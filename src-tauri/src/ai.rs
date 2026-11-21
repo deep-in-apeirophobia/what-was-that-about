@@ -158,6 +158,24 @@ impl LlmJob {
     }
 }
 
+/// Resolves once the user stops the job.
+async fn stopped(job: &LlmJob) {
+    while !job.cancel.load(Ordering::Relaxed) {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// Run a job's work, giving up as soon as the user stops it (whatever it's waiting on).
+async fn until_stopped<T>(
+    job: &LlmJob,
+    work: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::select! {
+        r = work => r,
+        _ = stopped(job) => Err(anyhow!("cancelled")),
+    }
+}
+
 impl Drop for LlmJob {
     fn drop(&mut self) {
         self.app
@@ -219,20 +237,11 @@ impl<'a> Ai<'a> {
         max_tokens: u32,
     ) -> Result<String> {
         self.check_cancel()?;
-        // Stop must not wait for a slow request to come back
-        let stopped = async {
-            match self.job {
-                Some(j) => {
-                    while !j.cancel.load(Ordering::Relaxed) {
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    }
-                }
-                None => std::future::pending::<()>().await,
-            }
-        };
-        let (text, u) = tokio::select! {
-            r = self.client.complete(model, messages, false, max_tokens) => r?,
-            _ = stopped => bail!("cancelled"),
+        let call = self.client.complete(model, messages, false, max_tokens);
+        let (text, u) = match self.job {
+            // Stop must not wait for a slow request to come back
+            Some(job) => until_stopped(job, call).await?,
+            None => call.await?,
         };
         self.add_usage(u);
         Ok(text.trim().to_string())
@@ -1018,7 +1027,7 @@ pub async fn ask(
     let mut stats = AskStats::default();
     let (r, usage) = match Ai::new(app, Some(&job)) {
         Ok(ai) => {
-            let r = ask_inner(
+            let work = ask_inner(
                 &ai,
                 &job,
                 recording_id,
@@ -1026,8 +1035,8 @@ pub async fn ask(
                 question,
                 attachment_ids,
                 &mut stats,
-            )
-            .await;
+            );
+            let r = until_stopped(&job, work).await;
             (r, ai.usage())
         }
         Err(e) => (Err(e), None),
@@ -1402,7 +1411,7 @@ pub async fn generate_doc(
     let model = app.state::<AppState>().settings().llm_model;
     let (r, usage) = match Ai::new(app, Some(&job)) {
         Ok(ai) => {
-            let r = generate_doc_inner(&ai, &job, &id, &prompt).await;
+            let r = until_stopped(&job, generate_doc_inner(&ai, &job, &id, &prompt)).await;
             (r, ai.usage())
         }
         Err(e) => (Err(e), None),
@@ -1480,7 +1489,7 @@ pub async fn revise_doc(
     let model = app.state::<AppState>().settings().llm_model;
     let (r, usage) = match Ai::new(app, Some(&job)) {
         Ok(ai) => {
-            let r = revise_doc_inner(&ai, &job, &doc_id, &instruction).await;
+            let r = until_stopped(&job, revise_doc_inner(&ai, &job, &doc_id, &instruction)).await;
             (r, ai.usage())
         }
         Err(e) => (Err(e), None),
