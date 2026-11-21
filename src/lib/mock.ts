@@ -754,6 +754,7 @@ async function runFix(s: RecState): Promise<FixSummary> {
       return out;
     });
     changed += fixed.length;
+    if (fixed.length) s.embeddingsIndexed = false;
     const p: FixProgress = { recordingId: id, done: b + 1, total, changed: fixed.map((x) => ({ ...x })) };
     emit(EV.fix, p);
   }
@@ -1158,6 +1159,7 @@ export const handlers: Record<string, Handler> = {
       reverted.push(out);
       return out;
     });
+    if (reverted.length) s.embeddingsIndexed = false;
     await sleep(150);
     return reverted.map((x) => ({ ...x }));
   },

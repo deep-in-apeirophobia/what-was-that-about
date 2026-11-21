@@ -358,6 +358,10 @@ impl Db {
     /// segment whose text changed in the meantime (edited by the user) is skipped. The
     /// recognizer's text is kept in `original_text`, and word timings stay so the karaoke
     /// highlight still finds the unchanged words. Returns the segments that changed.
+    ///
+    /// A fix touches much of a transcript, so the recording's semantic index is dropped as
+    /// a whole (like after re-transcribing) rather than left with holes; the UI then offers
+    /// to build it again.
     pub fn apply_fixes(
         &mut self,
         id: &str,
@@ -375,12 +379,11 @@ impl Db {
                 params![id, seg, old, new, normalize_for_search(new)],
             )?;
             if n > 0 {
-                tx.execute(
-                    "DELETE FROM embeddings WHERE recording_id = ?1 AND start_seg <= ?2 AND end_seg >= ?2",
-                    params![id, seg],
-                )?;
                 changed.push(*seg);
             }
+        }
+        if !changed.is_empty() {
+            tx.execute("DELETE FROM embeddings WHERE recording_id = ?1", [id])?;
         }
         tx.commit()?;
         if changed.is_empty() {
@@ -390,7 +393,7 @@ impl Db {
     }
 
     /// Put back the recognizer's text for AI-fixed segments (`only` = these ids, else all).
-    /// Returns the segments that changed.
+    /// Drops the semantic index like [`Db::apply_fixes`]. Returns the segments that changed.
     pub fn revert_fixes(&mut self, id: &str, only: Option<&[u32]>) -> Result<Vec<Segment>> {
         let fixed: Vec<(u32, String)> = {
             let mut st = self.conn.prepare(
@@ -411,11 +414,8 @@ impl Db {
                 "UPDATE segments SET text = ?3, norm = ?4, original_text = NULL WHERE recording_id = ?1 AND idx = ?2",
                 params![id, seg, original, normalize_for_search(original)],
             )?;
-            tx.execute(
-                "DELETE FROM embeddings WHERE recording_id = ?1 AND start_seg <= ?2 AND end_seg >= ?2",
-                params![id, seg],
-            )?;
         }
+        tx.execute("DELETE FROM embeddings WHERE recording_id = ?1", [id])?;
         tx.commit()?;
         let ids: Vec<u32> = fixed.iter().map(|(seg, _)| *seg).collect();
         self.segments_with_ids(id, &ids)
@@ -901,6 +901,22 @@ mod tests {
             &[seg(0, "سلام"), seg(1, "خداحافز"), seg(2, "متن")],
         )
         .unwrap();
+        let index = |db: &mut Db| {
+            let rows: Vec<EmbeddingRow> = [(0, 0, 0), (1, 1, 2)]
+                .map(|(chunk, start_seg, end_seg)| EmbeddingRow {
+                    recording_id: "r1".into(),
+                    chunk,
+                    start_seg,
+                    end_seg,
+                    vector: vec![1.0],
+                })
+                .into();
+            db.replace_embeddings("r1", "e", &rows).unwrap();
+        };
+        index(&mut db);
+        db.apply_fixes("r1", &[(2, "edited meanwhile".into(), "x".into())])
+            .unwrap();
+        assert!(db.has_embeddings("r1", "e").unwrap());
         let changed = db
             .apply_fixes(
                 "r1",
@@ -915,6 +931,8 @@ mod tests {
         assert_eq!(changed[0].text, "خداحافظ");
         assert_eq!(changed[0].original_text.as_deref(), Some("خداحافز"));
         assert_eq!(changed[0].words.len(), 1);
+        // the whole semantic index goes, not just the chunk with segment 1
+        assert!(!db.has_embeddings("r1", "e").unwrap());
         // search sees the fixed text
         let hits = crate::search::lexical(&db, "خداحافظ", Some("r1"), 10).unwrap();
         assert_eq!(hits.len(), 1);
@@ -938,7 +956,9 @@ mod tests {
             ],
         )
         .unwrap();
+        index(&mut db);
         let reverted = db.revert_fixes("r1", Some(&[0])).unwrap();
+        assert!(!db.has_embeddings("r1", "e").unwrap());
         assert_eq!(reverted.len(), 1);
         assert_eq!(
             (

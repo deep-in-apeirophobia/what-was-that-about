@@ -633,6 +633,15 @@ pub async fn import_link(app: AppHandle, url: String) -> CmdResult<Recording> {
 
 fn queue_transcription(app: &AppHandle, id: &str, model_id: String) -> anyhow::Result<()> {
     let state = app.state::<AppState>();
+    // A fix still running would write corrections meant for the old transcript.
+    if let Some(c) = state
+        .llm_jobs
+        .lock()
+        .unwrap()
+        .get(&crate::ai::fix_job_id(id))
+    {
+        c.store(true, Ordering::Relaxed);
+    }
     {
         let db = state.db.lock().unwrap();
         db.set_status(id, RecordingStatus::Queued, None)?;

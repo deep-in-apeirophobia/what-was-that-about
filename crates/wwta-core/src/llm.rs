@@ -812,7 +812,8 @@ fn plausible_fix(old: &str, new: &str) -> bool {
 }
 
 /// The model's corrections for `batch` as `(segment id, current text, corrected text)`.
-/// Drops ids outside the batch, unchanged or empty texts and implausible rewrites.
+/// Drops ids outside the batch, empty texts, implausible rewrites and changes that only
+/// touch whitespace (nothing to show for those).
 pub fn parse_fixes(v: &Value, batch: &[Segment]) -> Vec<(u32, String, String)> {
     let echoed_id = Regex::new(r"^\[\d+\]\s*").unwrap();
     let items = v["fixes"].as_array().or_else(|| v.as_array());
@@ -826,7 +827,8 @@ pub fn parse_fixes(v: &Value, batch: &[Segment]) -> Vec<(u32, String, String)> {
         };
         let new = echoed_id.replace(text.trim(), "").trim().to_string();
         let old = seg.text.trim();
-        if new == old || !plausible_fix(old, &new) || out.iter().any(|f| f.0 == id) {
+        let same_words = new.split_whitespace().eq(old.split_whitespace());
+        if same_words || !plausible_fix(old, &new) || out.iter().any(|f| f.0 == id) {
             continue;
         }
         out.push((id, seg.text.clone(), new));
@@ -941,7 +943,7 @@ mod tests {
         let v: Value = serde_json::from_str(
             r#"{"fixes":[
                 {"id":1,"text":"[1] جمله یک"},
-                {"id":"2","text":"جمله 2"},
+                {"id":"2","text":" جمله  2 "},
                 {"id":3,"text":""},
                 {"id":4,"text":"این جمله را مدل کاملاً بازنویسی کرده و خیلی طولانی‌تر شده است"},
                 {"id":9,"text":"خارج از دسته"},

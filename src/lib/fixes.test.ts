@@ -29,10 +29,15 @@ describe("diffFix", () => {
     expect(joined(q)).toBe("سلام، خوبید؟");
   });
 
-  it("leaves punctuation and spacing changes unmarked", () => {
-    const p = diffFix("سلام  به همه", "سلام، به همه.");
-    expect(changes(p)).toEqual([]);
-    expect(joined(p)).toBe("سلام، به همه.");
+  it("marks punctuation-only changes as minor and ignores spacing", () => {
+    const p = diffFix("سلام  به همه. خب", "سلام، به همه خب؟");
+    expect(p.filter((x) => x.original !== null)).toEqual([
+      { text: "،", original: "", minor: true },
+      { text: "", original: ".", minor: true },
+      { text: "؟", original: "", minor: true },
+    ]);
+    expect(joined(p)).toBe("سلام، به همه خب؟");
+    expect(diffFix("سلام  به همه", "سلام به همه")).toEqual([{ text: "سلام به همه", original: null }]);
   });
 
   it("puts removed words at the start or end of the sentence", () => {

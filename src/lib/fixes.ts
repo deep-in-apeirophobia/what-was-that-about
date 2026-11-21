@@ -6,6 +6,8 @@ export interface FixPiece {
   text: string;
   /** What speech recognition had here: null for unchanged text, "" for added words. */
   original: string | null;
+  /** Only punctuation changed here; shown more lightly than word changes. */
+  minor?: true;
 }
 
 interface Token {
@@ -64,8 +66,9 @@ function trimPunctuation(tokens: Token[]): Token[] {
 
 /**
  * Split `fixed` into unchanged and corrected pieces, each corrected piece carrying the
- * recognized text it replaced. The pieces' texts join back into `fixed`. Changes that only
- * touch punctuation or spacing are left unmarked.
+ * recognized text it replaced. The pieces' texts join back into `fixed`. Word changes are
+ * marked without the punctuation around them; punctuation-only changes are marked `minor`,
+ * and spacing changes not at all.
  */
 export function diffFix(original: string, fixed: string): FixPiece[] {
   const a = tokenize(original);
@@ -83,21 +86,25 @@ export function diffFix(original: string, fixed: string): FixPiece[] {
   let ai = 0;
   let bi = 0;
   for (const [am, bm] of pairs) {
-    const removed = trimPunctuation(a.slice(ai, am));
-    const added = trimPunctuation(b.slice(bi, bm));
+    let removed = trimPunctuation(a.slice(ai, am));
+    let added = trimPunctuation(b.slice(bi, bm));
+    const minor = !removed.length && !added.length;
+    if (minor) {
+      removed = a.slice(ai, am);
+      added = b.slice(bi, bm);
+    }
     if (removed.length || added.length) {
       const was = removed.length ? original.slice(removed[0].start, removed[removed.length - 1].end) : "";
+      let text = "";
       if (added.length) {
-        const start = added[0].start;
-        const end = added[added.length - 1].end;
-        plainUpTo(start);
-        out.push({ text: fixed.slice(start, end), original: was });
-        pos = end;
+        plainUpTo(added[0].start);
+        text = fixed.slice(added[0].start, added[added.length - 1].end);
       } else {
-        // Removed words: mark the spot after the previous unchanged word.
+        // Removed text: mark the spot after the previous unchanged token.
         plainUpTo(bi > 0 ? b[bi - 1].end : 0);
-        out.push({ text: "", original: was });
       }
+      out.push(minor ? { text, original: was, minor } : { text, original: was });
+      pos += text.length;
     }
     ai = am + 1;
     bi = bm + 1;

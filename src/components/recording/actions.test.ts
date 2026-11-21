@@ -28,7 +28,7 @@ const seg = (id: number, text: string, originalText?: string): Segment => ({
 function open(segments: Segment[]) {
   useRecording.setState({
     id: "r1",
-    detail: { segments, notes: [], docs: [], chat: [], analysis: null } as unknown as RecordingDetail,
+    detail: { segments, notes: [], docs: [], chat: [], analysis: null, embeddingsIndexed: true } as unknown as RecordingDetail,
   });
 }
 
@@ -54,6 +54,7 @@ describe("fixTranscript", () => {
     useRecording.getState().updateSegments("r1", [seg(1, "خداحافظ", "خداحافز"), seg(7, "unknown")]);
     expect(useLibrary.getState().fixing.r1).toEqual({ done: 1, total: 2 });
     expect(texts()).toEqual(["سلام", "خداحافظ"]);
+    expect(useRecording.getState().detail!.embeddingsIndexed).toBe(false);
 
     finish({ changed: 1, batches: 2, failed: 0, error: null });
     await run;
@@ -93,5 +94,6 @@ describe("revertTranscriptFixes", () => {
     mocked.revertTranscriptFixes.mockResolvedValueOnce([seg(1, "x")]);
     await revertTranscriptFixes("r2", null);
     expect(texts()).toEqual(["سلام", "خداحافز"]);
+    expect(useRecording.getState().detail!.embeddingsIndexed).toBe(true);
   });
 });

@@ -106,7 +106,8 @@ interface RecordingState {
   applyRecording: (r: Recording) => void;
   appendSegments: (recordingId: string, segs: Segment[]) => void;
   replaceSegment: (seg: Segment) => void;
-  /** Replace sentences of the open recording that are already shown (AI fixes, reverts). */
+  /** Replace sentences of the open recording that are already shown (AI fixes, reverts).
+   *  The backend drops the semantic index when that happens, so it's marked as gone. */
   updateSegments: (recordingId: string, segs: Segment[]) => void;
   setAnalysis: (a: Analysis) => void;
   setEmbeddingsIndexed: (v: boolean) => void;
@@ -251,7 +252,8 @@ export const useRecording = create<RecordingState>((set, get) => ({
     const { id, detail } = get();
     if (id !== recordingId || !detail || !segs.length) return;
     const byId = new Map(segs.map((s) => [s.id, s]));
-    set({ detail: { ...detail, segments: detail.segments.map((s) => byId.get(s.id) ?? s) } });
+    if (!detail.segments.some((s) => byId.has(s.id))) return;
+    set({ detail: { ...detail, segments: detail.segments.map((s) => byId.get(s.id) ?? s), embeddingsIndexed: false } });
   },
 
   setAnalysis: (analysis) => {

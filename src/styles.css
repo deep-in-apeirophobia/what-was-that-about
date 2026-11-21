@@ -231,6 +231,12 @@ mark.fix-hit {
   color: inherit;
   border-radius: 2px;
 }
+/* Punctuation-only fixes: underline only, with a little extra room to hover. */
+mark.fix-hit.fix-minor {
+  background: none;
+  padding-inline: 2px;
+  margin-inline: -2px;
+}
 /* Where the fix removed words: a thin bar with a wider hover area. */
 mark.fix-removed {
   display: inline-block;
@@ -242,6 +248,9 @@ mark.fix-removed {
   background: var(--fix);
   background-clip: content-box;
   opacity: 0.7;
+}
+mark.fix-removed.fix-minor {
+  opacity: 0.4;
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -234,7 +234,7 @@ async fn analyze_inner(
 const FIX_CONCURRENCY: usize = 4;
 
 /// `llm_jobs` key of a recording's transcript fix; `cancel_llm` with it stops the fix.
-fn fix_job_id(recording_id: &str) -> String {
+pub fn fix_job_id(recording_id: &str) -> String {
     format!("fix:{recording_id}")
 }
 

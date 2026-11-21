@@ -63,7 +63,7 @@ function FixText({ pieces, word = null }: { pieces: FixPiece[]; word?: [number, 
         offset += p.text.length;
         if (p.original === null) return <Fragment key={i}>{withActiveWord(p.text, at, word)}</Fragment>;
         return (
-          <mark key={i} className={p.text ? "fix-hit" : "fix-removed"} data-fix-original={p.original}>
+          <mark key={i} className={clsx(p.text ? "fix-hit" : "fix-removed", p.minor && "fix-minor")} data-fix-original={p.original}>
             {withActiveWord(p.text, at, word)}
           </mark>
         );
