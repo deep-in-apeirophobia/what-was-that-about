@@ -167,9 +167,7 @@ impl ReplyBuilder {
                 c.id = id.to_string();
             }
             if let Some(n) = tc["function"]["name"].as_str() {
-                if c.name.is_empty() {
-                    c.name = n.to_string();
-                }
+                c.name.push_str(n);
             }
             if let Some(a) = tc["function"]["arguments"].as_str() {
                 c.arguments.push_str(a);
@@ -828,7 +826,8 @@ mod tests {
         let mut b = ReplyBuilder::default();
         let chunks = [
             r#"{"choices":[{"delta":{"content":"Let me look."}}]}"#,
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"search","arguments":""}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"sea","arguments":""}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"rch"}}]}}]}"#,
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"query\":"}}]}}]}"#,
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"بودجه\"}"}}]}}]}"#,
             r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"c2","function":{"name":"get_notes"}}]}}]}"#,

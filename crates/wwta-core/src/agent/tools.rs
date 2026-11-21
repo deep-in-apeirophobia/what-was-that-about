@@ -15,7 +15,8 @@ use crate::types::{SearchHit, Segment};
 /// Transcript text per tool result; longer transcripts are paged.
 const TRANSCRIPT_CHARS: usize = 120_000;
 const DOC_CHARS: usize = 80_000;
-const LIST_LIMIT: usize = 150;
+/// Recordings per `list_recordings` page.
+const PAGE_SIZE: usize = 100;
 const SEARCH_LIMIT: usize = 20;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -116,8 +117,12 @@ impl ToolBox {
         if lib {
             defs.push(def(
                 "list_recordings",
-                "List all recordings in the library with their ids (like R3), dates, lengths and short descriptions.",
-                &[],
+                "List the recordings in the library, newest first, with their ids (like R3), dates, lengths and short descriptions.",
+                &[(
+                    "page",
+                    "integer",
+                    "1 for the newest 100 recordings, 2 for the next 100, and so on.",
+                )],
             ));
         }
         let search = if lib {
@@ -203,7 +208,10 @@ impl ToolBox {
             _ => String::new(),
         };
         match call.name.as_str() {
-            "list_recordings" => "Browsing the library".into(),
+            "list_recordings" => match arg_u32(&args, &["page"]) {
+                Some(p) if p > 1 => format!("Browsing the library (page {p})"),
+                _ => "Browsing the library".into(),
+            },
             "search" => format!(
                 "Searching for “{}”",
                 arg_str(&args, &["query", "q", "text"]).unwrap_or_default()
@@ -257,7 +265,10 @@ impl ToolBox {
             ));
         }
         match name {
-            "list_recordings" => self.list_recordings(db),
+            "list_recordings" => {
+                let page = arg_u32(args, &["page"]).unwrap_or(1).max(1) as usize;
+                self.list_recordings(db, page)
+            }
             "search" => self.search(db, args, semantic),
             "get_overview" => self.overview(db, args),
             "read_transcript" => {
@@ -317,13 +328,23 @@ impl ToolBox {
         ))
     }
 
-    fn list_recordings(&mut self, db: &Db) -> ToolResult {
+    fn list_recordings(&mut self, db: &Db, page: usize) -> ToolResult {
         let recs = db.list_recordings().map_err(|e| e.to_string())?;
         if recs.is_empty() {
             return Ok("The library is empty.".into());
         }
-        let mut out = format!("{} recordings, newest first:\n", recs.len());
-        for r in recs.iter().take(LIST_LIMIT) {
+        let pages = recs.len().div_ceil(PAGE_SIZE);
+        if page > pages {
+            return Err(format!(
+                "there are only {pages} pages ({} recordings).",
+                recs.len()
+            ));
+        }
+        let mut out = format!(
+            "{} recordings, newest first. Page {page} of {pages}:\n",
+            recs.len()
+        );
+        for r in recs.iter().skip((page - 1) * PAGE_SIZE).take(PAGE_SIZE) {
             let alias = self.alias(&r.id);
             let date = r.created_at.get(..10).unwrap_or(&r.created_at);
             let length = r.duration_sec.map(fmt_time).unwrap_or_else(|| "?".into());
@@ -343,11 +364,8 @@ impl ToolBox {
                 out.push_str(&format!("\n   {b}"));
             }
         }
-        if recs.len() > LIST_LIMIT {
-            out.push_str(&format!(
-                "\n\n…and {} older recordings. Use search to find them.",
-                recs.len() - LIST_LIMIT
-            ));
+        if page < pages {
+            out.push_str(&format!("\n\nOlder recordings are on page {}.", page + 1));
         }
         Ok(out)
     }
@@ -809,6 +827,37 @@ mod tests {
             broken.starts_with("Error: the arguments were not"),
             "{broken}"
         );
+    }
+
+    #[test]
+    fn lists_large_libraries_in_pages() {
+        let db = Db::open_in_memory().unwrap();
+        for i in 0..105 {
+            let mut r = rec(&format!("id-{i:03}"), &format!("rec {i}"));
+            r.created_at = format!("2026-01-01T00:{:02}:{:02}Z", i / 60, i % 60);
+            db.insert_recording(&r).unwrap();
+        }
+        let mut t = ToolBox::new(Scope::Library, false);
+        let first = t.run(&db, &call("list_recordings", json!({ "page": 1 })), vec![]);
+        assert!(
+            first.starts_with("105 recordings, newest first. Page 1 of 2:"),
+            "{first}"
+        );
+        assert!(
+            first.contains("R1 “rec 104”") && first.ends_with("Older recordings are on page 2.")
+        );
+        let second = t.run(
+            &db,
+            &call("list_recordings", json!({ "page": "2" })),
+            vec![],
+        );
+        assert!(
+            second.contains("R101 “rec 4”") && second.contains("R105 “rec 0”"),
+            "{second}"
+        );
+        assert!(!second.contains("Older recordings"));
+        let past = t.run(&db, &call("list_recordings", json!({ "page": 3 })), vec![]);
+        assert!(past.starts_with("Error: there are only 2 pages"), "{past}");
     }
 
     #[test]

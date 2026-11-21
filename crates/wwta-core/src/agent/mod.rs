@@ -316,42 +316,54 @@ impl<'a> Agent<'a> {
         Ok(())
     }
 
-    /// Fold all but the last few history messages (and any earlier summary) into a summary.
+    /// Fold all but the last few history messages (and any earlier summary) into a summary,
+    /// in batches small enough for the model's context.
     async fn summarize_history(&mut self) -> Result<()> {
         let len = self.ctx.history.len();
-        if len == 0 {
-            return Ok(());
-        }
-        self.check_cancel()?;
-        let n = if len > KEEP_RECENT {
+        let mut left = if len > KEEP_RECENT {
             len - KEEP_RECENT
         } else {
             len
         };
-        let mut text = String::new();
-        if let Some(s) = &self.ctx.summary {
-            text.push_str(&format!(
-                "Summary of the conversation before this:\n{s}\n\n"
-            ));
+        // bytes of conversation per summary request: a third of the budget
+        let batch = (self.ctx.budget as f64 / 3.0 / self.ctx.ratio) as usize;
+        while left > 0 {
+            self.check_cancel()?;
+            let mut text = String::new();
+            if let Some(s) = &self.ctx.summary {
+                text.push_str(&format!(
+                    "Summary of the conversation before this:\n{s}\n\n"
+                ));
+            }
+            let mut take = 0;
+            for m in &self.ctx.history[..left] {
+                let who = if m.role == "user" {
+                    "User"
+                } else {
+                    "Assistant"
+                };
+                let piece = format!(
+                    "{who}: {}\n\n",
+                    clip(m.content.trim(), (batch / 2).min(20_000))
+                );
+                if take > 0 && text.len() + piece.len() > batch {
+                    break;
+                }
+                text.push_str(&piece);
+                take += 1;
+            }
+            let msgs = [Msg::system(SUMMARY_PROMPT), Msg::user(text)];
+            let (summary, u) = self
+                .client
+                .complete(self.model, &msgs, false, 2_000)
+                .await
+                .map_err(|e| explain_error(e, self.model))?;
+            add_usage(&mut self.usage, u);
+            self.ctx.summary = Some(summary.trim().to_string());
+            self.ctx.history.drain(..take);
+            self.ctx.folded += take;
+            left -= take;
         }
-        for m in &self.ctx.history[..n] {
-            let who = if m.role == "user" {
-                "User"
-            } else {
-                "Assistant"
-            };
-            text.push_str(&format!("{who}: {}\n\n", clip(m.content.trim(), 20_000)));
-        }
-        let msgs = [Msg::system(SUMMARY_PROMPT), Msg::user(text)];
-        let (summary, u) = self
-            .client
-            .complete(self.model, &msgs, false, 2_000)
-            .await
-            .map_err(|e| explain_error(e, self.model))?;
-        add_usage(&mut self.usage, u);
-        self.ctx.summary = Some(summary.trim().to_string());
-        self.ctx.history.drain(..n);
-        self.ctx.folded += n;
         Ok(())
     }
 }
@@ -773,6 +785,45 @@ mod tests {
             "{out}"
         );
         assert!(out.ends_with("ask for a smaller part.]"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn summarizes_long_history_in_batches() {
+        let (base, seen) = fake_openrouter(vec![
+            completion("s1"),
+            completion("s2"),
+            completion("s3"),
+            completion("s4"),
+            answer("ok"),
+        ]);
+        let client = Client::with_base("key", &base).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut h = host(Scope::Recording("uuid-a".into()));
+        // 8 messages of 6 KB each; with a 12k budget each summary request takes one
+        let history: Vec<Msg> = (0..8)
+            .map(|i| Msg::user(format!("m{i} {}", "x".repeat(6_000))))
+            .collect();
+        let mut ctx = Context::new("system", None, history, Msg::user("now?"));
+        ctx.budget = 12_000;
+        let mut agent = Agent::new(&client, "m", 1_000, &cancel, ctx);
+        assert_eq!(agent.run(&mut h).await.unwrap(), "ok");
+        assert_eq!(agent.ctx.folded, 4);
+        assert_eq!(agent.ctx.summary.as_deref(), Some("s4"));
+        let seen = seen.lock().unwrap();
+        for (i, req) in seen[..4].iter().enumerate() {
+            let input = req["messages"][1]["content"].as_str().unwrap();
+            assert!(
+                input.len() <= 12_000 * 10 / 4 / 3 + 100,
+                "request {i}: {}",
+                input.len()
+            );
+            assert!(input.contains(&format!("User: m{i} ")), "request {i}");
+        }
+        // each batch builds on the previous summary
+        assert!(seen[1]["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("Summary of the conversation before this:\ns1"));
     }
 
     #[test]
