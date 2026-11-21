@@ -55,7 +55,9 @@ jobs:
       matrix:
         include:
           - name: windows-x64
-            os: windows-2025
+            # VS 2022: under VS 2026 (windows-2025) the nested CMake configure of ggml's
+            # vulkan-shaders-gen fails with "No CMAKE_C_COMPILER could be found".
+            os: windows-2022
           - name: linux-x64
             os: ubuntu-22.04
           - name: macos-arm64
@@ -66,6 +68,8 @@ jobs:
     env:
       # Build whisper.cpp for a portable baseline (AVX2 on x86-64) instead of the CI machine's CPU.
       GGML_NATIVE: "OFF"
+      # Match bundle.macOS.minimumSystemVersion so the CLI and `tauri build` share one native build.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - uses: actions/checkout@v7
 
@@ -73,6 +77,13 @@ jobs:
 
       - name: Build CLI
         run: cargo build --release --locked -p wwta-cli
+
+      - name: Show nested CMake logs (whisper.cpp)
+        if: failure() && runner.os == 'Windows'
+        shell: bash
+        run: |
+          find target/release/build -path '*whisper-rs-sys*' \( -name CMakeConfigureLog.yaml -o -name CMakeError.log \) -print \
+            | while read -r f; do echo "::group::$f"; tail -n 200 "$f"; echo "::endgroup::"; done
 
       - name: Cache Shenava model (smoke test)
         uses: actions/cache@v6

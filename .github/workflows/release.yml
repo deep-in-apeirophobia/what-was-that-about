@@ -17,6 +17,8 @@ env:
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
   # Build whisper.cpp for a portable baseline (AVX2 on x86-64) instead of the CI machine's CPU.
   GGML_NATIVE: "OFF"
+  # Match bundle.macOS.minimumSystemVersion so the CLI and the app share one native build.
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
 
 jobs:
   build:
@@ -26,7 +28,7 @@ jobs:
       matrix:
         include:
           - name: windows-x64
-            os: windows-2025
+            os: windows-2022
           - name: linux-x64
             os: ubuntu-22.04
           - name: macos-arm64
