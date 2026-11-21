@@ -25,6 +25,9 @@ env:
   WWTA_CHANNEL: release
   # Match bundle.macOS.minimumSystemVersion so the CLI and the app share one native build.
   MACOSX_DEPLOYMENT_TARGET: "11.0"
+  # Line tables for Sentry symbolication (split into .pdb / .dSYM on Windows / macOS).
+  CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+  CARGO_PROFILE_RELEASE_STRIP: none
 
 jobs:
   build:
@@ -53,6 +56,8 @@ jobs:
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Lets the Vite build upload source maps to Sentry (skipped when empty).
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
         with:
           tagName: ${{ env.RELEASE_TAG }}
           releaseName: What Was That About ${{ env.RELEASE_TAG }}
@@ -62,6 +67,12 @@ jobs:
             See the README for details. macOS builds are not notarized; right-click → Open on first launch.
           releaseDraft: true
           prerelease: false
+
+      - name: Upload debug symbols to Sentry
+        continue-on-error: true
+        uses: ./.github/actions/sentry-symbols
+        with:
+          auth-token: ${{ secrets.SENTRY_AUTH_TOKEN }}
 
       - name: Build and attach CLI
         shell: bash
