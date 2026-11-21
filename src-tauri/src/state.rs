@@ -44,9 +44,6 @@ impl Paths {
     pub fn peaks_path(&self, id: &str) -> PathBuf {
         self.recording_dir(id).join("peaks.u8")
     }
-    pub fn playback_path(&self, id: &str) -> PathBuf {
-        self.recording_dir(id).join("playback.wav")
-    }
 }
 
 /// Tiny counting semaphore for blocking threads (limits parallel decodes).

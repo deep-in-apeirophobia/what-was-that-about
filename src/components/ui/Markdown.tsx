@@ -34,6 +34,7 @@ function MarkdownImpl({ content, className, onCite, renderCite }: MarkdownProps)
           return (
             <button
               type="button"
+              dir="ltr"
               onClick={() => onCite(cite)}
               className="mx-0.5 inline-flex h-[18px] -translate-y-px items-center rounded-md bg-accent-soft px-1.5 align-middle text-[11px] font-semibold text-accent tabular-nums no-underline transition hover:brightness-95 dark:hover:brightness-125"
               title="Play this part"

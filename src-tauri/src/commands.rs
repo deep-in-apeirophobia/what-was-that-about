@@ -1,6 +1,6 @@
 //! Tauri commands. Names and argument shapes mirror `src/lib/api.ts`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -523,33 +523,23 @@ pub fn get_waveform(state: State<'_, AppState>, id: String) -> CmdResult<Wavefor
 
 #[tauri::command]
 pub async fn prepare_playback_wav(app: AppHandle, id: String) -> CmdResult<String> {
+    // The 16 kHz mono PCM cache made for transcription plays in every webview; reuse it
+    // instead of decoding the file a second time.
     let state = app.state::<AppState>();
-    let rec = state
-        .db
-        .lock()
-        .unwrap()
-        .recording(&id)
-        .map_err(anyhow_err)?;
-    if let Some(p) = rec.playback_wav_path.filter(|p| Path::new(p).is_file()) {
-        allow_asset(&app, &p);
-        return Ok(p);
-    }
-    let dst = state.paths.playback_path(&id);
-    let src = PathBuf::from(&rec.audio_path);
     let pcm = state.paths.pcm_path(&id);
-    let d2 = dst.clone();
-    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        match audio::decode_to_playback_wav(&src, &d2, &AtomicBool::new(false)) {
-            Ok(()) => Ok(()),
-            // fall back to the 16 kHz cache (always decodable)
-            Err(_) if pcm.is_file() => Ok(std::fs::copy(&pcm, &d2).map(|_| ())?),
-            Err(e) => Err(anyhow::anyhow!("{e}")),
+    if !pcm.is_file() {
+        let (app2, id2) = (app.clone(), id.clone());
+        let prepared = tokio::task::spawn_blocking(move || {
+            worker::prepare_audio(&app2, &id2, &AtomicBool::new(false))
+        })
+        .await
+        .map_err(err)?
+        .map_err(anyhow_err)?;
+        if let worker::Prepared::NeedsDecode = prepared {
+            return Err("this file has to be decoded before it can play".into());
         }
-    })
-    .await
-    .map_err(err)?
-    .map_err(anyhow_err)?;
-    let p = dst.to_string_lossy().into_owned();
+    }
+    let p = pcm.to_string_lossy().into_owned();
     state
         .db
         .lock()

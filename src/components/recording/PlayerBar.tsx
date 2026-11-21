@@ -13,7 +13,7 @@ import {
   Volume2,
   VolumeX,
 } from "lucide-react";
-import { api } from "../../lib/api";
+import { api, isTauri } from "../../lib/api";
 import { errorMessage } from "../../lib/errors";
 import { formatTime } from "../../lib/format";
 import { mediaUrl } from "../../lib/platform";
@@ -27,15 +27,28 @@ import { Waveform } from "./Waveform";
 
 type Source = { url: string | null; kind: "original" | "fallback"; error: string | null; preparing: boolean };
 
+/** WebKitGTK (Linux) can't stream <audio> from Tauri's asset:// scheme (fetch works), so
+ *  there the file is loaded into a blob URL instead. */
+const NEEDS_BLOB = isTauri() && typeof navigator !== "undefined" && /Linux/i.test(navigator.userAgent) && !/Android/i.test(navigator.userAgent);
+
+async function playableUrl(path: string): Promise<string> {
+  const url = mediaUrl(path);
+  if (!url) throw new Error("No playable file was produced.");
+  if (!NEEDS_BLOB || url.startsWith("blob:") || url.startsWith("data:")) return url;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Couldn't read the audio file (HTTP ${res.status}).`);
+  return URL.createObjectURL(await res.blob());
+}
+
 /** Owns the single <audio> element and keeps the player store in sync with it. */
 function useAudioElement(recording: Recording) {
   const ref = useRef<HTMLAudioElement>(null);
   const [el, setEl] = useState<HTMLAudioElement | null>(null);
   const [source, setSource] = useState<Source>(() => ({
-    url: mediaUrl(recording.audioPath),
+    url: NEEDS_BLOB ? null : mediaUrl(recording.audioPath),
     kind: "original",
     error: null,
-    preparing: false,
+    preparing: NEEDS_BLOB,
   }));
   const resumeAt = useRef<number | null>(null);
   const sourceRef = useRef(source);
@@ -50,8 +63,7 @@ function useAudioElement(recording: Recording) {
     setSource((s) => ({ ...s, preparing: true }));
     try {
       const path = await api.preparePlaybackWav(recording.id);
-      const url = mediaUrl(path);
-      if (!url) throw new Error("No playable file was produced.");
+      const url = await playableUrl(path);
       setSource({ url, kind: "fallback", error: null, preparing: false });
     } catch (e) {
       setSource({ url: null, kind: "fallback", error: errorMessage(e), preparing: false });
@@ -60,10 +72,38 @@ function useAudioElement(recording: Recording) {
 
   // New file (e.g. after in-browser decoding) → start over with the original source.
   useEffect(() => {
-    const url = mediaUrl(recording.audioPath);
-    setSource({ url, kind: "original", error: null, preparing: false });
-    if (!url) void tryFallback();
+    let cancelled = false;
+    if (!NEEDS_BLOB) {
+      const url = mediaUrl(recording.audioPath);
+      setSource({ url, kind: "original", error: null, preparing: false });
+      if (!url) void tryFallback();
+      return;
+    }
+    setSource({ url: null, kind: "original", error: null, preparing: true });
+    playableUrl(recording.audioPath).then(
+      (url) => {
+        if (!cancelled) setSource({ url, kind: "original", error: null, preparing: false });
+        else if (url.startsWith("blob:")) URL.revokeObjectURL(url);
+      },
+      () => {
+        if (!cancelled) {
+          setSource((s) => ({ ...s, preparing: false }));
+          void tryFallback();
+        }
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
   }, [recording.audioPath, tryFallback]);
+
+  // Release blob URLs when the source changes or the player unmounts.
+  useEffect(() => {
+    const url = source.url;
+    return () => {
+      if (url?.startsWith("blob:")) URL.revokeObjectURL(url);
+    };
+  }, [source.url]);
 
   useEffect(() => {
     const audio = ref.current;

@@ -333,56 +333,6 @@ pub fn decode_to_16k_mono(
     Ok(out)
 }
 
-/// Decode to a 16-bit WAV at the source rate (max 2 channels), for playback in
-/// webviews that can't play the original format.
-pub fn decode_to_playback_wav(
-    path: &Path,
-    dst: &Path,
-    cancel: &AtomicBool,
-) -> Result<(), DecodeError> {
-    let mut writer: Option<(hound::WavWriter<std::io::BufWriter<File>>, usize, u32)> = None;
-    let tmp = dst.with_extension("wav.part");
-    let mut err: Option<anyhow::Error> = None;
-    decode_with(path, cancel, &mut |_| {}, &mut |inter, ch, rate| {
-        if err.is_some() {
-            return;
-        }
-        if writer.is_none() {
-            let spec = hound::WavSpec {
-                channels: ch.min(2) as u16,
-                sample_rate: rate,
-                bits_per_sample: 16,
-                sample_format: hound::SampleFormat::Int,
-            };
-            match hound::WavWriter::create(&tmp, spec) {
-                Ok(w) => writer = Some((w, ch, rate)),
-                Err(e) => {
-                    err = Some(e.into());
-                    return;
-                }
-            }
-        }
-        let (w, wch, _) = writer.as_mut().unwrap();
-        let out_ch = (*wch).min(2);
-        for frame in inter.chunks_exact(ch) {
-            for c in 0..out_ch {
-                let v = frame.get(c).copied().unwrap_or(frame[0]);
-                if let Err(e) = w.write_sample((v.clamp(-1.0, 1.0) * 32767.0) as i16) {
-                    err = Some(e.into());
-                    return;
-                }
-            }
-        }
-    })?;
-    if let Some(e) = err {
-        return Err(e.into());
-    }
-    let (w, _, _) = writer.ok_or_else(|| DecodeError::Unsupported("no audio".into()))?;
-    w.finalize().map_err(anyhow::Error::from)?;
-    std::fs::rename(&tmp, dst).map_err(anyhow::Error::from)?;
-    Ok(())
-}
-
 pub fn write_wav_16k(path: &Path, samples: &[f32]) -> Result<()> {
     let spec = hound::WavSpec {
         channels: 1,

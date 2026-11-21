@@ -82,6 +82,9 @@ export function DocFrame({ doc, title, onEscape }: { doc: Doc; title: string; on
       sandbox="allow-scripts"
       referrerPolicy="no-referrer"
       {...(src ? { src } : { srcDoc: srcdoc })}
+      // Inside an iframe, prefers-color-scheme follows the frame's color-scheme, so docs
+      // match the app's theme rather than the OS setting.
+      style={{ colorScheme: document.documentElement.classList.contains("dark") ? "dark" : "light" }}
       className="h-full w-full border-0 bg-white"
     />
   );

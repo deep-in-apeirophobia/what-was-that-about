@@ -56,6 +56,38 @@ pub fn run() {
                 llm_models: tokio::sync::Mutex::new(None),
             });
             worker::spawn(app.handle().clone(), rx);
+            // Debug builds only: evaluate JS lines written to the FIFO named by
+            // WWTA_E2E_EVAL_FIFO in the main webview (headless end-to-end runs).
+            #[cfg(debug_assertions)]
+            if let Ok(fifo) = std::env::var("WWTA_E2E_EVAL_FIFO") {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || loop {
+                    let Ok(text) = std::fs::read_to_string(&fifo) else {
+                        break;
+                    };
+                    if let Some(w) = handle.get_webview_window("main") {
+                        let _ = w.eval(text);
+                    }
+                });
+            }
+            // Debug builds only: import files listed in WWTA_E2E_IMPORT on startup (used for
+            // headless end-to-end runs).
+            #[cfg(debug_assertions)]
+            if let Ok(list) = std::env::var("WWTA_E2E_IMPORT") {
+                let paths: Vec<String> = std::env::split_paths(&list)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .filter(|p| !p.is_empty())
+                    .collect();
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    if paths.is_empty() {
+                        return;
+                    }
+                    if let Err(e) = commands::import_files(handle, paths).await {
+                        log::error!("e2e import failed: {e}");
+                    }
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
