@@ -107,6 +107,8 @@ export interface Segment {
   text: string;
   /** Word timings when the engine provides them. */
   words: Word[];
+  /** What speech recognition produced, when an AI fix changed `text`. */
+  originalText?: string | null;
 }
 
 export interface Chapter {
@@ -224,6 +226,26 @@ export interface TranscriptionProgress {
   message: string | null;
   /** Newly finalized segments since the last event (live preview). */
   newSegments: Segment[];
+}
+
+/** Event `transcript://fix-progress` — one batch of an AI transcript fix finished. */
+export interface FixProgress {
+  recordingId: string;
+  /** Batches finished (including failed ones) out of `total`. */
+  done: number;
+  total: number;
+  /** Segments this batch changed, with `originalText` set. */
+  changed: Segment[];
+}
+
+export interface FixSummary {
+  /** Sentences whose text changed. */
+  changed: number;
+  batches: number;
+  /** Batches that failed; their sentences were left as they were. */
+  failed: number;
+  /** The first failure, when some batches failed. */
+  error: string | null;
 }
 
 export interface SearchHit {

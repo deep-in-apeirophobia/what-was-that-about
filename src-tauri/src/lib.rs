@@ -128,6 +128,8 @@ pub fn run() {
             commands::transcribe,
             commands::cancel_transcription,
             commands::update_segment_text,
+            commands::fix_transcript,
+            commands::revert_transcript_fixes,
             commands::get_waveform,
             commands::prepare_playback_wav,
             commands::export_transcript,

@@ -552,6 +552,7 @@ mod tests {
             end: i as f64 + 1.0,
             text: t.into(),
             words: vec![],
+            original_text: None,
         };
         db.replace_segments(
             "a",
@@ -648,6 +649,7 @@ mod tests {
                 end: 0.0,
                 text: "x".repeat(100),
                 words: vec![],
+                original_text: None,
             })
             .collect();
         let c = chunk_segments(&segs, 300);

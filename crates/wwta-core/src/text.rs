@@ -322,6 +322,7 @@ pub fn split_segments(segments: Vec<Segment>, max_secs: f64) -> Vec<Segment> {
                     .collect::<Vec<_>>()
                     .join(" "),
                 words: p,
+                original_text: None,
             });
         }
     }
@@ -404,6 +405,7 @@ mod tests {
                     text: "نفر".into(),
                 },
             ],
+            original_text: None,
         };
         itn_segment(&mut seg);
         assert_eq!(seg.text, "۲۵ نفر");
@@ -437,6 +439,7 @@ mod tests {
                 w(3.6, 4.0, "حرف"),
                 w(4.1, 4.5, "می‌زنیم؟"),
             ],
+            original_text: None,
         };
         let out = split_segments(vec![seg], 30.0);
         assert_eq!(out.len(), 2);
@@ -455,6 +458,7 @@ mod tests {
                     w(i as f64 + gap * 0.0, i as f64 + 0.9 - gap * 0.5, "کلمه")
                 })
                 .collect(),
+            original_text: None,
         };
         let out = split_segments(vec![long], 8.0);
         assert!(out.len() >= 3);

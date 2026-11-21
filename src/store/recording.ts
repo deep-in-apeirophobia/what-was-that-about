@@ -20,7 +20,16 @@ import { attempt, toast } from "./toasts";
 export type PanelTab = "overview" | "notes" | "topics" | "ask" | "docs" | "related";
 
 const LS_FONT = "wwta.transcriptFontSize";
+const LS_HIGHLIGHT_FIXES = "wwta.highlightFixes";
 export const FONT_SIZES = [15, 17, 19, 21, 24, 28] as const;
+
+function readHighlightFixes(): boolean {
+  try {
+    return localStorage.getItem(LS_HIGHLIGHT_FIXES) !== "0";
+  } catch {
+    return true;
+  }
+}
 
 function readFont(): number {
   try {
@@ -77,6 +86,8 @@ interface RecordingState {
   related: RelatedState | null;
   findOpen: boolean;
   fontSize: number;
+  /** Mark the words an AI fix changed in the transcript. */
+  highlightFixes: boolean;
   pendingAsk: PendingAsk | null;
   /** In-flight doc generation (new doc) for the Docs tab. */
   pendingDoc: { requestId: string; prompt: string } | null;
@@ -95,6 +106,8 @@ interface RecordingState {
   applyRecording: (r: Recording) => void;
   appendSegments: (recordingId: string, segs: Segment[]) => void;
   replaceSegment: (seg: Segment) => void;
+  /** Replace sentences of the open recording that are already shown (AI fixes, reverts). */
+  updateSegments: (recordingId: string, segs: Segment[]) => void;
   setAnalysis: (a: Analysis) => void;
   setEmbeddingsIndexed: (v: boolean) => void;
   upsertDoc: (doc: Doc) => void;
@@ -106,6 +119,7 @@ interface RecordingState {
   findRelated: (seg: Segment) => Promise<void>;
   setFindOpen: (open: boolean) => void;
   setFontSize: (size: number) => void;
+  setHighlightFixes: (on: boolean) => void;
   setPendingAsk: (p: PendingAsk | null) => void;
   setPendingDoc: (p: { requestId: string; prompt: string } | null) => void;
   revealSegment: (segmentId: number) => void;
@@ -141,6 +155,7 @@ export const useRecording = create<RecordingState>((set, get) => ({
   related: null,
   findOpen: false,
   fontSize: readFont(),
+  highlightFixes: readHighlightFixes(),
   pendingAsk: null,
   pendingDoc: null,
   reveal: null,
@@ -232,6 +247,13 @@ export const useRecording = create<RecordingState>((set, get) => ({
     set({ detail: { ...detail, segments: detail.segments.map((s) => (s.id === seg.id ? seg : s)) } });
   },
 
+  updateSegments: (recordingId, segs) => {
+    const { id, detail } = get();
+    if (id !== recordingId || !detail || !segs.length) return;
+    const byId = new Map(segs.map((s) => [s.id, s]));
+    set({ detail: { ...detail, segments: detail.segments.map((s) => byId.get(s.id) ?? s) } });
+  },
+
   setAnalysis: (analysis) => {
     const { detail } = get();
     if (detail) set({ detail: { ...detail, analysis } });
@@ -290,6 +312,14 @@ export const useRecording = create<RecordingState>((set, get) => ({
       /* ignore */
     }
     set({ fontSize });
+  },
+  setHighlightFixes: (highlightFixes) => {
+    try {
+      localStorage.setItem(LS_HIGHLIGHT_FIXES, highlightFixes ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+    set({ highlightFixes });
   },
   setPendingAsk: (pendingAsk) => set({ pendingAsk }),
   setPendingDoc: (pendingDoc) => set({ pendingDoc }),

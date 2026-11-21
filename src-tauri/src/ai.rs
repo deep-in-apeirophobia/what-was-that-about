@@ -1,14 +1,17 @@
-//! AI features on top of OpenRouter: analysis, embeddings, Q&A and interactive docs.
+//! AI features on top of OpenRouter: analysis, transcript fixes, embeddings, Q&A and
+//! interactive docs.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
 use tauri::{AppHandle, Emitter, Manager};
 use wwta_core::llm::{self, CitationRewriter, LibraryContextItem, Msg};
 use wwta_core::search;
-use wwta_core::types::{now_iso, Analysis, ChatMessage, Doc, LlmStreamEvent, SearchHit};
+use wwta_core::types::{
+    now_iso, Analysis, ChatMessage, Doc, FixProgress, FixSummary, LlmStreamEvent, SearchHit,
+};
 
 use crate::events;
 use crate::state::AppState;
@@ -95,6 +98,31 @@ impl LlmJob {
         }
     }
 
+    /// Like `start`, but `None` when a job with this id is already running.
+    fn try_start(app: &AppHandle, id: &str) -> Option<Self> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let state = app.state::<AppState>();
+            let mut jobs = state.llm_jobs.lock().unwrap();
+            if jobs.contains_key(id) {
+                return None;
+            }
+            jobs.insert(id.to_string(), cancel.clone());
+        }
+        Some(Self {
+            app: app.clone(),
+            id: id.to_string(),
+            cancel,
+        })
+    }
+
+    /// Resolves once the job is cancelled.
+    async fn cancelled(&self) {
+        while !self.cancel.load(Ordering::Relaxed) {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+    }
+
     fn emit(&self, delta: Option<String>, done: bool, error: Option<String>) {
         let _ = self.app.emit(
             events::LLM_STREAM,
@@ -123,6 +151,39 @@ impl Drop for LlmJob {
             .lock()
             .unwrap()
             .remove(&self.id);
+    }
+}
+
+/// A completion that must be one JSON object. Retries without `response_format` for
+/// providers that reject it, and asks the model once to repair invalid JSON.
+async fn complete_json(
+    client: &llm::Client,
+    model: &str,
+    messages: &[Msg],
+    max_tokens: u32,
+    usage: &mut Option<llm::Usage>,
+) -> Result<serde_json::Value> {
+    let (raw, u) = match client.complete(model, messages, true, max_tokens).await {
+        Ok(r) => r,
+        Err(e) if e.to_string().contains("response_format") => {
+            client.complete(model, messages, false, max_tokens).await?
+        }
+        Err(e) => return Err(e),
+    };
+    add_usage(usage, u);
+    match llm::extract_json(&raw) {
+        Ok(v) => Ok(v),
+        Err(first) => {
+            log::warn!("model JSON invalid ({first:#}); asking the model to repair it");
+            let mut repair = messages.to_vec();
+            repair.push(Msg::assistant(raw));
+            repair.push(Msg::user(
+                "That was not valid JSON. Reply again with only the corrected JSON object.",
+            ));
+            let (fixed, u) = client.complete(model, &repair, false, max_tokens).await?;
+            add_usage(usage, u);
+            llm::extract_json(&fixed)
+        }
     }
 }
 
@@ -155,29 +216,7 @@ async fn analyze_inner(
     }
     let messages = llm::analysis_messages(&rec.title, &segs, &settings.ai_language);
     let model = settings.llm_model.clone();
-    let (raw, u) = match client.complete(&model, &messages, true, 16_000).await {
-        Ok(r) => r,
-        // some providers reject response_format; retry without it
-        Err(e) if e.to_string().contains("response_format") => {
-            client.complete(&model, &messages, false, 16_000).await?
-        }
-        Err(e) => return Err(e),
-    };
-    add_usage(usage, u);
-    let value = match llm::extract_json(&raw) {
-        Ok(v) => v,
-        Err(first) => {
-            log::warn!("analysis JSON invalid ({first:#}); asking the model to repair it");
-            let mut repair = messages.clone();
-            repair.push(Msg::assistant(raw));
-            repair.push(Msg::user(
-                "That was not valid JSON. Reply again with only the corrected JSON object.",
-            ));
-            let (fixed, u) = client.complete(&model, &repair, false, 16_000).await?;
-            add_usage(usage, u);
-            llm::extract_json(&fixed)?
-        }
-    };
+    let value = complete_json(&client, &model, &messages, 16_000, usage).await?;
     let analysis = llm::parse_analysis(&value, &segs, &model, &settings.ai_language);
     {
         let mut db = state.db.lock().unwrap();
@@ -189,6 +228,116 @@ async fn analyze_inner(
         events::recording_updated(app, &db, id);
     }
     Ok(analysis)
+}
+
+/// Fix requests in flight at once.
+const FIX_CONCURRENCY: usize = 4;
+
+/// `llm_jobs` key of a recording's transcript fix; `cancel_llm` with it stops the fix.
+fn fix_job_id(recording_id: &str) -> String {
+    format!("fix:{recording_id}")
+}
+
+/// Correct recognition errors in the transcript, batch by batch. Each batch is saved and
+/// sent to the UI as it finishes, so a failed or cancelled run keeps what was done.
+pub async fn fix_transcript(app: &AppHandle, id: &str) -> Result<FixSummary> {
+    let job = LlmJob::try_start(app, &fix_job_id(id))
+        .ok_or_else(|| anyhow!("this transcript is already being fixed"))?;
+    let started = std::time::Instant::now();
+    let model = app.state::<AppState>().settings().llm_model;
+    let mut usage = None;
+    let r = fix_transcript_inner(app, id, &job, &mut usage).await;
+    let extra = match &r {
+        Ok(s) => {
+            serde_json::json!({ "changed": s.changed, "batches": s.batches, "failed": s.failed })
+        }
+        Err(_) => serde_json::json!({}),
+    };
+    track_ai(app, "fix_transcript", &model, started, &r, usage, extra);
+    r
+}
+
+async fn fix_transcript_inner(
+    app: &AppHandle,
+    id: &str,
+    job: &LlmJob,
+    usage: &mut Option<llm::Usage>,
+) -> Result<FixSummary> {
+    let (client, settings) = client(app)?;
+    let state = app.state::<AppState>();
+    let (rec, segs, analysis) = {
+        let db = state.db.lock().unwrap();
+        (db.recording(id)?, db.segments(id)?, db.analysis(id)?)
+    };
+    if segs.is_empty() {
+        bail!("transcribe the recording before fixing it");
+    }
+    let summary = analysis.as_ref().map(|a| a.summary.as_str());
+    let mut pending = llm::fix_batches(&segs).into_iter().map(|range| {
+        let messages = llm::fix_messages(&rec.title, summary, &segs, range.clone());
+        (range, messages)
+    });
+    let batches = pending.len() as u32;
+    let mut running = tokio::task::JoinSet::new();
+    let mut spawn_next = |running: &mut tokio::task::JoinSet<_>| {
+        if let Some((range, messages)) = pending.next() {
+            let (client, model) = (client.clone(), settings.llm_model.clone());
+            running.spawn(async move {
+                let mut usage = None;
+                let r = complete_json(&client, &model, &messages, llm::FIX_MAX_TOKENS, &mut usage)
+                    .await;
+                (range, r, usage)
+            });
+        }
+    };
+    for _ in 0..FIX_CONCURRENCY {
+        spawn_next(&mut running);
+    }
+    let (mut done, mut changed, mut failed) = (0u32, 0u32, 0u32);
+    let mut first_error: Option<String> = None;
+    loop {
+        // Dropping `running` on cancel aborts the requests still in flight.
+        let joined = tokio::select! {
+            j = running.join_next() => j,
+            _ = job.cancelled() => bail!("cancelled"),
+        };
+        let Some(joined) = joined else { break };
+        spawn_next(&mut running);
+        let (range, r, u) = joined?;
+        add_usage(usage, u);
+        done += 1;
+        let fixed = match r {
+            Ok(v) => {
+                let fixes = llm::parse_fixes(&v, &segs[range]);
+                state.db.lock().unwrap().apply_fixes(id, &fixes)?
+            }
+            Err(e) => {
+                log::warn!("transcript fix batch failed: {e:#}");
+                failed += 1;
+                first_error.get_or_insert_with(|| format!("{e:#}"));
+                vec![]
+            }
+        };
+        changed += fixed.len() as u32;
+        let _ = app.emit(
+            events::TRANSCRIPT_FIX,
+            FixProgress {
+                recording_id: id.to_string(),
+                done,
+                total: batches,
+                changed: fixed,
+            },
+        );
+    }
+    if failed == batches {
+        bail!(first_error.unwrap_or_default());
+    }
+    Ok(FixSummary {
+        changed,
+        batches,
+        failed,
+        error: first_error,
+    })
 }
 
 pub async fn index_embeddings(app: &AppHandle, id: &str) -> Result<()> {

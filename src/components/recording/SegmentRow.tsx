@@ -1,6 +1,7 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, useEffect, useMemo, useRef, useState } from "react";
 import clsx from "clsx";
-import { Check, Copy, Link, Network, Pencil, Play, StickyNote, X } from "lucide-react";
+import { Check, Copy, Link, Network, Pencil, Play, StickyNote, Undo2, X } from "lucide-react";
+import { diffFix, type FixPiece } from "../../lib/fixes";
 import { formatTime, pluralize } from "../../lib/format";
 import { noteColor } from "../../lib/notes";
 import { findContainingIndex, wordRanges } from "../../lib/segments";
@@ -19,6 +20,8 @@ export interface SegmentHandlers {
   addNote: (seg: Segment) => void;
   copyLink: (seg: Segment) => void;
   showNote: (note: Note) => void;
+  /** Put back the recognized text of an AI-fixed sentence. */
+  restoreOriginal: (seg: Segment) => void;
 }
 
 /** Active-row text with the word being spoken highlighted (only this row re-renders per word). */
@@ -34,6 +37,46 @@ function KaraokeText({ seg }: { seg: Segment }) {
       {seg.text.slice(r[1])}
     </>
   );
+}
+
+/** `text` (starting at `offset` in the sentence) with the part inside `word` highlighted. */
+function withActiveWord(text: string, offset: number, word: [number, number] | null): React.ReactNode {
+  const s = word ? Math.max(word[0] - offset, 0) : 0;
+  const e = word ? Math.min(word[1] - offset, text.length) : 0;
+  if (e <= s) return text;
+  return (
+    <>
+      {text.slice(0, s)}
+      <span className="word-active">{text.slice(s, e)}</span>
+      {text.slice(e)}
+    </>
+  );
+}
+
+/** Sentence text with AI corrections marked; the transcript shows what was heard on hover. */
+function FixText({ pieces, word = null }: { pieces: FixPiece[]; word?: [number, number] | null }) {
+  let offset = 0;
+  return (
+    <>
+      {pieces.map((p, i) => {
+        const at = offset;
+        offset += p.text.length;
+        if (p.original === null) return <Fragment key={i}>{withActiveWord(p.text, at, word)}</Fragment>;
+        return (
+          <mark key={i} className={p.text ? "fix-hit" : "fix-removed"} data-fix-original={p.original}>
+            {withActiveWord(p.text, at, word)}
+          </mark>
+        );
+      })}
+    </>
+  );
+}
+
+/** `FixText` on the active row, following the spoken word like `KaraokeText`. */
+function FixKaraokeText({ seg, pieces }: { seg: Segment; pieces: FixPiece[] }) {
+  const ranges = useMemo(() => wordRanges(seg.text, seg.words), [seg]);
+  const wi = usePlayer((s) => findContainingIndex(seg.words, s.time));
+  return <FixText pieces={pieces} word={wi >= 0 ? ranges[wi] : null} />;
 }
 
 function FindText({ text, ranges, current }: { text: string; ranges: [number, number][]; current: number }) {
@@ -131,6 +174,8 @@ export interface SegmentRowProps {
   notes?: Note[];
   /** Show the note-count badge (first row of a run with the same notes). */
   noteBadge?: boolean;
+  /** Mark the words an AI fix changed. */
+  highlightFixes: boolean;
 }
 
 /** Colored bars in the margin, one per note (up to three). */
@@ -157,8 +202,14 @@ function SegmentRowImpl({
   handlers,
   notes,
   noteBadge,
+  highlightFixes,
 }: SegmentRowProps) {
   const hasWords = seg.words.length > 0;
+  const fixed = seg.originalText != null;
+  const fixPieces = useMemo(
+    () => (highlightFixes && seg.originalText != null ? diffFix(seg.originalText, seg.text) : null),
+    [highlightFixes, seg.originalText, seg.text],
+  );
   const clickText = () => {
     // Don't hijack a text selection.
     const sel = window.getSelection();
@@ -229,6 +280,8 @@ function SegmentRowImpl({
         >
           {findRanges.length ? (
             <FindText text={seg.text} ranges={findRanges} current={currentFind} />
+          ) : fixPieces ? (
+            active && hasWords ? <FixKaraokeText seg={seg} pieces={fixPieces} /> : <FixText pieces={fixPieces} />
           ) : active && hasWords ? (
             <KaraokeText seg={seg} />
           ) : (
@@ -259,6 +312,11 @@ function SegmentRowImpl({
           <RowAction label="Edit text" onClick={() => setEditing(seg.id)}>
             <Pencil className="size-3.5" />
           </RowAction>
+          {fixed && (
+            <RowAction label="Restore the original text (undo the AI fix)" onClick={() => handlers.restoreOriginal(seg)}>
+              <Undo2 className="size-3.5" />
+            </RowAction>
+          )}
         </div>
       )}
     </div>

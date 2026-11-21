@@ -9,6 +9,8 @@ import type {
   ChatMessage,
   Doc,
   ExportFormat,
+  FixProgress,
+  FixSummary,
   LlmModelInfo,
   LlmStreamEvent,
   ModelInfo,
@@ -61,6 +63,7 @@ export const EVENTS = {
   modelProgress: "model://progress",
   transcriptionProgress: "transcription://progress",
   llmStream: "llm://stream",
+  transcriptFix: "transcript://fix-progress",
   /** Payload: Recording — emitted whenever a recording row changes. */
   recordingUpdated: "library://recording-updated",
   /** Payload: string (recording id) */
@@ -71,6 +74,7 @@ export const onModelProgress = (cb: (p: ModelProgress) => void) => listen(EVENTS
 export const onTranscriptionProgress = (cb: (p: TranscriptionProgress) => void) =>
   listen(EVENTS.transcriptionProgress, cb);
 export const onLlmStream = (cb: (p: LlmStreamEvent) => void) => listen(EVENTS.llmStream, cb);
+export const onFixProgress = (cb: (p: FixProgress) => void) => listen(EVENTS.transcriptFix, cb);
 export const onRecordingUpdated = (cb: (r: Recording) => void) => listen(EVENTS.recordingUpdated, cb);
 export const onRecordingDeleted = (cb: (id: string) => void) => listen(EVENTS.recordingDeleted, cb);
 
@@ -150,6 +154,15 @@ export const api = {
   testApiKey: (apiKey: string) => invoke<string>("test_api_key", { apiKey }),
   analyze: (id: string, parts: AnalysisPart[] = ["summary", "chapters", "tags"]) =>
     invoke<Analysis>("analyze", { id, parts }),
+  /** Correct recognition errors with the AI model, keeping the recognized text in
+   *  `originalText`. Each finished batch arrives on `transcript://fix-progress`. */
+  fixTranscript: (id: string) => invoke<FixSummary>("fix_transcript", { id }),
+  /** Stop a running fix; corrections already saved are kept. */
+  cancelFixTranscript: (id: string) => invoke<void>("cancel_llm", { requestId: `fix:${id}` }),
+  /** Put back the recognized text of AI-fixed sentences (`segmentIds` null = all).
+   *  Returns the sentences that changed. */
+  revertTranscriptFixes: (id: string, segmentIds: number[] | null) =>
+    invoke<Segment[]>("revert_transcript_fixes", { id, segmentIds }),
   /** Build the embedding index for semantic search. */
   indexEmbeddings: (id: string) => invoke<void>("index_embeddings", { id }),
   /** Ask a question. Streams tokens on `llm://stream` with the given requestId,

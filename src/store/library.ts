@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { api } from "../lib/api";
-import type { Recording, TranscriptionProgress } from "../lib/types";
+import type { FixProgress, Recording, TranscriptionProgress } from "../lib/types";
 import { pluralize } from "../lib/format";
 import { attempt, toast } from "./toasts";
 import { useApp } from "./app";
@@ -8,14 +8,24 @@ import { useApp } from "./app";
 /** Last progress per recording, without the (potentially large) newSegments payload. */
 export type ProgressInfo = Omit<TranscriptionProgress, "newSegments">;
 
+/** A running AI transcript fix: batches finished so far (total is 0 until the first one). */
+export interface FixingInfo {
+  done: number;
+  total: number;
+}
+
 interface LibraryState {
   recordings: Recording[];
   loaded: boolean;
   progress: Record<string, ProgressInfo>;
+  /** AI transcript fixes started from this window, by recording id. */
+  fixing: Record<string, FixingInfo>;
   refresh: () => Promise<void>;
   upsert: (r: Recording) => void;
   remove: (id: string) => void;
   applyProgress: (p: TranscriptionProgress) => void;
+  setFixing: (id: string, info: FixingInfo | null) => void;
+  applyFixProgress: (p: FixProgress) => void;
   importPaths: (paths: string[]) => Promise<Recording[]>;
   importLink: (url: string) => Promise<Recording | null>;
   insertIfMissing: (r: Recording) => void;
@@ -27,6 +37,7 @@ export const useLibrary = create<LibraryState>((set, get) => ({
   recordings: [],
   loaded: false,
   progress: {},
+  fixing: {},
 
   refresh: async () => {
     const list = await attempt("Couldn't load your library", () => api.listRecordings());
@@ -69,6 +80,18 @@ export const useLibrary = create<LibraryState>((set, get) => ({
       const title = get().recordings.find((r) => r.id === p.recordingId)?.title ?? "A recording";
       toast.error(`Transcription failed: ${title}`, p.message ?? "Unknown error");
     }
+  },
+
+  setFixing: (id, info) =>
+    set((s) => {
+      const fixing = { ...s.fixing };
+      if (info) fixing[id] = info;
+      else delete fixing[id];
+      return { fixing };
+    }),
+
+  applyFixProgress: (p) => {
+    if (get().fixing[p.recordingId]) get().setFixing(p.recordingId, { done: p.done, total: p.total });
   },
 
   importLink: async (url) => {

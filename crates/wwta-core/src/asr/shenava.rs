@@ -106,6 +106,7 @@ impl Engine for Shenava {
                     end,
                     text,
                     words,
+                    original_text: None,
                 });
             }
             out.extend(new.iter().cloned());

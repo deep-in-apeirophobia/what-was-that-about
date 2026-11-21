@@ -788,6 +788,38 @@ pub fn update_segment_text(
         .map_err(anyhow_err)
 }
 
+/// Correct recognition errors with the OpenRouter model. Progress (and the changed
+/// segments) arrive on `transcript://fix-progress`; `cancel_llm("fix:<id>")` stops it.
+#[tauri::command]
+pub async fn fix_transcript(app: AppHandle, id: String) -> CmdResult<FixSummary> {
+    crate::ai::fix_transcript(&app, &id)
+        .await
+        .map_err(anyhow_err)
+}
+
+/// Put back the recognizer's text of AI-fixed segments (`segment_ids` null = all).
+#[tauri::command]
+pub fn revert_transcript_fixes(
+    state: State<'_, AppState>,
+    id: String,
+    segment_ids: Option<Vec<u32>>,
+) -> CmdResult<Vec<Segment>> {
+    let reverted = state
+        .db
+        .lock()
+        .unwrap()
+        .revert_fixes(&id, segment_ids.as_deref())
+        .map_err(anyhow_err)?;
+    state.analytics.capture(
+        "transcript fixes reverted",
+        serde_json::json!({
+            "scope": if segment_ids.is_some() { "segments" } else { "all" },
+            "segments": reverted.len(),
+        }),
+    );
+    Ok(reverted)
+}
+
 #[tauri::command]
 pub fn get_waveform(state: State<'_, AppState>, id: String) -> CmdResult<Waveform> {
     let peaks = audio::read_peaks(&state.paths.peaks_path(&id))

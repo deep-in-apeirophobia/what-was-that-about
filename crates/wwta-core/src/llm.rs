@@ -714,6 +714,126 @@ pub fn html_title(html: &str) -> Option<String> {
     (!t.is_empty()).then(|| t.chars().take(100).collect())
 }
 
+// ------------------------------------------------------------------ transcript fixing
+
+/// Transcript text per fix request. The model answers with the changed segments only, so
+/// the reply stays well under `FIX_MAX_TOKENS` even when most of a batch needs fixing.
+const FIX_BATCH_CHARS: usize = 5_000;
+const FIX_BATCH_SEGMENTS: usize = 80;
+/// Read-only segments shown on each side of a batch.
+const FIX_CONTEXT_SEGMENTS: usize = 3;
+pub const FIX_MAX_TOKENS: u32 = 12_000;
+
+/// Split a transcript into consecutive batches (index ranges into `segs`) for fixing.
+pub fn fix_batches(segs: &[Segment]) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut chars = 0;
+    for (i, s) in segs.iter().enumerate() {
+        let len = s.text.chars().count();
+        if i > start && (chars + len > FIX_BATCH_CHARS || i - start >= FIX_BATCH_SEGMENTS) {
+            out.push(start..i);
+            start = i;
+            chars = 0;
+        }
+        chars += len;
+    }
+    if start < segs.len() {
+        out.push(start..segs.len());
+    }
+    out
+}
+
+const FIX_SYSTEM: &str = "You proofread automatic speech recognition (ASR) transcripts of Persian (Farsi) audio. \
+    Each line is one segment: `[id] text`. Fix recognition errors so each segment says what the speaker \
+    actually said:\n\
+    - misheard words: use the context to pick the word that was meant (usually one that sounds similar)\n\
+    - words wrongly split or joined, missing or wrong half-spaces (ZWNJ, e.g. می\u{200c}شود), spelling mistakes\n\
+    - Arabic letter forms (ي ك) instead of Persian (ی ک)\n\
+    - missing or wrong punctuation (، . ؟ !)\n\
+    Rules:\n\
+    - Keep the speaker's words, word order and spoken style. Colloquial forms stay colloquial \
+    (می\u{200c}خوام must not become می\u{200c}خواهم). \
+    Never paraphrase, summarize, translate, censor, complete or reorder.\n\
+    - Keep words from other languages, filler words and repetitions; keep numbers in the form they have \
+    (digits stay digits, words stay words).\n\
+    - Segments stay separate: never move words from one segment to another, merge or split segments.\n\
+    - Only change what is clearly a recognition error; when unsure, leave the text as it is.\n\
+    - Correct only the segments under \"Segments to correct\". Context lines are there to help you \
+    understand; never return them.\n\
+    Respond with ONE JSON object and nothing else: {\"fixes\": [{\"id\": 12, \"text\": \"the complete corrected \
+    text of segment 12\"}]}. List only the segments you changed; reply {\"fixes\": []} if none need changes.";
+
+fn id_lines(segs: &[Segment]) -> String {
+    segs.iter()
+        .map(|s| format!("[{}] {}\n", s.id, s.text.trim()))
+        .collect()
+}
+
+/// The request for one batch: `segs[batch]` with a few read-only segments around it.
+/// `summary` (from the AI analysis) helps the model with names and terms.
+pub fn fix_messages(
+    title: &str,
+    summary: Option<&str>,
+    segs: &[Segment],
+    batch: std::ops::Range<usize>,
+) -> Vec<Msg> {
+    let mut user = format!("Recording: {title}\n");
+    if let Some(s) = summary.map(str::trim).filter(|s| !s.is_empty()) {
+        user.push_str(&format!(
+            "\nSummary of the whole recording (for names and terms):\n{s}\n"
+        ));
+    }
+    let before = &segs[batch.start.saturating_sub(FIX_CONTEXT_SEGMENTS)..batch.start];
+    let after = &segs[batch.end..(batch.end + FIX_CONTEXT_SEGMENTS).min(segs.len())];
+    if !before.is_empty() {
+        user.push_str(&format!(
+            "\nContext before (don't correct):\n{}",
+            id_lines(before)
+        ));
+    }
+    user.push_str(&format!(
+        "\nSegments to correct:\n{}",
+        id_lines(&segs[batch])
+    ));
+    if !after.is_empty() {
+        user.push_str(&format!(
+            "\nContext after (don't correct):\n{}",
+            id_lines(after)
+        ));
+    }
+    vec![Msg::system(FIX_SYSTEM), Msg::user(user)]
+}
+
+/// A correction is a small edit of the segment, not a rewrite or a dropped sentence.
+fn plausible_fix(old: &str, new: &str) -> bool {
+    let (a, b) = (old.chars().count(), new.chars().count());
+    b > 0 && b <= a * 2 + 12 && b * 2 + 12 >= a
+}
+
+/// The model's corrections for `batch` as `(segment id, current text, corrected text)`.
+/// Drops ids outside the batch, unchanged or empty texts and implausible rewrites.
+pub fn parse_fixes(v: &Value, batch: &[Segment]) -> Vec<(u32, String, String)> {
+    let echoed_id = Regex::new(r"^\[\d+\]\s*").unwrap();
+    let items = v["fixes"].as_array().or_else(|| v.as_array());
+    let mut out: Vec<(u32, String, String)> = Vec::new();
+    for item in items.into_iter().flatten() {
+        let (Some(id), Some(text)) = (as_u32(&item["id"]), item["text"].as_str()) else {
+            continue;
+        };
+        let Some(seg) = batch.iter().find(|s| s.id == id) else {
+            continue;
+        };
+        let new = echoed_id.replace(text.trim(), "").trim().to_string();
+        let old = seg.text.trim();
+        if new == old || !plausible_fix(old, &new) || out.iter().any(|f| f.0 == id) {
+            continue;
+        }
+        out.push((id, seg.text.clone(), new));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,6 +846,7 @@ mod tests {
                 end: i as f64 * 10.0 + 9.0,
                 text: format!("جمله {i}"),
                 words: vec![],
+                original_text: None,
             })
             .collect()
     }
@@ -788,6 +909,54 @@ mod tests {
         assert_eq!((u.prompt_tokens, u.completion_tokens), (1200, 300));
         assert_eq!(u.cost, Some(0.00042));
         assert!(Usage::from_json(&serde_json::json!({"choices": []})).is_none());
+    }
+
+    #[test]
+    fn fix_batches_cover_the_transcript() {
+        let s = segs(200);
+        let b = fix_batches(&s);
+        assert_eq!(b.first().unwrap().start, 0);
+        assert_eq!(b.last().unwrap().end, 200);
+        assert!(b.windows(2).all(|w| w[0].end == w[1].start));
+        assert!(b.iter().all(|r| r.len() <= FIX_BATCH_SEGMENTS));
+        assert_eq!(b.len(), 3);
+        assert!(fix_batches(&[]).is_empty());
+
+        let m = fix_messages("t", Some("خلاصه"), &s, b[1].clone());
+        let user = &m[1].content;
+        assert!(user.contains("خلاصه"));
+        assert!(user.contains(
+            "Context before (don't correct):\n[77] جمله 77\n[78] جمله 78\n[79] جمله 79\n"
+        ));
+        assert!(user.contains("Segments to correct:\n[80] جمله 80\n"));
+        assert!(user.contains("Context after (don't correct):\n[160] جمله 160\n"));
+        assert!(!fix_messages("t", None, &s, b[0].clone())[1]
+            .content
+            .contains("Context before"));
+    }
+
+    #[test]
+    fn parses_and_filters_fixes() {
+        let batch = segs(5);
+        let v: Value = serde_json::from_str(
+            r#"{"fixes":[
+                {"id":1,"text":"[1] جمله یک"},
+                {"id":"2","text":"جمله 2"},
+                {"id":3,"text":""},
+                {"id":4,"text":"این جمله را مدل کاملاً بازنویسی کرده و خیلی طولانی‌تر شده است"},
+                {"id":9,"text":"خارج از دسته"},
+                {"id":1,"text":"تکراری"},
+                {"text":"بدون شناسه"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parse_fixes(&v, &batch),
+            vec![(1, "جمله 1".to_string(), "جمله یک".to_string())]
+        );
+        let bare: Value = serde_json::from_str(r#"[{"id":0,"text":"جمله ۰"}]"#).unwrap();
+        assert_eq!(parse_fixes(&bare, &batch).len(), 1);
+        assert!(parse_fixes(&serde_json::json!({"fixes": []}), &batch).is_empty());
     }
 
     #[test]

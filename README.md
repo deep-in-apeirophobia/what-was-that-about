@@ -76,6 +76,11 @@ A one-hour recording is roughly 40k tokens, a fraction of a cent with these mode
   them, action items and suggested questions.
 - **Ask:** chat about one recording or the whole library; answers cite segments like `[12]`,
   and clicking a citation plays that moment.
+- **Fix transcript:** the model corrects recognition errors (misheard words, half-spaces,
+  spelling, punctuation) and keeps the spoken style. The recognized text is kept: corrected
+  words are highlighted (toggle in the transcript toolbar), hovering one shows what was heard,
+  and a sentence or the whole transcript can be restored. Search, AI answers and exports use
+  the corrected text; JSON exports also include the recognized text.
 - **Docs:** the model writes a self-contained HTML/JS page (mind map, timeline, flashcards,
   quiz, minutes…) shown inside the app. Docs run in a sandboxed iframe on their own origin with
   a Content-Security-Policy that blocks all network access; they can only read the transcript
