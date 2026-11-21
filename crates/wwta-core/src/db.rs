@@ -238,6 +238,14 @@ impl Db {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM segments WHERE recording_id = ?1", [id])?;
         tx.execute("DELETE FROM embeddings WHERE recording_id = ?1", [id])?;
+        // A new transcript renumbers segments, so the old analysis (chapters/tags point at
+        // segment ids) no longer fits; docs and chat history are kept.
+        tx.execute("DELETE FROM analyses WHERE recording_id = ?1", [id])?;
+        tx.execute("DELETE FROM analysis_tags WHERE recording_id = ?1", [id])?;
+        tx.execute(
+            "UPDATE recordings SET tags_json = '[]', blurb = NULL WHERE id = ?1",
+            [id],
+        )?;
         {
             let mut st = tx.prepare(
                 "INSERT INTO segments (recording_id, idx, start, end, text, norm, words) VALUES (?1,?2,?3,?4,?5,?6,?7)",
@@ -587,6 +595,13 @@ mod tests {
 
         let s = db.update_segment_text("r1", 1, "بدرود").unwrap();
         assert_eq!(s.text, "بدرود");
+
+        // re-transcribing drops the analysis that referenced the old segment ids
+        db.replace_segments("r1", "taraneh-wlarge", &segs).unwrap();
+        let r = db.recording("r1").unwrap();
+        assert!(!r.has_analysis);
+        assert!(r.tags.is_empty());
+        assert!(db.all_tags().unwrap().is_empty());
 
         db.delete_recording("r1").unwrap();
         assert!(db.get_recording("r1").unwrap().is_none());
