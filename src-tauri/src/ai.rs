@@ -380,11 +380,12 @@ async fn index_embeddings_inner(app: &AppHandle, id: &str, inputs: &mut usize) -
             vector: v,
         })
         .collect();
-    state
-        .db
-        .lock()
-        .unwrap()
-        .replace_embeddings(id, &settings.embedding_model, &rows)?;
+    let mut db = state.db.lock().unwrap();
+    // An edit, AI fix or new transcript while the request ran would leave stale vectors.
+    if db.segments(id)? != segs {
+        bail!("the transcript changed while indexing; enable semantic search again");
+    }
+    db.replace_embeddings(id, &settings.embedding_model, &rows)?;
     Ok(())
 }
 

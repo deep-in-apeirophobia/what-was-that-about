@@ -109,6 +109,8 @@ export async function fixTranscript(id: string): Promise<void> {
     else toast.error("Couldn't fix the transcript", e);
   } finally {
     useLibrary.getState().setFixing(id, null);
+    // Progress events can race a (re)load of the recording; settle on what was saved.
+    if (useRecording.getState().id === id) void useRecording.getState().reload();
   }
 }
 

@@ -5,6 +5,7 @@ vi.mock("../../lib/api", () => ({
   api: {
     fixTranscript: vi.fn(),
     revertTranscriptFixes: vi.fn(),
+    getRecording: vi.fn(),
   },
 }));
 
@@ -14,7 +15,7 @@ const { useLibrary } = await import("../../store/library");
 const { useRecording } = await import("../../store/recording");
 const { useToasts } = await import("../../store/toasts");
 
-const mocked = api as unknown as Record<"fixTranscript" | "revertTranscriptFixes", ReturnType<typeof vi.fn>>;
+const mocked = api as unknown as Record<"fixTranscript" | "revertTranscriptFixes" | "getRecording", ReturnType<typeof vi.fn>>;
 
 const seg = (id: number, text: string, originalText?: string): Segment => ({
   id,
@@ -37,6 +38,7 @@ const toastTitles = () => useToasts.getState().toasts.map((t) => t.title);
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mocked.getRecording.mockImplementation(async () => useRecording.getState().detail);
   useToasts.setState({ toasts: [] });
   useLibrary.setState({ fixing: {} });
   open([seg(0, "سلام"), seg(1, "خداحافز")]);
@@ -60,6 +62,20 @@ describe("fixTranscript", () => {
     await run;
     expect(useLibrary.getState().fixing.r1).toBeUndefined();
     expect(toastTitles()).toEqual(["Transcript fixed"]);
+  });
+
+  it("reloads the open recording at the end, so a progress event lost to a load can't stick", async () => {
+    mocked.getRecording.mockResolvedValueOnce({
+      segments: [seg(0, "سلام"), seg(1, "خداحافظ", "خداحافز")],
+      notes: [],
+      docs: [],
+      chat: [],
+      analysis: null,
+    });
+    mocked.fixTranscript.mockResolvedValueOnce({ changed: 1, batches: 1, failed: 0, error: null });
+    await fixTranscript("r1");
+    await vi.waitFor(() => expect(texts()).toEqual(["سلام", "خداحافظ"]));
+    expect(mocked.getRecording).toHaveBeenCalledWith("r1");
   });
 
   it("ignores progress for fixes this window didn't start", () => {
