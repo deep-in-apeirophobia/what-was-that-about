@@ -16,6 +16,10 @@ the app downloads them on first use, or you can import files you downloaded your
 | [Taraneh-WLarge](https://huggingface.co/areffarhadi/Taraneh-WLarge) | Best accuracy with a GPU | MIT | 6.2 GB → 1.7 GB on disk | Whisper large-v3 fine-tuned on ~1,560 h of Persian (3.9% WER on FLEURS). Runs on whisper.cpp with **Vulkan** (Windows/Linux, any modern GPU) or **Metal** (macOS). Works on CPU, slowly. |
 | [Shenava Koochik v1.0](https://huggingface.co/Reza2kn/Shenava-Koochik-v1.0) | CPU, laptops, long files | Apache-2.0 | 459 MB | 114M FastConformer CTC (10.6% WER on FLEURS). ~30× faster than real time on an 8-core CPU. |
 
+Measured speeds: Shenava transcribed a 34-minute podcast in 63 s on an 8-core CPU (~32× real
+time). Taraneh ran at 5–7× real time on a laptop RTX 3070 (Vulkan) and ~0.5× on the same 8-core
+CPU.
+
 Install them from **Models** in the app. Taraneh is published as PyTorch safetensors; the app
 converts it on your machine into a whisper.cpp model (Q8_0 by default, or F16). The converter is
 a Rust port of whisper.cpp's `convert-h5-to-ggml.py` + `quantize` and produces byte-identical
@@ -73,11 +77,25 @@ or from the artifacts of the latest [CI run](https://github.com/deep-in-apeiroph
 - **macOS 11+:** `.dmg` (Apple Silicon and Intel). Builds aren't notarized: right-click the app →
   Open the first time, or run `xattr -dr com.apple.quarantine "/Applications/What Was That About.app"`.
 
+## Troubleshooting
+
+- **First Whisper run is slow on NVIDIA:** the driver compiles Vulkan shaders once (can take a
+  couple of minutes) and caches them; later runs are fast.
+- **Laptops with two GPUs:** the app picks the discrete GPU with the most memory. The Models page
+  shows which device is used.
+- **Linux audio playback:** WebKitGTK plays audio through GStreamer. If a format won't play,
+  install `gst-plugins-good`/`gst-libav` (or use the AppImage, which bundles them); the app also
+  falls back to the decoded WAV.
+- **Logs:** see the app's log directory (`%LOCALAPPDATA%\com.whatwasthatabout.desktop\logs` on
+  Windows, `~/.local/share/com.whatwasthatabout.desktop/logs` on Linux,
+  `~/Library/Logs/com.whatwasthatabout.desktop` on macOS).
+
 ## Build from source
 
 Prerequisites: Rust (stable), Node 22 + pnpm, CMake, a C/C++ toolchain, and
-- Windows: Visual Studio Build Tools (C++), the [Vulkan SDK](https://vulkan.lunarg.com/sdk/home)
-  (`VULKAN_SDK` set), LLVM/Clang for bindgen.
+- Windows: Visual Studio 2022 Build Tools (C++), the [Vulkan SDK](https://vulkan.lunarg.com/sdk/home)
+  (`VULKAN_SDK` set), LLVM/Clang for bindgen. Clone into a short path (e.g. `C:\src\wwta`):
+  whisper.cpp's nested CMake build otherwise exceeds the 260-character path limit.
 - Linux: `libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libsoup-3.0-dev libssl-dev clang
   libclang-dev`, plus the Vulkan SDK (or distro `libvulkan-dev` + `glslc`). NixOS: `nix develop`.
 - macOS: Xcode command line tools.
