@@ -65,6 +65,14 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     created_at TEXT NOT NULL,
     model TEXT
 );
+-- what the AI remembers of a long chat: a summary of every message up to and including
+-- through_id (one row per chat; recording_id NULL is the library chat)
+CREATE TABLE IF NOT EXISTS chat_summaries (
+    recording_id TEXT REFERENCES recordings(id) ON DELETE CASCADE,
+    through_id TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS docs (
     id TEXT PRIMARY KEY,
     recording_id TEXT NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
@@ -446,14 +454,43 @@ impl Db {
     }
 
     pub fn clear_chat(&self, recording_id: Option<&str>) -> Result<()> {
-        match recording_id {
-            Some(id) => self
-                .conn
-                .execute("DELETE FROM chat_messages WHERE recording_id = ?1", [id])?,
-            None => self
-                .conn
-                .execute("DELETE FROM chat_messages WHERE recording_id IS NULL", [])?,
-        };
+        self.conn.execute(
+            "DELETE FROM chat_messages WHERE recording_id IS ?1",
+            [recording_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM chat_summaries WHERE recording_id IS ?1",
+            [recording_id],
+        )?;
+        Ok(())
+    }
+
+    /// The stored summary of a chat's older messages: (id of the last message it covers, text).
+    pub fn chat_summary(&self, recording_id: Option<&str>) -> Result<Option<(String, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT through_id, summary FROM chat_summaries WHERE recording_id IS ?1",
+                [recording_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn save_chat_summary(
+        &self,
+        recording_id: Option<&str>,
+        through_id: &str,
+        summary: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM chat_summaries WHERE recording_id IS ?1",
+            [recording_id],
+        )?;
+        self.conn.execute(
+            "INSERT INTO chat_summaries (recording_id, through_id, summary, created_at) VALUES (?1,?2,?3,?4)",
+            params![recording_id, through_id, summary, now_iso()],
+        )?;
         Ok(())
     }
 
@@ -848,5 +885,23 @@ mod tests {
         db.clear_chat(None).unwrap();
         assert!(db.chat(None).unwrap().is_empty());
         assert_eq!(db.chat(Some("r1")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn chat_summaries_follow_their_chat() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_recording(&sample_recording("r1")).unwrap();
+        db.save_chat_summary(None, "m1", "old").unwrap();
+        db.save_chat_summary(None, "m2", "library").unwrap();
+        db.save_chat_summary(Some("r1"), "m3", "recording").unwrap();
+        assert_eq!(
+            db.chat_summary(None).unwrap(),
+            Some(("m2".into(), "library".into()))
+        );
+        assert_eq!(db.chat_summary(Some("r1")).unwrap().unwrap().1, "recording");
+        db.clear_chat(None).unwrap();
+        assert!(db.chat_summary(None).unwrap().is_none());
+        db.delete_recording("r1").unwrap();
+        assert!(db.chat_summary(Some("r1")).unwrap().is_none());
     }
 }

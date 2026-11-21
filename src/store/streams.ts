@@ -6,6 +6,8 @@ export interface StreamState {
   text: string;
   done: boolean;
   error: string | null;
+  /** What the agent is doing while no answer text is streaming (reading, searching…). */
+  activity: string | null;
 }
 
 interface StreamsState {
@@ -18,7 +20,7 @@ interface StreamsState {
 export const useStreams = create<StreamsState>((set) => ({
   streams: {},
   start: (requestId) =>
-    set((s) => ({ streams: { ...s.streams, [requestId]: { text: "", done: false, error: null } } })),
+    set((s) => ({ streams: { ...s.streams, [requestId]: { text: "", done: false, error: null, activity: null } } })),
   apply: (e) =>
     set((s) => {
       const cur = s.streams[e.requestId];
@@ -28,9 +30,10 @@ export const useStreams = create<StreamsState>((set) => ({
         streams: {
           ...s.streams,
           [e.requestId]: {
-            text: cur.text + (e.delta ?? ""),
+            text: (e.reset ? "" : cur.text) + (e.delta ?? ""),
             done: cur.done || e.done,
             error: e.error ?? cur.error,
+            activity: e.activity ?? (e.delta ? null : cur.activity),
           },
         },
       };

@@ -418,6 +418,12 @@ pub struct LlmStreamEvent {
     pub delta: Option<String>,
     pub done: bool,
     pub error: Option<String>,
+    /// What the agent is doing, e.g. "Reading the transcript".
+    #[serde(default)]
+    pub activity: Option<String>,
+    /// Discard the text streamed so far: it was the model's preface to tool calls.
+    #[serde(default)]
+    pub reset: bool,
 }
 
 pub fn now_iso() -> String {

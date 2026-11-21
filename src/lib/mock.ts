@@ -732,6 +732,15 @@ async function stream(requestId: string, chunks: string[], delay: number): Promi
   emit(EV.llm, { requestId, delta: null, done: true, error: null });
 }
 
+/** Mimic the agent's tool steps before the answer streams. */
+async function agentSteps(requestId: string, labels: string[]): Promise<void> {
+  for (const activity of labels) {
+    if (cancelledRequests.has(requestId)) return;
+    emit(EV.llm, { requestId, delta: null, done: false, error: null, activity });
+    await sleep(450);
+  }
+}
+
 function wordChunks(text: string): string[] {
   return text.match(/\S+\s*|\s+/g) ?? [text];
 }
@@ -1120,7 +1129,10 @@ export const handlers: Record<string, Handler> = {
       const owner = (seg: Segment) => all.find((x) => x.seg === seg)!.s;
       answer = composeAnswer(picks, question, (seg) => `[rec:${owner(seg).rec.id}#${seg.id}]`, picks);
     }
-    await sleep(500);
+    await agentSteps(
+      requestId,
+      recordingId ? ["Reading the overview", `Searching for “${shorten(question, 4)}”`] : [`Searching for “${shorten(question, 4)}”`],
+    );
     await stream(requestId, wordChunks(answer), 35);
     const msg: ChatMessage = {
       id: uid("msg"),
@@ -1149,7 +1161,12 @@ export const handlers: Record<string, Handler> = {
     if (!s.segments.length) throw new Error("Transcribe the recording first.");
     const kind = docKindFromPrompt(prompt);
     const html = mockDocHtml(kind, 200 + Math.floor(Math.random() * 120));
-    await sleep(600);
+    const skill = optStr(args, "skill");
+    await agentSteps(requestId, [
+      ...(skill ? [] : [`Loading the ${kind} guide`]),
+      "Reading the overview",
+      "Reading the transcript",
+    ]);
     await stream(requestId, sizedChunks(html, 160), 18);
     const doc: Doc = {
       id: uid("doc"),

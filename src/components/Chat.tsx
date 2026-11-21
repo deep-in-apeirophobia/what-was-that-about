@@ -26,12 +26,15 @@ function UserBubble({ content }: { content: string }) {
 function AssistantMessage({
   content,
   streaming,
+  activity,
   onCite,
   renderCite,
   model,
 }: {
   content: string;
   streaming?: boolean;
+  /** What the agent is doing before the answer starts (searching, reading…). */
+  activity?: string | null;
   onCite: (c: Citation) => void;
   renderCite?: (c: Citation, label: ReactNode) => ReactNode;
   model?: string | null;
@@ -41,10 +44,15 @@ function AssistantMessage({
       {content ? (
         <Markdown content={content} onCite={onCite} renderCite={renderCite} className="font-fa" />
       ) : (
-        <div className="flex items-center gap-1 py-1" aria-label="Thinking">
+        <div className="flex items-center gap-1 py-1" role="status" aria-label={activity ?? "Thinking"}>
           {[0, 1, 2].map((i) => (
             <span key={i} className="size-1.5 animate-pulse rounded-full bg-faint" style={{ animationDelay: `${i * 150}ms` }} />
           ))}
+          {activity && (
+            <span className="ml-1.5 truncate text-[12px] text-muted" dir="auto">
+              {activity}…
+            </span>
+          )}
         </div>
       )}
       {streaming && content && <span className="ml-0.5 inline-block h-3.5 w-1.5 animate-pulse bg-accent align-middle" />}
@@ -84,6 +92,7 @@ export function ChatThread({
   const [draft, setDraft] = useState("");
   const [confirmClear, setConfirmClear] = useState(false);
   const streamText = useStreams((s) => (pending ? (s.streams[pending.requestId]?.text ?? "") : ""));
+  const activity = useStreams((s) => (pending ? (s.streams[pending.requestId]?.activity ?? null) : null));
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const stickToBottom = useRef(true);
@@ -91,7 +100,7 @@ export function ChatThread({
   useEffect(() => {
     const el = scrollRef.current;
     if (el && stickToBottom.current) el.scrollTop = el.scrollHeight;
-  }, [messages.length, streamText, pending]);
+  }, [messages.length, streamText, activity, pending]);
 
   useEffect(() => {
     const el = inputRef.current;
@@ -132,7 +141,7 @@ export function ChatThread({
         {pending && (
           <>
             <UserBubble content={pending.question} />
-            <AssistantMessage content={streamText} streaming onCite={onCite} renderCite={renderCite} />
+            <AssistantMessage content={streamText} streaming activity={activity} onCite={onCite} renderCite={renderCite} />
           </>
         )}
       </div>

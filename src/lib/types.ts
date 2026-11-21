@@ -310,12 +310,16 @@ export interface LlmModelInfo {
 
 export type AnalysisPart = "summary" | "chapters" | "tags";
 
-/** Event `llm://stream` — streamed tokens for chat answers and docs. */
+/** Event `llm://stream` — streamed tokens and agent progress for chat answers and docs. */
 export interface LlmStreamEvent {
   requestId: string;
   delta: string | null;
   done: boolean;
   error: string | null;
+  /** What the agent is doing, e.g. "Reading the transcript". */
+  activity?: string | null;
+  /** Discard the text streamed so far: it was the model's preface to tool calls. */
+  reset?: boolean;
 }
 
 export type ExportFormat = "txt" | "srt" | "vtt" | "json" | "md";

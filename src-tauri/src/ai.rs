@@ -1,30 +1,21 @@
-//! AI features on top of OpenRouter: analysis, embeddings, Q&A and interactive docs.
+//! AI features on top of OpenRouter: analysis, embeddings, and the tool-using agent behind
+//! Q&A and interactive docs.
 
-use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
+use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager};
-use wwta_core::llm::{self, CitationRewriter, LibraryContextItem, Msg};
+use wwta_core::agent::tools::{Scope, ToolBox};
+use wwta_core::agent::{self, add_usage, Agent, Context, Host, RecordingFacts, Stats};
+use wwta_core::llm::{self, rewrite_citations, CitationRewriter, Msg, ToolCall};
 use wwta_core::search;
-use wwta_core::types::{now_iso, Analysis, ChatMessage, Doc, LlmStreamEvent, SearchHit};
+use wwta_core::types::{now_iso, Analysis, ChatMessage, Doc, LlmStreamEvent, Recording, SearchHit};
 
 use crate::events;
 use crate::state::AppState;
 use crate::telemetry;
-
-fn add_usage(acc: &mut Option<llm::Usage>, u: Option<llm::Usage>) {
-    if let Some(u) = u {
-        let a = acc.get_or_insert_with(llm::Usage::default);
-        a.prompt_tokens += u.prompt_tokens;
-        a.completion_tokens += u.completion_tokens;
-        a.cost = match (a.cost, u.cost) {
-            (Some(x), Some(y)) => Some(x + y),
-            (x, y) => x.or(y),
-        };
-    }
-}
 
 /// Record one OpenRouter request for analytics (kind, model, latency, tokens, cost — never
 /// prompts or answers) and report unexpected failures to Sentry.
@@ -95,23 +86,50 @@ impl LlmJob {
         }
     }
 
-    fn emit(&self, delta: Option<String>, done: bool, error: Option<String>) {
-        let _ = self.app.emit(
-            events::LLM_STREAM,
-            LlmStreamEvent {
-                request_id: self.id.clone(),
-                delta,
-                done,
-                error,
-            },
-        );
+    fn send(&self, ev: LlmStreamEvent) {
+        let _ = self.app.emit(events::LLM_STREAM, ev);
+    }
+
+    fn event(&self) -> LlmStreamEvent {
+        LlmStreamEvent {
+            request_id: self.id.clone(),
+            delta: None,
+            done: false,
+            error: None,
+            activity: None,
+            reset: false,
+        }
+    }
+
+    fn delta(&self, text: String) {
+        self.send(LlmStreamEvent {
+            delta: Some(text),
+            ..self.event()
+        });
+    }
+
+    /// Show what the agent is doing (e.g. which transcript it is reading).
+    fn activity(&self, label: String) {
+        self.send(LlmStreamEvent {
+            activity: Some(label),
+            ..self.event()
+        });
+    }
+
+    /// Clear the text streamed so far: it was the model's preface to tool calls.
+    fn reset(&self) {
+        self.send(LlmStreamEvent {
+            reset: true,
+            ..self.event()
+        });
     }
 
     fn finish<T>(&self, r: &Result<T>) {
-        match r {
-            Ok(_) => self.emit(None, true, None),
-            Err(e) => self.emit(None, true, Some(format!("{e:#}"))),
-        }
+        self.send(LlmStreamEvent {
+            done: true,
+            error: r.as_ref().err().map(|e| format!("{e:#}")),
+            ..self.event()
+        });
     }
 }
 
@@ -307,15 +325,84 @@ fn store_chat(
     Ok(m)
 }
 
-fn history(chat: &[ChatMessage], max: usize) -> Vec<Msg> {
-    let start = chat.len().saturating_sub(max);
-    chat[start..]
-        .iter()
-        .map(|m| Msg {
-            role: m.role.clone(),
-            content: m.content.clone(),
-        })
-        .collect()
+/// Runs the agent's tools against the library and streams its text to the UI.
+struct ToolHost<'a> {
+    app: &'a AppHandle,
+    job: &'a LlmJob,
+    tools: ToolBox,
+    /// Limits semantic search to one recording.
+    recording_id: Option<String>,
+    /// Library chat: turns `[R3#14]` aliases into `[rec:<uuid>#14]` while streaming.
+    rewriter: Option<CitationRewriter>,
+}
+
+impl<'a> ToolHost<'a> {
+    fn new(app: &'a AppHandle, job: &'a LlmJob, recording_id: Option<&str>, skills: bool) -> Self {
+        let scope = match recording_id {
+            Some(id) => Scope::Recording(id.to_string()),
+            None => Scope::Library,
+        };
+        Self {
+            app,
+            job,
+            tools: ToolBox::new(scope, skills),
+            recording_id: recording_id.map(String::from),
+            rewriter: recording_id.is_none().then(CitationRewriter::default),
+        }
+    }
+}
+
+impl Host for ToolHost<'_> {
+    fn tools(&self) -> Vec<Value> {
+        self.tools.definitions()
+    }
+
+    async fn run_tool(&mut self, call: &ToolCall) -> String {
+        let state = self.app.state::<AppState>();
+        let label = self.tools.label(&state.db.lock().unwrap(), call);
+        self.job.activity(label);
+        let semantic = match ToolBox::search_query(call) {
+            Some(q) => semantic_search(self.app, &q, self.recording_id.as_deref(), 12).await,
+            None => vec![],
+        };
+        let db = state.db.lock().unwrap();
+        self.tools.run(&db, call, semantic)
+    }
+
+    fn on_text(&mut self, delta: &str) {
+        let out = match self.rewriter.as_mut() {
+            Some(r) => r.push(delta, self.tools.recording_ids()),
+            None => delta.to_string(),
+        };
+        if !out.is_empty() {
+            self.job.delta(out);
+        }
+    }
+
+    fn on_reset(&mut self) {
+        if let Some(r) = self.rewriter.as_mut() {
+            r.reset();
+        }
+        self.job.reset();
+    }
+}
+
+fn facts(rec: &Recording, notes: usize) -> RecordingFacts<'_> {
+    RecordingFacts {
+        title: &rec.title,
+        duration_sec: rec.duration_sec,
+        segment_count: rec.segment_count,
+        has_analysis: rec.has_analysis,
+        notes,
+    }
+}
+
+fn stats_props(stats: Stats) -> serde_json::Value {
+    serde_json::json!({
+        "requests": stats.requests,
+        "tool_calls": stats.tool_calls,
+        "compactions": stats.compactions,
+    })
 }
 
 pub async fn ask(
@@ -333,9 +420,10 @@ pub async fn ask(
         "ask_library"
     };
     let mut usage = None;
-    let r = ask_inner(app, recording_id, question, &job, &mut usage).await;
+    let mut stats = Stats::default();
+    let r = ask_inner(app, recording_id, question, &job, &mut usage, &mut stats).await;
     job.finish(&r);
-    track_ai(app, kind, &model, started, &r, usage, serde_json::json!({}));
+    track_ai(app, kind, &model, started, &r, usage, stats_props(stats));
     r
 }
 
@@ -345,6 +433,7 @@ async fn ask_inner(
     question: String,
     job: &LlmJob,
     usage: &mut Option<llm::Usage>,
+    stats: &mut Stats,
 ) -> Result<ChatMessage> {
     let (client, settings) = client(app)?;
     let state = app.state::<AppState>();
@@ -353,166 +442,127 @@ async fn ask_inner(
         bail!("empty question");
     }
     let rid = recording_id.as_deref();
-    let prior = state.db.lock().unwrap().chat(rid)?;
-    let (system, rewriter) = match rid {
-        Some(id) => {
-            let (rec, segs, analysis, notes) = {
-                let db = state.db.lock().unwrap();
-                (
-                    db.recording(id)?,
-                    db.segments(id)?,
-                    db.analysis(id)?,
-                    db.notes(id)?,
-                )
-            };
-            if segs.is_empty() {
-                bail!("transcribe the recording before asking about it");
-            }
-            (
-                llm::qa_system(
-                    &rec.title,
-                    &segs,
-                    analysis.as_ref(),
-                    &notes,
-                    &settings.ai_language,
-                ),
-                None,
-            )
-        }
-        None => {
-            let (system, ids) = library_context(app, &question).await?;
-            (system, Some(CitationRewriter::new(ids)))
-        }
-    };
-    store_chat(app, rid, "user", &question, None)?;
-    let mut messages = vec![Msg::system(system)];
-    messages.extend(history(&prior, 12));
-    messages.push(Msg::user(question));
-
-    let mut rewriter = rewriter;
-    let (answer, u) = client
-        .stream(
-            &settings.llm_model,
-            &messages,
-            4_000,
-            &job.cancel,
-            &mut |d| {
-                let out = match rewriter.as_mut() {
-                    Some(r) => r.push(d),
-                    None => d.to_string(),
-                };
-                if !out.is_empty() {
-                    job.emit(Some(out), false, None);
+    let (system, summary, prior) = {
+        let db = state.db.lock().unwrap();
+        let system = match rid {
+            Some(id) => {
+                let rec = db.recording(id)?;
+                if rec.segment_count == 0 {
+                    bail!("transcribe the recording before asking about it");
                 }
-            },
-        )
-        .await?;
-    *usage = u;
-    let answer = match rewriter.as_mut() {
-        Some(r) => {
-            let tail = r.finish();
-            if !tail.is_empty() {
-                job.emit(Some(tail), false, None);
+                let notes = db.notes(id)?.len();
+                agent::recording_chat_system(&facts(&rec, notes), &settings.ai_language)
             }
-            r.rewrite_all(&answer)
+            None => {
+                let n = db.list_recordings()?.len();
+                if n == 0 {
+                    bail!("your library is empty; import and transcribe some recordings first");
+                }
+                agent::library_chat_system(n, &settings.ai_language)
+            }
+        };
+        // messages already folded into a summary are replaced by it
+        let chat = db.chat(rid)?;
+        let (summary, prior) = match db.chat_summary(rid)? {
+            Some((through, text)) => match chat.iter().position(|m| m.id == through) {
+                Some(i) => (Some(text), chat[i + 1..].to_vec()),
+                None => (None, chat),
+            },
+            None => (None, chat),
+        };
+        (system, summary, prior)
+    };
+    let mut host = ToolHost::new(app, job, rid, false);
+    // stored answers cite `[rec:<uuid>#14]`; show the model the aliases its tools use
+    let summary = summary.map(|s| host.tools.aliasify(&s));
+    let history: Vec<Msg> = prior
+        .iter()
+        .map(|m| {
+            let text = host.tools.aliasify(&m.content);
+            if m.role == "user" {
+                Msg::user(text)
+            } else {
+                Msg::assistant(text)
+            }
+        })
+        .collect();
+    store_chat(app, rid, "user", &question, None)?;
+
+    let ctx = Context::new(system, summary, history, Msg::user(question));
+    let mut agent = Agent::new(&client, &settings.llm_model, 4_000, &job.cancel, ctx);
+    let result = agent.run(&mut host).await;
+    *usage = agent.usage;
+    *stats = agent.stats;
+    // remember what was summarized so later questions don't summarize it again
+    if let (Some(summary), Some(last)) = (
+        &agent.ctx.summary,
+        agent.ctx.folded.checked_sub(1).and_then(|i| prior.get(i)),
+    ) {
+        let summary = rewrite_citations(summary, host.tools.recording_ids());
+        state
+            .db
+            .lock()
+            .unwrap()
+            .save_chat_summary(rid, &last.id, &summary)?;
+    }
+    let answer = result?;
+    let answer = match host.rewriter.as_mut() {
+        Some(r) => {
+            let tail = r.finish(host.tools.recording_ids());
+            if !tail.is_empty() {
+                job.delta(tail);
+            }
+            rewrite_citations(&answer, host.tools.recording_ids())
         }
         None => answer,
     };
     store_chat(app, rid, "assistant", &answer, Some(&settings.llm_model))
 }
 
-/// Retrieve excerpts from the whole library for a question (lexical + semantic + tags).
-async fn library_context(app: &AppHandle, question: &str) -> Result<(String, Vec<String>)> {
+/// Let the doc agent work on one recording and return the HTML it wrote.
+async fn write_doc(
+    app: &AppHandle,
+    job: &LlmJob,
+    recording_id: &str,
+    request: String,
+    usage: &mut Option<llm::Usage>,
+    stats: &mut Stats,
+) -> Result<String> {
+    let (client, settings) = client(app)?;
     let state = app.state::<AppState>();
-    let settings = state.settings();
-    let semantic = semantic_search(app, question, None, 24).await;
-    let (lexical, tags) = {
+    let system = {
         let db = state.db.lock().unwrap();
-        // match on individual meaningful words, not just the full phrase
-        let mut lex = Vec::new();
-        for term in question
-            .split_whitespace()
-            .filter(|t| t.chars().count() >= 3)
-        {
-            lex.extend(search::lexical(&db, term, None, 8)?);
+        let rec = db.recording(recording_id)?;
+        if rec.segment_count == 0 {
+            bail!("transcribe the recording before generating docs");
         }
-        (lex, search::tag_hits(&db, question, None)?)
+        let notes = db.notes(recording_id)?.len();
+        agent::doc_system(&facts(&rec, notes), &settings.ai_language)
     };
-    let hits = search::merge_hits(vec![semantic, lexical, tags], 40);
-    if hits.is_empty() {
-        let n = state.db.lock().unwrap().list_recordings()?.len();
-        if n == 0 {
-            bail!("your library is empty; import and transcribe some recordings first");
-        }
-    }
-    // group hits by recording, with one segment of context on each side
-    let mut by_rec: BTreeMap<String, (String, Vec<u32>)> = BTreeMap::new();
-    for h in &hits {
-        let e = by_rec
-            .entry(h.recording_id.clone())
-            .or_insert_with(|| (h.recording_title.clone(), vec![]));
-        for s in h.segment_id.saturating_sub(1)..=h.segment_id + 1 {
-            e.1.push(s);
-        }
-    }
-    let mut items = Vec::new();
-    let mut ids = Vec::new();
-    {
-        let db = state.db.lock().unwrap();
-        for (rid, (title, mut wanted)) in by_rec {
-            wanted.sort_unstable();
-            wanted.dedup();
-            let segs = db.segments(&rid)?;
-            let picked: Vec<_> = segs
-                .into_iter()
-                .filter(|s| wanted.binary_search(&s.id).is_ok())
-                .collect();
-            ids.push(rid.clone());
-            items.push(LibraryContextItem {
-                recording_id: rid,
-                recording_title: title,
-                segments: picked,
-            });
-        }
-    }
-    Ok((llm::library_qa_system(&items, &settings.ai_language), ids))
+    let ctx = Context::new(system, None, vec![], Msg::user(request));
+    let mut host = ToolHost::new(app, job, Some(recording_id), true);
+    let mut agent = Agent::new(&client, &settings.llm_model, 32_000, &job.cancel, ctx);
+    let result = agent.run(&mut host).await;
+    *usage = agent.usage;
+    *stats = agent.stats;
+    llm::extract_html(&result?)
 }
 
 pub async fn generate_doc(
     app: &AppHandle,
     id: String,
     prompt: String,
+    skill: Option<String>,
     request_id: String,
 ) -> Result<Doc> {
     let job = LlmJob::start(app, &request_id);
     let started = std::time::Instant::now();
     let model = app.state::<AppState>().settings().llm_model;
     let mut usage = None;
+    let mut stats = Stats::default();
     let r = async {
-        let (client, settings) = client(app)?;
-        let state = app.state::<AppState>();
-        let (rec, segs, analysis) = {
-            let db = state.db.lock().unwrap();
-            (db.recording(&id)?, db.segments(&id)?, db.analysis(&id)?)
-        };
-        if segs.is_empty() {
-            bail!("transcribe the recording before generating docs");
-        }
-        let messages = vec![
-            Msg::system(llm::doc_system(&settings.ai_language)),
-            Msg::user(llm::doc_user(&prompt, &rec.title, &segs, analysis.as_ref())),
-        ];
-        let (raw, u) = client
-            .stream(
-                &settings.llm_model,
-                &messages,
-                32_000,
-                &job.cancel,
-                &mut |d| job.emit(Some(d.to_string()), false, None),
-            )
-            .await?;
-        usage = u;
-        let html = llm::extract_html(&raw)?;
+        let request = agent::doc_request(&prompt, skill.as_deref());
+        let html = write_doc(app, &job, &id, request, &mut usage, &mut stats).await?;
         let now = now_iso();
         let doc = Doc {
             id: uuid::Uuid::new_v4().to_string(),
@@ -520,24 +570,21 @@ pub async fn generate_doc(
             title: llm::html_title(&html).unwrap_or_else(|| prompt.chars().take(60).collect()),
             prompt: prompt.clone(),
             html,
-            model: settings.llm_model.clone(),
+            model: model.clone(),
             created_at: now.clone(),
             updated_at: now,
         };
-        state.db.lock().unwrap().save_doc(&doc)?;
+        app.state::<AppState>().db.lock().unwrap().save_doc(&doc)?;
         Ok(doc)
     }
     .await;
     job.finish(&r);
-    track_ai(
-        app,
-        "generate_doc",
-        &model,
-        started,
-        &r,
-        usage,
-        serde_json::json!({}),
-    );
+    let mut props = stats_props(stats);
+    // only the built-in template names, never free text
+    if let Some(s) = skill.as_deref().and_then(agent::skills::get) {
+        props["skill"] = s.name.as_str().into();
+    }
+    track_ai(app, "generate_doc", &model, started, &r, usage, props);
     r
 }
 
@@ -551,38 +598,37 @@ pub async fn revise_doc(
     let started = std::time::Instant::now();
     let model = app.state::<AppState>().settings().llm_model;
     let mut usage = None;
+    let mut stats = Stats::default();
     let r = async {
-        let (client, settings) = client(app)?;
-        let state = app.state::<AppState>();
-        let (doc, rec, segs, analysis) = {
-            let db = state.db.lock().unwrap();
-            let doc = db.doc(&doc_id).map_err(|_| anyhow!("doc not found"))?;
-            let rid = doc.recording_id.clone();
-            (doc, db.recording(&rid)?, db.segments(&rid)?, db.analysis(&rid)?)
-        };
-        let messages = vec![
-            Msg::system(llm::doc_system(&settings.ai_language)),
-            Msg::user(llm::doc_user(&doc.prompt, &rec.title, &segs, analysis.as_ref())),
-            Msg::assistant(doc.html.clone()),
-            Msg::user(format!(
-                "Revise the document: {instruction}\nReturn the complete updated HTML document only."
-            )),
-        ];
-        let (raw, u) = client
-            .stream(&settings.llm_model, &messages, 32_000, &job.cancel, &mut |d| {
-                job.emit(Some(d.to_string()), false, None)
-            })
-            .await?;
-        usage = u;
-        let html = llm::extract_html(&raw)?;
+        let doc = app
+            .state::<AppState>()
+            .db
+            .lock()
+            .unwrap()
+            .doc(&doc_id)
+            .map_err(|_| anyhow!("doc not found"))?;
+        let request = agent::doc_revision(&doc.prompt, &doc.html, &instruction);
+        let html = write_doc(
+            app,
+            &job,
+            &doc.recording_id,
+            request,
+            &mut usage,
+            &mut stats,
+        )
+        .await?;
         let updated = Doc {
             title: llm::html_title(&html).unwrap_or(doc.title.clone()),
             html,
-            model: settings.llm_model.clone(),
+            model: model.clone(),
             updated_at: now_iso(),
             ..doc
         };
-        state.db.lock().unwrap().save_doc(&updated)?;
+        app.state::<AppState>()
+            .db
+            .lock()
+            .unwrap()
+            .save_doc(&updated)?;
         Ok(updated)
     }
     .await;
@@ -594,7 +640,7 @@ pub async fn revise_doc(
         started,
         &r,
         usage,
-        serde_json::json!({}),
+        stats_props(stats),
     );
     r
 }

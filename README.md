@@ -69,16 +69,24 @@ video is ignored.
 ### AI features (optional, OpenRouter)
 
 Paste an [OpenRouter](https://openrouter.ai/keys) API key in **Settings** and pick a model.
+Ask and Docs need a model that supports tool calling; the model list only shows those.
 Cheap defaults: `deepseek/deepseek-v4-flash`, `openai/gpt-6-luna`, `anthropic/claude-haiku-5.5`.
 A one-hour recording is roughly 40k tokens, a fraction of a cent with these models.
 
 - **Analyze:** title, summary, key points, chapters, topic tags with the segments that discuss
   them, action items and suggested questions.
-- **Ask:** chat about one recording or the whole library; answers cite segments like `[12]`,
-  and clicking a citation plays that moment.
-- **Docs:** the model writes a self-contained HTML/JS page (mind map, timeline, flashcards,
-  quiz, minutes…) shown inside the app. Docs run in a sandboxed iframe on their own origin with
-  a Content-Security-Policy that blocks all network access; they can only read the transcript
+- **Ask:** chat about one recording or the whole library. The model looks things up instead
+  of getting every transcript pasted in: it can list recordings, search transcripts and notes,
+  read a recording's overview, its whole transcript or a range of segments, the user's notes
+  and earlier docs. The chat shows what it is reading. Answers cite segments like `[12]`, and
+  clicking a citation plays that moment. When a conversation gets large (over ~256k tokens, or
+  less if the model's context is smaller) old tool output is dropped and earlier messages are
+  summarized, so long chats keep working.
+- **Docs:** the model loads a design guide for the kind of doc (mind map, timeline, flashcards,
+  quiz, minutes, glossary or a general report; see `crates/wwta-core/src/agent/skills`),
+  gathers the content with the same tools, and writes a self-contained HTML/JS page shown
+  inside the app. Docs run in a sandboxed iframe on their own origin with a
+  Content-Security-Policy that blocks all network access; they can only read the transcript
   through a small `window.WWTA` bridge and ask the player to seek.
 - **Semantic search:** optional embeddings (default `baai/bge-m3`) for meaning-based search and
   related sections.
@@ -173,7 +181,8 @@ pnpm test                 # UI logic
 ```
 crates/wwta-core     audio decode/resample (Symphonia), Silero VAD + engines (sherpa-onnx, whisper.cpp),
                      safetensors→GGML converter, model catalog/downloads, SQLite library, search,
-                     OpenRouter client and prompts, exports
+                     OpenRouter client, the Ask/Docs agent (tools, context compaction, doc guides),
+                     exports
 crates/wwta-cli      headless CLI (also the CI smoke test)
 src-tauri            Tauri v2 app: commands, transcription queue, wwta-doc:// protocol for docs
 src                  React 19 + TypeScript UI (Vite, Tailwind, wavesurfer.js, zustand)

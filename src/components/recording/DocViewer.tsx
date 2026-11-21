@@ -108,6 +108,7 @@ export function DocViewer({ doc, onClose }: { doc: Doc; onClose: () => void }) {
   const [revising, setRevising] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const streamLen = useStreams((s) => (revising ? (s.streams[revising]?.text.length ?? 0) : 0));
+  const activity = useStreams((s) => (revising ? (s.streams[revising]?.activity ?? null) : null));
 
   const revise = async () => {
     const text = instruction.trim();
@@ -191,7 +192,16 @@ export function DocViewer({ doc, onClose }: { doc: Doc; onClose: () => void }) {
             <div className="absolute inset-x-0 top-0 flex justify-center p-3">
               <div className="flex items-center gap-2 rounded-full border border-line bg-surface px-3.5 py-1.5 text-[12.5px] shadow-pop">
                 <Wand2 className="size-3.5 animate-pulse text-accent" />
-                Revising… {streamLen > 0 && <span className="text-muted tabular-nums">{formatBytes(streamLen)}</span>}
+                Revising…{" "}
+                {streamLen > 0 ? (
+                  <span className="text-muted tabular-nums">{formatBytes(streamLen)}</span>
+                ) : (
+                  activity && (
+                    <span className="text-muted" dir="auto">
+                      {activity}
+                    </span>
+                  )
+                )}
               </div>
             </div>
           )}

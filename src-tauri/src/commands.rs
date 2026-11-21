@@ -1078,9 +1078,10 @@ pub async fn generate_doc(
     app: AppHandle,
     id: String,
     prompt: String,
+    skill: Option<String>,
     request_id: String,
 ) -> CmdResult<Doc> {
-    crate::ai::generate_doc(&app, id, prompt, request_id)
+    crate::ai::generate_doc(&app, id, prompt, skill, request_id)
         .await
         .map_err(anyhow_err)
 }
