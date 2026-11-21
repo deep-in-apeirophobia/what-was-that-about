@@ -217,11 +217,39 @@ pub struct Doc {
     pub updated_at: String,
 }
 
+/// A user note/comment on a stretch of a recording, anchored by time so it survives
+/// re-transcription and transcript edits.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Note {
+    pub id: String,
+    pub recording_id: String,
+    pub start: f64,
+    pub end: f64,
+    /// Markdown.
+    pub body: String,
+    /// "yellow" | "green" | "blue" | "purple" | "red"
+    pub color: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+pub const NOTE_COLORS: &[&str] = &["yellow", "green", "blue", "purple", "red"];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteWithRecording {
+    #[serde(flatten)]
+    pub note: Note,
+    pub recording_title: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordingDetail {
     pub recording: Recording,
     pub segments: Vec<Segment>,
+    pub notes: Vec<Note>,
     pub analysis: Option<Analysis>,
     pub docs: Vec<Doc>,
     pub chat: Vec<ChatMessage>,
@@ -265,6 +293,7 @@ pub enum HitKind {
     Lexical,
     Semantic,
     Tag,
+    Note,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,6 +309,9 @@ pub struct SearchHit {
     pub kind: HitKind,
     /// UTF-16 code unit ranges, matching JavaScript string indices.
     pub highlights: Vec<(u32, u32)>,
+    /// Set for note hits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

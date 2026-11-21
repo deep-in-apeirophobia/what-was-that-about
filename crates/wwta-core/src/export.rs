@@ -1,7 +1,7 @@
 //! Transcript export formats.
 
 use crate::text::fmt_time;
-use crate::types::{Analysis, Segment};
+use crate::types::{Analysis, Note, Segment};
 
 fn ts(secs: f64, sep: char) -> String {
     let ms = (secs.max(0.0) * 1000.0).round() as u64;
@@ -49,7 +49,12 @@ pub fn txt(segs: &[Segment]) -> String {
         + "\n"
 }
 
-pub fn markdown(title: &str, segs: &[Segment], analysis: Option<&Analysis>) -> String {
+pub fn markdown(
+    title: &str,
+    segs: &[Segment],
+    analysis: Option<&Analysis>,
+    notes: &[Note],
+) -> String {
     let mut o = format!("# {title}\n\n");
     if let Some(a) = analysis {
         if !a.summary.is_empty() {
@@ -70,6 +75,18 @@ pub fn markdown(title: &str, segs: &[Segment], analysis: Option<&Analysis>) -> S
             o.push('\n');
         }
     }
+    if !notes.is_empty() {
+        o.push_str("## Notes\n\n");
+        for n in notes {
+            o.push_str(&format!(
+                "- **{}–{}** {}\n",
+                fmt_time(n.start),
+                fmt_time(n.end),
+                n.body.replace('\n', "\n  ")
+            ));
+        }
+        o.push('\n');
+    }
     o.push_str("## Transcript\n\n");
     let chapters = analysis.map(|a| a.chapters.as_slice()).unwrap_or(&[]);
     for s in segs {
@@ -81,11 +98,12 @@ pub fn markdown(title: &str, segs: &[Segment], analysis: Option<&Analysis>) -> S
     o
 }
 
-pub fn json(title: &str, segs: &[Segment], analysis: Option<&Analysis>) -> String {
+pub fn json(title: &str, segs: &[Segment], analysis: Option<&Analysis>, notes: &[Note]) -> String {
     serde_json::to_string_pretty(&serde_json::json!({
         "title": title,
         "segments": segs,
         "analysis": analysis,
+        "notes": notes,
     }))
     .unwrap_or_default()
 }
@@ -95,13 +113,14 @@ pub fn render(
     title: &str,
     segs: &[Segment],
     analysis: Option<&Analysis>,
+    notes: &[Note],
 ) -> Option<String> {
     Some(match format {
         "srt" => srt(segs),
         "vtt" => vtt(segs),
         "txt" => txt(segs),
-        "md" => markdown(title, segs, analysis),
-        "json" => json(title, segs, analysis),
+        "md" => markdown(title, segs, analysis, notes),
+        "json" => json(title, segs, analysis, notes),
         _ => return None,
     })
 }
@@ -109,6 +128,32 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notes_in_markdown_and_json() {
+        let segs = vec![Segment {
+            id: 0,
+            start: 1.5,
+            end: 3.0,
+            text: "سلام".into(),
+            words: vec![],
+        }];
+        let note = Note {
+            id: "n".into(),
+            recording_id: "r".into(),
+            start: 1.0,
+            end: 65.0,
+            body: "پیگیری".into(),
+            color: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let md = render("md", "t", &segs, None, std::slice::from_ref(&note)).unwrap();
+        assert!(md.contains("## Notes") && md.contains("**0:01–1:05** پیگیری"));
+        assert!(render("json", "t", &segs, None, &[note])
+            .unwrap()
+            .contains("\"notes\""));
+    }
 
     #[test]
     fn subtitle_formats() {
@@ -122,9 +167,9 @@ mod tests {
         assert_eq!(srt(&segs), "1\n00:00:01,500 --> 01:02:05,250\nسلام\n\n");
         assert!(vtt(&segs).starts_with("WEBVTT\n\n00:00:01.500 --> 01:02:05.250"));
         assert_eq!(txt(&segs), "[0:01] سلام\n");
-        assert!(render("md", "t", &segs, None)
+        assert!(render("md", "t", &segs, None, &[])
             .unwrap()
             .contains("**0:01** سلام"));
-        assert!(render("docx", "t", &segs, None).is_none());
+        assert!(render("docx", "t", &segs, None, &[]).is_none());
     }
 }

@@ -481,11 +481,23 @@ pub fn qa_system(
     title: &str,
     segs: &[Segment],
     analysis: Option<&Analysis>,
+    notes: &[crate::types::Note],
     ai_language: &str,
 ) -> String {
-    let summary = analysis
+    let mut summary = analysis
         .map(|a| format!("\nExisting summary of the recording:\n{}\n", a.summary))
         .unwrap_or_default();
+    if !notes.is_empty() {
+        summary.push_str("\nThe user's own notes on this recording (time range: note):\n");
+        for n in notes {
+            summary.push_str(&format!(
+                "- ({}–{}) {}\n",
+                fmt_time(n.start),
+                fmt_time(n.end),
+                n.body.trim()
+            ));
+        }
+    }
     format!(
         "You answer questions about one audio recording using its automatic transcript. {lang}\n\
          Rules:\n\
@@ -592,6 +604,7 @@ impl CitationRewriter {
 pub const DOC_BRIDGE_DOC: &str = r#"The document runs inside a sandboxed iframe in the app with this API pre-defined (do not redefine it):
   window.WWTA.recording  -> { id, title, durationSec }
   window.WWTA.segments   -> [{ id, start, end, text }]   // full transcript; start/end in seconds
+  window.WWTA.notes      -> [{ start, end, body, color }]   // the user's own notes (markdown bodies)
   window.WWTA.analysis   -> null or { title, summary, keyPoints[], chapters[{title,startSegment,endSegment,start,end,summary,tags[]}], tags[{name,description,segments[]}], actionItems[], questions[] }
   window.WWTA.seek(seconds)  // jump the app's audio player to that time and play
   window.WWTA.play() / window.WWTA.pause()

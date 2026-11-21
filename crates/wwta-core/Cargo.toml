@@ -31,6 +31,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 futures-util = "0.3"
 regex = "1"
+uuid = { version = "1", features = ["v4"] }
 zip = { version = "9", default-features = false, features = ["deflate"] }
 quick-xml = "0.42"
 oxideav-speex = "0.0.12"
@@ -40,5 +41,4 @@ sherpa-onnx = { workspace = true, optional = true }
 whisper-rs = { workspace = true, optional = true, features = ["log_backend", "raw-api"] }
 
 [dev-dependencies]
-uuid = { version = "1", features = ["v4"] }
 tempfile = "3"

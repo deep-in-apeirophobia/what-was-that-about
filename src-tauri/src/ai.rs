@@ -242,15 +242,26 @@ async fn ask_inner(
     let prior = state.db.lock().unwrap().chat(rid)?;
     let (system, rewriter) = match rid {
         Some(id) => {
-            let (rec, segs, analysis) = {
+            let (rec, segs, analysis, notes) = {
                 let db = state.db.lock().unwrap();
-                (db.recording(id)?, db.segments(id)?, db.analysis(id)?)
+                (
+                    db.recording(id)?,
+                    db.segments(id)?,
+                    db.analysis(id)?,
+                    db.notes(id)?,
+                )
             };
             if segs.is_empty() {
                 bail!("transcribe the recording before asking about it");
             }
             (
-                llm::qa_system(&rec.title, &segs, analysis.as_ref(), &settings.ai_language),
+                llm::qa_system(
+                    &rec.title,
+                    &segs,
+                    analysis.as_ref(),
+                    &notes,
+                    &settings.ai_language,
+                ),
                 None,
             )
         }

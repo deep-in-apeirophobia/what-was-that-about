@@ -76,6 +76,7 @@ pub fn lexical(
             start,
             end,
             highlights: find_highlights(&text, &terms),
+            note_id: None,
             text,
             score,
             kind: HitKind::Lexical,
@@ -84,6 +85,49 @@ pub fn lexical(
     hits.sort_by(|a, b| b.score.total_cmp(&a.score));
     hits.truncate(limit);
     Ok(hits)
+}
+
+/// Notes whose text contains every query term.
+pub fn note_hits(db: &Db, query: &str, recording_id: Option<&str>) -> Result<Vec<SearchHit>> {
+    let terms = search_terms(query);
+    if terms.is_empty() {
+        return Ok(vec![]);
+    }
+    let like: Vec<String> = terms
+        .iter()
+        .map(|t| like_escape(&normalize_for_search(t)))
+        .collect();
+    let mut seg_cache: HashMap<String, Vec<Segment>> = HashMap::new();
+    let mut out = Vec::new();
+    for n in db.search_notes(&like, recording_id)? {
+        let segs = match seg_cache.get(&n.note.recording_id) {
+            Some(s) => s,
+            None => {
+                let s = db.segments(&n.note.recording_id)?;
+                seg_cache.entry(n.note.recording_id.clone()).or_insert(s)
+            }
+        };
+        // first segment that overlaps the note (or the last one before it)
+        let seg_id = segs
+            .iter()
+            .find(|s| s.end > n.note.start + 0.05)
+            .or(segs.last())
+            .map(|s| s.id)
+            .unwrap_or(0);
+        out.push(SearchHit {
+            recording_id: n.note.recording_id.clone(),
+            recording_title: n.recording_title,
+            segment_id: seg_id,
+            start: n.note.start,
+            end: n.note.end,
+            highlights: find_highlights(&n.note.body, &terms),
+            text: n.note.body,
+            score: 0.95,
+            kind: HitKind::Note,
+            note_id: Some(n.note.id),
+        });
+    }
+    Ok(out)
 }
 
 pub fn list_tags(db: &Db) -> Result<Vec<TagSummary>> {
@@ -134,6 +178,7 @@ fn hits_for_segments(
                 score,
                 kind,
                 highlights: vec![],
+                note_id: None,
             });
         }
     }
@@ -276,6 +321,7 @@ pub fn semantic_hits(
             score,
             kind: HitKind::Semantic,
             highlights: vec![],
+            note_id: None,
         });
     }
     Ok(out)
@@ -452,6 +498,7 @@ pub fn lexical_related(db: &Db, rid: &str, seg_id: u32, limit: usize) -> Result<
                 start: r.3,
                 end: r.4,
                 highlights: find_highlights(&r.5, &qterms),
+                note_id: None,
                 text: r.5.clone(),
                 score,
                 kind: HitKind::Lexical,
@@ -462,10 +509,11 @@ pub fn lexical_related(db: &Db, rid: &str, seg_id: u32, limit: usize) -> Result<
 
 /// Merge hit lists, dropping duplicates (same recording + segment), best score first.
 pub fn merge_hits(lists: Vec<Vec<SearchHit>>, limit: usize) -> Vec<SearchHit> {
-    let mut seen: HashSet<(String, u32)> = HashSet::new();
+    // notes never collapse into transcript hits on the same segment
+    let mut seen: HashSet<(String, u32, Option<String>)> = HashSet::new();
     let mut all: Vec<SearchHit> = lists.into_iter().flatten().collect();
     all.sort_by(|a, b| b.score.total_cmp(&a.score));
-    all.retain(|h| seen.insert((h.recording_id.clone(), h.segment_id)));
+    all.retain(|h| seen.insert((h.recording_id.clone(), h.segment_id, h.note_id.clone())));
     all.truncate(limit);
     all
 }
@@ -567,6 +615,19 @@ mod tests {
         assert_eq!(tags[0].recording_count, 2);
         assert_eq!(segments_for_tag(&db, "هوش مصنوعی").unwrap().len(), 2);
         assert_eq!(tag_hits(&db, "هوش", None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn notes_are_searchable() {
+        let db = setup();
+        db.add_note("a", 1.2, 1.9, "پیگیری بودجهٔ پروژه با علی", Some("yellow"))
+            .unwrap();
+        let hits = note_hits(&db, "بودجه", None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, HitKind::Note);
+        assert_eq!(hits[0].segment_id, 1);
+        assert!(hits[0].note_id.is_some() && !hits[0].highlights.is_empty());
+        assert!(note_hits(&db, "بودجه", Some("b")).unwrap().is_empty());
     }
 
     #[test]

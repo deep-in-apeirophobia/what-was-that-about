@@ -32,6 +32,7 @@ window.WWTA = (function () {
     recording: data.recording,
     segments: data.segments,
     analysis: data.analysis,
+    notes: data.notes || [],
     seek: function (t) { var n = Number(t); if (isFinite(n) && n >= 0) post({ type: "wwta:seek", time: n }); },
     play: function () { post({ type: "wwta:play" }); },
     pause: function () { post({ type: "wwta:pause" }); },
@@ -85,11 +86,13 @@ pub fn handle(app: &AppHandle, req: Request<Vec<u8>>) -> Response<Cow<'static, [
     let rec = db.recording(&doc.recording_id).ok();
     let segs = db.segments(&doc.recording_id).unwrap_or_default();
     let analysis = db.analysis(&doc.recording_id).ok().flatten();
+    let notes = db.notes(&doc.recording_id).unwrap_or_default();
     drop(db);
     let data = json!({
         "recording": rec.as_ref().map(|r| json!({ "id": r.id, "title": r.title, "durationSec": r.duration_sec })),
         "segments": segs.iter().map(|s| json!({ "id": s.id, "start": s.start, "end": s.end, "text": s.text })).collect::<Vec<_>>(),
         "analysis": analysis,
+        "notes": notes.iter().map(|n| json!({ "start": n.start, "end": n.end, "body": n.body, "color": n.color })).collect::<Vec<_>>(),
     });
     respond(StatusCode::OK, inject(&doc.html, &data))
 }

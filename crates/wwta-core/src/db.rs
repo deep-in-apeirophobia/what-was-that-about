@@ -7,7 +7,8 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::text::normalize_for_search;
 use crate::types::{
-    now_iso, Analysis, ChatMessage, Doc, Recording, RecordingStatus, Segment, Word,
+    now_iso, Analysis, ChatMessage, Doc, Note, NoteWithRecording, Recording, RecordingStatus,
+    Segment, Word, NOTE_COLORS,
 };
 
 /// (recording_id, title, tag, segment ids), as returned by [`Db::all_tags`].
@@ -74,6 +75,18 @@ CREATE TABLE IF NOT EXISTS docs (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS notes (
+    id TEXT PRIMARY KEY,
+    recording_id TEXT NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
+    start REAL NOT NULL,
+    end REAL NOT NULL,
+    body TEXT NOT NULL,
+    norm TEXT NOT NULL,
+    color TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS notes_recording ON notes(recording_id, start);
 CREATE TABLE IF NOT EXISTS embeddings (
     recording_id TEXT NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
     chunk INTEGER NOT NULL,
@@ -490,6 +503,151 @@ impl Db {
         Ok(())
     }
 
+    // ---- notes
+
+    fn note_from_row(r: &Row) -> rusqlite::Result<Note> {
+        Ok(Note {
+            id: r.get("id")?,
+            recording_id: r.get("recording_id")?,
+            start: r.get("start")?,
+            end: r.get("end")?,
+            body: r.get("body")?,
+            color: r.get("color")?,
+            created_at: r.get("created_at")?,
+            updated_at: r.get("updated_at")?,
+        })
+    }
+
+    fn clean_note(start: f64, end: f64, color: Option<&str>) -> Result<(f64, f64, Option<String>)> {
+        if !start.is_finite() || !end.is_finite() || start < 0.0 {
+            anyhow::bail!("invalid note time range");
+        }
+        let (a, b) = if end < start {
+            (end, start)
+        } else {
+            (start, end)
+        };
+        let color = color.filter(|c| NOTE_COLORS.contains(c)).map(String::from);
+        Ok((a, b, color))
+    }
+
+    pub fn add_note(
+        &self,
+        recording_id: &str,
+        start: f64,
+        end: f64,
+        body: &str,
+        color: Option<&str>,
+    ) -> Result<Note> {
+        let (start, end, color) = Self::clean_note(start, end, color)?;
+        let now = now_iso();
+        let note = Note {
+            id: uuid::Uuid::new_v4().to_string(),
+            recording_id: recording_id.to_string(),
+            start,
+            end,
+            body: body.trim().to_string(),
+            color,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        self.conn.execute(
+            "INSERT INTO notes (id, recording_id, start, end, body, norm, color, created_at, updated_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                note.id,
+                note.recording_id,
+                note.start,
+                note.end,
+                note.body,
+                normalize_for_search(&note.body),
+                note.color,
+                note.created_at,
+                note.updated_at
+            ],
+        )?;
+        Ok(note)
+    }
+
+    pub fn update_note(
+        &self,
+        id: &str,
+        start: f64,
+        end: f64,
+        body: &str,
+        color: Option<&str>,
+    ) -> Result<Note> {
+        let (start, end, color) = Self::clean_note(start, end, color)?;
+        let n = self.conn.execute(
+            "UPDATE notes SET start = ?2, end = ?3, body = ?4, norm = ?5, color = ?6, updated_at = ?7 WHERE id = ?1",
+            params![id, start, end, body.trim(), normalize_for_search(body), color, now_iso()],
+        )?;
+        if n == 0 {
+            anyhow::bail!("note not found");
+        }
+        Ok(self.conn.query_row(
+            "SELECT * FROM notes WHERE id = ?1",
+            [id],
+            Self::note_from_row,
+        )?)
+    }
+
+    pub fn delete_note(&self, id: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM notes WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    pub fn notes(&self, recording_id: &str) -> Result<Vec<Note>> {
+        let mut st = self
+            .conn
+            .prepare("SELECT * FROM notes WHERE recording_id = ?1 ORDER BY start, created_at")?;
+        let rows = st.query_map([recording_id], Self::note_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn all_notes(&self) -> Result<Vec<NoteWithRecording>> {
+        let mut st = self.conn.prepare(
+            "SELECT n.*, r.title AS recording_title FROM notes n JOIN recordings r ON r.id = n.recording_id \
+             ORDER BY r.created_at DESC, n.start, n.created_at",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok(NoteWithRecording {
+                note: Self::note_from_row(r)?,
+                recording_title: r.get("recording_title")?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Notes whose normalized body contains every term (already normalized, LIKE-escaped).
+    pub fn search_notes(
+        &self,
+        like_terms: &[String],
+        recording_id: Option<&str>,
+    ) -> Result<Vec<NoteWithRecording>> {
+        let mut sql = String::from(
+            "SELECT n.*, r.title AS recording_title FROM notes n JOIN recordings r ON r.id = n.recording_id WHERE 1=1",
+        );
+        let mut args: Vec<String> = Vec::new();
+        for t in like_terms {
+            args.push(t.clone());
+            sql.push_str(&format!(" AND n.norm LIKE ?{} ESCAPE '\\'", args.len()));
+        }
+        if let Some(id) = recording_id {
+            args.push(id.to_string());
+            sql.push_str(&format!(" AND n.recording_id = ?{}", args.len()));
+        }
+        sql.push_str(" ORDER BY r.created_at DESC, n.start LIMIT 200");
+        let mut st = self.conn.prepare(&sql)?;
+        let rows = st.query_map(rusqlite::params_from_iter(args.iter()), |r| {
+            Ok(NoteWithRecording {
+                note: Self::note_from_row(r)?,
+                recording_title: r.get("recording_title")?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     // ---- embeddings
 
     pub fn replace_embeddings(
@@ -631,6 +789,43 @@ mod tests {
         db.delete_recording("r1").unwrap();
         assert!(db.get_recording("r1").unwrap().is_none());
         assert!(db.segments("r1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn notes_crud_and_cascade() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_recording(&sample_recording("r1")).unwrap();
+        let n = db
+            .add_note(
+                "r1",
+                12.0,
+                5.0,
+                "  مهم: https://example.com  ",
+                Some("blue"),
+            )
+            .unwrap();
+        assert_eq!((n.start, n.end), (5.0, 12.0)); // swapped into order
+        assert_eq!(n.body, "مهم: https://example.com");
+        let bad = db
+            .add_note("r1", 1.0, 2.0, "x", Some("chartreuse"))
+            .unwrap();
+        assert_eq!(bad.color, None);
+        assert!(db.add_note("r1", f64::NAN, 2.0, "x", None).is_err());
+        let u = db.update_note(&n.id, 6.0, 8.0, "مهم‌تر", None).unwrap();
+        assert_eq!(
+            (u.start, u.body.as_str(), u.color.as_deref()),
+            (6.0, "مهم‌تر", None)
+        );
+        assert_eq!(db.notes("r1").unwrap().len(), 2);
+        assert_eq!(db.notes("r1").unwrap()[0].id, bad.id); // sorted by start
+        let found = db.search_notes(&["%مهمتر%".to_string()], None).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].recording_title, "جلسه");
+        assert_eq!(db.all_notes().unwrap().len(), 2);
+        db.delete_note(&bad.id).unwrap();
+        assert_eq!(db.notes("r1").unwrap().len(), 1);
+        db.delete_recording("r1").unwrap();
+        assert!(db.all_notes().unwrap().is_empty());
     }
 
     #[test]

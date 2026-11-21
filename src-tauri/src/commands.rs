@@ -231,6 +231,7 @@ pub fn get_recording(state: State<'_, AppState>, id: String) -> CmdResult<Record
     Ok(RecordingDetail {
         recording: db.recording(&id).map_err(anyhow_err)?,
         segments: db.segments(&id).map_err(anyhow_err)?,
+        notes: db.notes(&id).map_err(anyhow_err)?,
         analysis: db.analysis(&id).map_err(anyhow_err)?,
         docs: db.docs(&id).map_err(anyhow_err)?,
         chat: db.chat(Some(&id)).map_err(anyhow_err)?,
@@ -690,9 +691,65 @@ pub fn export_transcript(
     let rec = db.recording(&id).map_err(anyhow_err)?;
     let segs = db.segments(&id).map_err(anyhow_err)?;
     let analysis = db.analysis(&id).map_err(anyhow_err)?;
-    let body = export::render(&format, &rec.title, &segs, analysis.as_ref())
+    let notes = db.notes(&id).map_err(anyhow_err)?;
+    let body = export::render(&format, &rec.title, &segs, analysis.as_ref(), &notes)
         .ok_or("unknown export format")?;
     std::fs::write(&path, body).map_err(err)
+}
+
+// ------------------------------------------------------------------ notes
+
+#[tauri::command]
+pub fn add_note(
+    state: State<'_, AppState>,
+    recording_id: String,
+    start: f64,
+    end: f64,
+    body: String,
+    color: Option<String>,
+) -> CmdResult<Note> {
+    if body.trim().is_empty() {
+        return Err("a note can't be empty".into());
+    }
+    let db = state.db.lock().unwrap();
+    db.recording(&recording_id).map_err(anyhow_err)?;
+    db.add_note(&recording_id, start, end, &body, color.as_deref())
+        .map_err(anyhow_err)
+}
+
+#[tauri::command]
+pub fn update_note(
+    state: State<'_, AppState>,
+    id: String,
+    start: f64,
+    end: f64,
+    body: String,
+    color: Option<String>,
+) -> CmdResult<Note> {
+    if body.trim().is_empty() {
+        return Err("a note can't be empty".into());
+    }
+    state
+        .db
+        .lock()
+        .unwrap()
+        .update_note(&id, start, end, &body, color.as_deref())
+        .map_err(anyhow_err)
+}
+
+#[tauri::command]
+pub fn delete_note(state: State<'_, AppState>, id: String) -> CmdResult<()> {
+    state
+        .db
+        .lock()
+        .unwrap()
+        .delete_note(&id)
+        .map_err(anyhow_err)
+}
+
+#[tauri::command]
+pub fn list_all_notes(state: State<'_, AppState>) -> CmdResult<Vec<NoteWithRecording>> {
+    state.db.lock().unwrap().all_notes().map_err(anyhow_err)
 }
 
 // ------------------------------------------------------------------ search
@@ -706,11 +763,12 @@ pub async fn search(
 ) -> CmdResult<Vec<SearchHit>> {
     let limit = limit.unwrap_or(50).clamp(1, 500);
     let state = app.state::<AppState>();
-    let (lexical, tags) = {
+    let (lexical, tags, notes) = {
         let db = state.db.lock().unwrap();
         (
             search::lexical(&db, &query, recording_id.as_deref(), limit).map_err(anyhow_err)?,
             search::tag_hits(&db, &query, recording_id.as_deref()).map_err(anyhow_err)?,
+            search::note_hits(&db, &query, recording_id.as_deref()).map_err(anyhow_err)?,
         )
     };
     let semantic = if query.trim().chars().count() >= 3 {
@@ -718,7 +776,10 @@ pub async fn search(
     } else {
         vec![]
     };
-    Ok(search::merge_hits(vec![lexical, tags, semantic], limit))
+    Ok(search::merge_hits(
+        vec![notes, lexical, tags, semantic],
+        limit,
+    ))
 }
 
 #[tauri::command]
