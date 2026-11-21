@@ -54,7 +54,7 @@ export const useLibrary = create<LibraryState>((set, get) => ({
     void _ignored;
     set((s) => {
       const progress = { ...s.progress };
-      if (p.stage === "done" || p.stage === "cancelled") delete progress[p.recordingId];
+      if (p.stage === "done" || p.stage === "cancelled" || p.stage === "error") delete progress[p.recordingId];
       else progress[p.recordingId] = info;
       return { progress };
     });

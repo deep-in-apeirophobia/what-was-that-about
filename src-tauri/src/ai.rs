@@ -106,15 +106,9 @@ pub async fn analyze(app: &AppHandle, id: &str) -> Result<Analysis> {
     {
         let mut db = state.db.lock().unwrap();
         db.save_analysis(id, &analysis)?;
-        // replace the file-name title with the AI title unless the user renamed it
-        let stem = std::path::Path::new(&rec.source_path)
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        // use the AI title unless the user renamed the recording
         if let Some(t) = &analysis.title {
-            if rec.title == stem {
-                db.set_title(id, t)?;
-            }
+            db.set_suggested_title(id, t)?;
         }
         events::recording_updated(app, &db, id);
     }

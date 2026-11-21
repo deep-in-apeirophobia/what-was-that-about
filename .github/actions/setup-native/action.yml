@@ -121,7 +121,10 @@ runs:
         New-Item -ItemType Junction -Path C:\t -Target (Resolve-Path target).Path | Out-Null
         Add-Content $env:GITHUB_ENV "CARGO_TARGET_DIR=C:\t"
 
-    - uses: dtolnay/rust-toolchain@stable
+    # Same version as rust-toolchain.toml
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: "1.100.0"
 
     - uses: Swatinem/rust-cache@v2
       with:

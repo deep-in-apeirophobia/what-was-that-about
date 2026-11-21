@@ -61,12 +61,11 @@ pub fn run() {
             #[cfg(debug_assertions)]
             if let Ok(fifo) = std::env::var("WWTA_E2E_EVAL_FIFO") {
                 let handle = app.handle().clone();
-                std::thread::spawn(move || loop {
-                    let Ok(text) = std::fs::read_to_string(&fifo) else {
-                        break;
-                    };
-                    if let Some(w) = handle.get_webview_window("main") {
-                        let _ = w.eval(text);
+                std::thread::spawn(move || {
+                    while let Ok(text) = std::fs::read_to_string(&fifo) {
+                        if let Some(w) = handle.get_webview_window("main") {
+                            let _ = w.eval(text);
+                        }
                     }
                 });
             }

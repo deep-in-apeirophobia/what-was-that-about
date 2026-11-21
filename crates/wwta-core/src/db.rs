@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS recordings (
     model_id TEXT,
     error TEXT,
     tags_json TEXT NOT NULL DEFAULT '[]',
-    blurb TEXT
+    blurb TEXT,
+    title_custom INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS segments (
     recording_id TEXT NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
@@ -134,6 +135,15 @@ impl Db {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
+        // migrations for libraries created by earlier builds
+        let has_title_custom: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('recordings') WHERE name = 'title_custom'")?
+            .exists([])?;
+        if !has_title_custom {
+            conn.execute_batch(
+                "ALTER TABLE recordings ADD COLUMN title_custom INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
         Ok(Self { conn })
     }
 
@@ -202,12 +212,22 @@ impl Db {
         Ok(())
     }
 
+    /// Title chosen by the user (AI analysis won't replace it).
     pub fn set_title(&self, id: &str, title: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE recordings SET title = ?2, updated_at = ?3 WHERE id = ?1",
+            "UPDATE recordings SET title = ?2, title_custom = 1, updated_at = ?3 WHERE id = ?1",
             params![id, title, now_iso()],
         )?;
         Ok(())
+    }
+
+    /// Replace the title with an AI suggestion unless the user named the recording.
+    pub fn set_suggested_title(&self, id: &str, title: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE recordings SET title = ?2, updated_at = ?3 WHERE id = ?1 AND title_custom = 0",
+            params![id, title, now_iso()],
+        )?;
+        Ok(n > 0)
     }
 
     pub fn set_duration(&self, id: &str, secs: f64) -> Result<()> {
@@ -592,6 +612,11 @@ mod tests {
         assert_eq!(r.tags, vec!["خوشامد".to_string()]);
         assert_eq!(r.blurb.as_deref(), Some("خلاصه"));
         assert_eq!(db.all_tags().unwrap().len(), 1);
+
+        assert!(db.set_suggested_title("r1", "AI title").unwrap());
+        db.set_title("r1", "My title").unwrap();
+        assert!(!db.set_suggested_title("r1", "Another AI title").unwrap());
+        assert_eq!(db.recording("r1").unwrap().title, "My title");
 
         let s = db.update_segment_text("r1", 1, "بدرود").unwrap();
         assert_eq!(s.text, "بدرود");

@@ -33,7 +33,8 @@ SHA-256.
 ## Features
 
 - Import audio or video by drag and drop (mp3, m4a/aac, wav, flac, ogg/vorbis, opus, webm, mp4,
-  mkv…). Formats the native decoder can't read are decoded through the web view as a fallback.
+  mkv, flv…), or Adobe Connect recordings (see below). Formats the native decoder can't read
+  are decoded through the web view as a fallback.
 - Local transcription with sentence-level segments and word timings (Silero VAD + DTW alignment
   for Whisper), Persian digits for spoken numbers (Shenava), editable segments.
 - Player with waveform, chapters, speed control and karaoke-style highlighting; click a sentence
@@ -43,6 +44,22 @@ SHA-256.
 - Library search that ignores Arabic/Persian letter variants, diacritics and ZWNJ; tag browser
   across recordings; "related sections" (lexical offline, semantic with embeddings).
 - Export as TXT, SRT, VTT, Markdown or JSON.
+
+### Adobe Connect recordings
+
+Three ways to bring in a Connect meeting:
+
+1. **Link:** click **Adobe Connect link…** and paste the recording's address. If the recording
+   requires a login, open it in your browser first and copy the address from there (it then
+   contains `?session=…`); the app downloads the source archive with that session.
+2. **Source archive:** add `/output/download.zip?download=zip` to the recording link, download
+   the ZIP, and drop it onto the app (an extracted folder works too).
+3. **MP4 export:** newer Connect versions can export MP4, which imports like any video.
+
+The archive holds one Flash video (FLV) file per stream; the app reads `mainstream.xml` for
+when each speaker's stream started, decodes the voice streams (Speex, Nellymoser, AAC, MP3)
+and mixes them onto one timeline, so transcript timestamps follow the meeting. Screen-share
+video is ignored.
 
 ### AI features (optional, OpenRouter)
 
@@ -119,6 +136,7 @@ cargo run --release -p wwta-cli -- info
 cargo run --release -p wwta-cli -- install shenava-koochik --models-dir ./models
 cargo run --release -p wwta-cli -- transcribe talk.mp3 --model-file ./models/shenava-koochik/model.onnx --kind shenava
 cargo run --release -p wwta-cli -- convert ./Taraneh-WLarge ./ggml-model-q8_0.bin   # HF safetensors -> whisper.cpp
+cargo run --release -p wwta-cli -- decode meeting.zip meeting.wav                   # Adobe Connect archive -> WAV
 ```
 
 ### Tests
@@ -148,6 +166,8 @@ Some implementation notes:
 
 ## Credits
 
+- Speex decoding by [oxideav-speex](https://github.com/OxideAV/oxideav-speex) (MIT), Nellymoser
+  by [Ruffle's nellymoser-rs](https://github.com/ruffle-rs/nellymoser) (MIT).
 - Taraneh-WLarge by Aref Farhadipour (University of Zurich), MIT, based on OpenAI Whisper (MIT).
 - Shenava Koochik by Reza2kn / PersianML, Apache-2.0.
 - [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (MIT), [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)

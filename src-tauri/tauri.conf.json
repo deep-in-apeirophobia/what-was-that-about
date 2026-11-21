@@ -27,7 +27,9 @@
       "assetProtocol": {
         "enable": true,
         "scope": {
-          "allow": ["$APPDATA/library/**"],
+          "allow": [
+            "$APPDATA/library/**"
+          ],
           "requireLiteralLeadingDot": false
         }
       }
@@ -54,10 +56,17 @@
     },
     "linux": {
       "deb": {
-        "depends": ["libvulkan1"]
+        "depends": [
+          "libvulkan1"
+        ]
       },
       "rpm": {
-        "depends": ["vulkan-loader"]
+        "depends": [
+          "vulkan-loader"
+        ]
+      },
+      "appimage": {
+        "bundleMediaFramework": true
       }
     },
     "macOS": {

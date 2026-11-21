@@ -1,0 +1,5 @@
+# Pinned so new stable lints don't break CI unannounced; bump deliberately.
+[toolchain]
+channel = "1.100.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
