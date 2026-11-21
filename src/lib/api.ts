@@ -78,6 +78,9 @@ export const api = {
   // ---- system & settings
   getSystemInfo: () => invoke<SystemInfo>("get_system_info"),
   getSettings: () => invoke<Settings>("get_settings"),
+  /** Record an allow-listed UI event for anonymous usage statistics (no-op when disabled). */
+  trackUi: (event: "onboarding completed" | "onboarding skipped" | "doc template used" | "search opened", props?: Record<string, string | number | boolean>) =>
+    invoke<void>("track_ui", { event, props: props ?? null }).catch(() => undefined),
   saveSettings: (settings: Settings) => invoke<Settings>("save_settings", { settings }),
 
   // ---- speech models

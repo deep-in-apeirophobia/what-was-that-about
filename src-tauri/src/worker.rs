@@ -180,6 +180,13 @@ pub fn spawn(app: AppHandle, rx: Receiver<Job>) {
                 let cancel = Arc::new(AtomicBool::new(false));
                 *state.worker.current.lock().unwrap() =
                     Some((job.recording_id.clone(), cancel.clone()));
+                let format = state
+                    .db
+                    .lock()
+                    .unwrap()
+                    .recording(&job.recording_id)
+                    .map(|r| crate::telemetry::format_of(Path::new(&r.source_path)))
+                    .unwrap_or_default();
                 let result = run_job(&app, &job, &cancel, &mut cache);
                 *state.worker.current.lock().unwrap() = None;
                 let id = &job.recording_id;
@@ -199,6 +206,10 @@ pub fn spawn(app: AppHandle, rx: Receiver<Job>) {
                         let _ = db.set_status(id, status, None);
                         events::recording_updated(&app, &db, id);
                         progress(&app, id, TranscriptionStage::Cancelled, 0.0, None, vec![]);
+                        state.analytics.capture(
+                            "transcription cancelled",
+                            serde_json::json!({ "model": job.model_id, "format": format }),
+                        );
                     }
                     Err(e) => {
                         let msg = format!("{e:#}");
@@ -206,6 +217,16 @@ pub fn spawn(app: AppHandle, rx: Receiver<Job>) {
                         let db = state.db.lock().unwrap();
                         let _ = db.set_status(id, RecordingStatus::Error, Some(&msg));
                         events::recording_updated(&app, &db, id);
+                        let kind = crate::telemetry::error_kind(&msg);
+                        state.analytics.capture(
+                            "transcription failed",
+                            serde_json::json!({ "model": job.model_id, "format": format, "error_kind": kind }),
+                        );
+                        crate::telemetry::report_error(
+                            "transcription",
+                            &msg,
+                            &[("model", job.model_id.as_str()), ("format", format.as_str())],
+                        );
                         progress(&app, id, TranscriptionStage::Error, 0.0, Some(msg), vec![]);
                     }
                 }
@@ -256,7 +277,9 @@ fn run_job(
         opts.precise_word_timings,
         opts.threads
     );
+    let mut model_load_ms: Option<u64> = None;
     if cache.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
+        let load_started = std::time::Instant::now();
         *cache = None; // free the previous model (RAM/VRAM) first
         progress(
             app,
@@ -269,6 +292,7 @@ fn run_job(
         let engine = asr::load_engine(&spec, &model_file, &opts)?;
         log::info!("loaded {} on {}", spec.name, engine.device());
         *cache = Some((key, engine));
+        model_load_ms = Some(load_started.elapsed().as_millis() as u64);
     }
     let engine = &mut cache.as_mut().unwrap().1;
     let device = engine.device();
@@ -310,6 +334,36 @@ fn run_job(
         t0.elapsed().as_secs_f32(),
         spec.name
     );
+    {
+        let secs = audio::duration_secs(samples.len());
+        let took = t0.elapsed().as_secs_f64();
+        let on_gpu = !device.starts_with("CPU");
+        let source = state
+            .db
+            .lock()
+            .unwrap()
+            .recording(id)
+            .map(|r| r.source_path)
+            .unwrap_or_default();
+        state.analytics.capture(
+            "transcription completed",
+            serde_json::json!({
+                "model": spec.id,
+                "engine": format!("{:?}", spec.engine).to_lowercase(),
+                "device": if on_gpu { "gpu" } else { "cpu" },
+                "gpu_backend": if on_gpu { wwta_core::asr::whisper::GPU_BACKEND } else { "none" },
+                "audio_duration_sec": secs.round(),
+                "duration_bucket": crate::telemetry::duration_bucket(secs),
+                "processing_sec": (took * 10.0).round() / 10.0,
+                "realtime_factor": if took > 0.0 { (secs / took * 10.0).round() / 10.0 } else { 0.0 },
+                "segments": segments.len(),
+                "format": crate::telemetry::format_of(Path::new(&source)),
+                "model_load_ms": model_load_ms,
+                "precise_word_timings": opts.precise_word_timings,
+                "persian_digits": opts.persian_digits,
+            }),
+        );
+    }
     progress(app, id, TranscriptionStage::Saving, 1.0, None, vec![]);
     {
         let mut db = state.db.lock().unwrap();

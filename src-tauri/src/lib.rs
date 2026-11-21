@@ -6,6 +6,7 @@ mod docproto;
 mod events;
 mod state;
 mod sysinfo;
+mod telemetry;
 mod worker;
 
 use std::sync::{Mutex, RwLock};
@@ -15,8 +16,21 @@ use wwta_core::db::Db;
 
 use crate::state::{load_settings, AppState, Paths, Slots};
 
+const IDENTIFIER: &str = "com.whatwasthatabout.desktop";
+
 pub fn run() {
-    tauri::Builder::default()
+    // Crash reporting starts before anything else (and re-runs in its crash-reporter process).
+    let (analytics_on, crash_reports_on) = telemetry::early_settings(IDENTIFIER);
+    let sentry = telemetry::init_sentry(crash_reports_on);
+    let (_sentry_guard, sentry_plugin) = match sentry {
+        Some((g, p)) => (Some(g), Some(p)),
+        None => (None, None),
+    };
+    let mut builder = tauri::Builder::default();
+    if let Some(p) = sentry_plugin {
+        builder = builder.plugin(p);
+    }
+    builder
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(log::LevelFilter::Info)
@@ -28,7 +42,7 @@ pub fn run() {
         .register_uri_scheme_protocol("wwta-doc", |ctx, req| {
             docproto::handle(ctx.app_handle(), req)
         })
-        .setup(|app| {
+        .setup(move |app| {
             let data = app.path().app_data_dir()?;
             let paths = Paths::new(data)?;
             let db = Db::open(&paths.data.join("library.sqlite"))?;
@@ -42,6 +56,9 @@ pub fn run() {
                 }
             }
             let settings = load_settings(&paths.settings);
+            let analytics =
+                telemetry::Analytics::new(&paths.data, settings.analytics_enabled && analytics_on);
+            analytics.spawn_flusher();
             let (worker, rx) = worker::Worker::new();
             log::info!("data dir: {}", paths.data.display());
             app.manage(AppState {
@@ -54,7 +71,9 @@ pub fn run() {
                 model_status: Mutex::default(),
                 llm_jobs: Mutex::default(),
                 llm_models: tokio::sync::Mutex::new(None),
+                analytics,
             });
+            telemetry_app_opened(app.handle().clone());
             worker::spawn(app.handle().clone(), rx);
             // Debug builds only: evaluate JS lines written to the FIFO named by
             // WWTA_E2E_EVAL_FIFO in the main webview (headless end-to-end runs).
@@ -93,6 +112,7 @@ pub fn run() {
             commands::get_system_info,
             commands::get_settings,
             commands::save_settings,
+            commands::track_ui,
             commands::list_models,
             commands::install_model,
             commands::cancel_model_install,
@@ -133,4 +153,53 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running the application");
+}
+
+/// Detect the GPU off the main thread, then record the launch with coarse machine facts.
+fn telemetry_app_opened(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        let state = app.state::<AppState>();
+        let devices = sysinfo::gpu_devices_cached();
+        let a = &state.analytics;
+        a.set_base(
+            "gpu_backend",
+            serde_json::json!(wwta_core::asr::whisper::GPU_BACKEND),
+        );
+        a.set_base("gpu_available", serde_json::json!(!devices.is_empty()));
+        if let Some(g) = devices.first() {
+            a.set_base("gpu", serde_json::json!(g.name));
+            a.set_base(
+                "gpu_discrete",
+                serde_json::json!(g.description.contains("discrete")),
+            );
+        }
+        let installed: Vec<String> = wwta_core::models::catalog()
+            .iter()
+            .filter(|m| wwta_core::models::read_manifest(&state.paths.models, m.id).is_some())
+            .map(|m| m.id.to_string())
+            .collect();
+        let (recordings, notes) = {
+            let db = state.db.lock().unwrap();
+            (
+                db.list_recordings().map(|r| r.len()).unwrap_or(0),
+                db.all_notes().map(|n| n.len()).unwrap_or(0),
+            )
+        };
+        let s = state.settings();
+        a.capture(
+            "app opened",
+            serde_json::json!({
+                "models_installed": installed,
+                "recordings": recordings,
+                "notes": notes,
+                "cpu_cores": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+                "ram_gb": (sysinfo::total_memory() as f64 / 1e9).round(),
+                "default_model": s.default_model_id,
+                "llm_model": if s.openrouter_api_key.trim().is_empty() { None } else { Some(s.llm_model) },
+                "ai_enabled": !s.openrouter_api_key.trim().is_empty(),
+                "ai_language": s.ai_language,
+                "theme": s.theme,
+            }),
+        );
+    });
 }

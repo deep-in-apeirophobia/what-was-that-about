@@ -25,6 +25,12 @@ serde_json.workspace = true
 tokio.workspace = true
 log.workspace = true
 uuid = { version = "1", features = ["v4"] }
+regex = "1"
+dirs = "7"
+# Crash reporting (only active when SENTRY_DSN is set at build time). No TLS feature here:
+# it uses the workspace's reqwest/rustls (ring) build instead of pulling in aws-lc.
+sentry = { version = "0.49", default-features = false, features = ["backtrace", "contexts", "debug-images", "panic", "reqwest", "release-health"] }
+tauri-plugin-sentry = "0.9"
 
 # GPU backend for whisper.cpp: Metal on macOS, Vulkan elsewhere.
 [target.'cfg(target_os = "macos")'.dependencies]

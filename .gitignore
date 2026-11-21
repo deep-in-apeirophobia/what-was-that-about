@@ -8,3 +8,4 @@ target/
 .env.*
 ci-models/
 /models/
+!.env.example

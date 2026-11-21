@@ -139,7 +139,10 @@ export function DocsTab() {
                   key={t.key}
                   type="button"
                   disabled={!canGenerate}
-                  onClick={() => void generate(t.prompt)}
+                  onClick={() => {
+                    void api.trackUi("doc template used", { template: t.key });
+                    void generate(t.prompt);
+                  }}
                   title={t.prompt}
                   className="flex items-center gap-2 rounded-lg border border-line bg-surface px-2.5 py-2 text-left text-[12.5px] font-medium transition-colors hover:border-accent hover:bg-accent-soft/40 disabled:pointer-events-none disabled:opacity-50 [&>svg]:size-4 [&>svg]:shrink-0 [&>svg]:text-accent"
                 >

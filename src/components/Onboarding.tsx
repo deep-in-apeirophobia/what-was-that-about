@@ -12,7 +12,7 @@ import { toast } from "../store/toasts";
 import { errorMessage } from "../lib/errors";
 import { Button } from "./ui/Button";
 import { Dialog } from "./ui/Dialog";
-import { Badge, inputClass, Spinner } from "./ui/misc";
+import { Badge, inputClass, Spinner, Switch } from "./ui/misc";
 import { ManualInstall, ModelProgressView } from "./ModelCard";
 import { importViaDialog } from "./Sidebar";
 
@@ -245,6 +245,26 @@ function AiStep({ onNext }: { onNext: () => void }) {
   );
 }
 
+function TelemetryNotice() {
+  const settings = useSettings((s) => s.settings);
+  const patch = useSettings((s) => s.patch);
+  if (!settings) return null;
+  const on = settings.analyticsEnabled && settings.crashReportsEnabled;
+  return (
+    <div className="flex items-start gap-3 rounded-lg border border-line bg-sunken/50 p-3 text-left">
+      <p className="flex-1 text-[12px] leading-relaxed text-muted">
+        The app sends anonymous usage statistics and crash reports to help improve it — never recordings,
+        transcripts, notes, names or keys. You can change this anytime in Settings → Privacy.
+      </p>
+      <Switch
+        label="Share anonymous usage statistics and crash reports"
+        checked={on}
+        onChange={(v) => void patch({ analyticsEnabled: v, crashReportsEnabled: v })}
+      />
+    </div>
+  );
+}
+
 function DoneStep({ onClose }: { onClose: () => void }) {
   const models = useModels((s) => s.models);
   const ready = hasReadyModel(models);
@@ -261,6 +281,7 @@ function DoneStep({ onClose }: { onClose: () => void }) {
             : "The model keeps installing in the background. Meanwhile you can import recordings; transcribe them once it's ready."}
         </p>
       </div>
+      <TelemetryNotice />
       <div className="flex justify-center gap-2">
         <Button onClick={onClose}>Close</Button>
         <Button
@@ -299,6 +320,10 @@ export function Onboarding() {
   }, [needed]);
 
   const close = () => {
+    void api.trackUi(step === "done" ? "onboarding completed" : "onboarding skipped", {
+      step,
+      model_ready: hasReadyModel(models),
+    });
     setOpen(false);
     dismiss();
   };

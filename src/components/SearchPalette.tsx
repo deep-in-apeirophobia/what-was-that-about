@@ -40,6 +40,7 @@ export function SearchPalette() {
 
   useEffect(() => {
     if (open) {
+      void api.trackUi("search opened");
       setSel(0);
       requestAnimationFrame(() => inputRef.current?.select());
     }

@@ -12,6 +12,11 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Telemetry keys compiled into CI builds (empty = built without telemetry).
+  POSTHOG_KEY: ${{ vars.POSTHOG_KEY }}
+  POSTHOG_HOST: ${{ vars.POSTHOG_HOST }}
+  SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+  WWTA_CHANNEL: nightly
 
 jobs:
   frontend:

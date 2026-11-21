@@ -342,6 +342,10 @@ pub struct Settings {
     pub persian_digits: bool,
     pub precise_word_timings: bool,
     pub auto_analyze: bool,
+    /// Anonymous usage statistics (PostHog). On by default, opt-out.
+    pub analytics_enabled: bool,
+    /// Crash and error reports (Sentry). On by default, opt-out.
+    pub crash_reports_enabled: bool,
 }
 
 impl Default for Settings {
@@ -361,6 +365,8 @@ impl Default for Settings {
             persian_digits: true,
             precise_word_timings: true,
             auto_analyze: false,
+            analytics_enabled: true,
+            crash_reports_enabled: true,
         }
     }
 }

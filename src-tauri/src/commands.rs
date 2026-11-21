@@ -59,8 +59,71 @@ pub fn get_settings(state: State<'_, AppState>) -> Settings {
 #[tauri::command]
 pub fn save_settings(state: State<'_, AppState>, settings: Settings) -> CmdResult<Settings> {
     store_settings(&state.paths.settings, &settings).map_err(anyhow_err)?;
-    *state.settings.write().unwrap() = settings.clone();
+    let old = std::mem::replace(&mut *state.settings.write().unwrap(), settings.clone());
+    state.analytics.set_enabled(settings.analytics_enabled);
+    crate::telemetry::set_crash_reports(settings.crash_reports_enabled);
+    let (o, n) = (
+        serde_json::to_value(&old).unwrap_or_default(),
+        serde_json::to_value(&settings).unwrap_or_default(),
+    );
+    let changed: Vec<String> = n
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .filter(|(k, v)| o.get(*k) != Some(*v))
+                .map(|(k, _)| k.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    if !changed.is_empty() {
+        state.analytics.capture(
+            "settings changed",
+            serde_json::json!({
+                "changed": changed,
+                "llm_model": settings.llm_model,
+                "embedding_model": settings.embedding_model,
+                "default_model": settings.default_model_id,
+                "ai_language": settings.ai_language,
+                "use_gpu": settings.use_gpu,
+                "whisper_quant": settings.whisper_quant,
+                "auto_analyze": settings.auto_analyze,
+                "theme": settings.theme,
+                "openrouter_key_set": !settings.openrouter_api_key.trim().is_empty(),
+            }),
+        );
+    }
     Ok(settings)
+}
+
+/// Product events the UI may record (allow-listed; properties are reduced to scalars).
+#[tauri::command]
+pub fn track_ui(state: State<'_, AppState>, event: String, props: Option<serde_json::Value>) {
+    const ALLOWED: &[&str] = &[
+        "onboarding completed",
+        "onboarding skipped",
+        "doc template used",
+        "search opened",
+        "audio played",
+    ];
+    if !ALLOWED.contains(&event.as_str()) {
+        return;
+    }
+    let mut clean = serde_json::Map::new();
+    if let Some(serde_json::Value::Object(m)) = props {
+        for (k, v) in m.into_iter().take(12) {
+            let ok = match &v {
+                serde_json::Value::String(s) => s.chars().count() <= 64,
+                serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
+                _ => false,
+            };
+            if ok {
+                clean.insert(k, v);
+            }
+        }
+    }
+    state
+        .analytics
+        .capture(&event, serde_json::Value::Object(clean));
 }
 
 // ------------------------------------------------------------------ models
@@ -83,7 +146,12 @@ fn emit_model(app: &AppHandle, p: ModelProgress) {
 }
 
 /// Shared driver for downloads and manual imports.
-fn spawn_model_job<F, Fut>(app: AppHandle, model_id: String, run: F) -> CmdResult<()>
+fn spawn_model_job<F, Fut>(
+    app: AppHandle,
+    model_id: String,
+    method: &'static str,
+    run: F,
+) -> CmdResult<()>
 where
     F: FnOnce(AppHandle, Arc<AtomicBool>) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
@@ -106,9 +174,40 @@ where
         .unwrap()
         .insert(model_id.clone(), (ModelStatus::Downloading, None));
     tauri::async_runtime::spawn(async move {
+        let started = std::time::Instant::now();
         let result = run(app.clone(), cancel.clone()).await;
         let state = app.state::<AppState>();
         state.model_jobs.lock().unwrap().remove(&model_id);
+        let took = started.elapsed().as_secs();
+        match &result {
+            Ok(()) => {
+                let format =
+                    models::read_manifest(&state.paths.models, &model_id).map(|m| m.format);
+                state.analytics.capture(
+                    "model installed",
+                    serde_json::json!({ "model": model_id, "method": method, "format": format, "duration_sec": took }),
+                );
+            }
+            Err(_) if cancel.load(Ordering::Relaxed) => state.analytics.capture(
+                "model install cancelled",
+                serde_json::json!({ "model": model_id, "method": method, "duration_sec": took }),
+            ),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                let kind = crate::telemetry::error_kind(&msg);
+                state.analytics.capture(
+                    "model install failed",
+                    serde_json::json!({ "model": model_id, "method": method, "error_kind": kind, "duration_sec": took }),
+                );
+                if kind != "network" {
+                    crate::telemetry::report_error(
+                        "model_install",
+                        &msg,
+                        &[("model", model_id.as_str()), ("method", method)],
+                    );
+                }
+            }
+        }
         let (stage, message) = match &result {
             Ok(()) => {
                 state.model_status.lock().unwrap().remove(&model_id);
@@ -163,7 +262,7 @@ fn progress_reporter(app: &AppHandle) -> impl FnMut(ModelProgress) + Send + 'sta
 #[tauri::command]
 pub fn install_model(app: AppHandle, model_id: String) -> CmdResult<()> {
     let id = model_id.clone();
-    spawn_model_job(app, model_id, move |app, cancel| async move {
+    spawn_model_job(app, model_id, "download", move |app, cancel| async move {
         let state = app.state::<AppState>();
         let spec = models::spec(&id).unwrap();
         let settings = state.settings();
@@ -190,7 +289,7 @@ pub fn cancel_model_install(state: State<'_, AppState>, model_id: String) {
 #[tauri::command]
 pub fn import_model_files(app: AppHandle, model_id: String, paths: Vec<String>) -> CmdResult<()> {
     let id = model_id.clone();
-    spawn_model_job(app, model_id, move |app, cancel| async move {
+    spawn_model_job(app, model_id, "import", move |app, cancel| async move {
         let state = app.state::<AppState>();
         let spec = models::spec(&id).unwrap();
         let quant = ggml::OutType::parse(&state.settings().whisper_quant);
@@ -323,7 +422,7 @@ pub async fn import_files(app: AppHandle, paths: Vec<String>) -> CmdResult<Vec<R
     }
     // Decode in the background (waveform + duration), then queue transcription.
     for rec in &created {
-        prepare_and_queue(&app, rec.id.clone());
+        prepare_and_queue(&app, rec.id.clone(), "file");
     }
     Ok(created)
 }
@@ -343,7 +442,33 @@ fn is_container(p: &std::path::Path) -> bool {
 }
 
 /// Decode a freshly imported recording (waveform, duration) and queue its transcription.
-fn prepare_and_queue(app: &AppHandle, id: String) {
+/// Record an import with coarse facts about the media (never its name or content).
+fn track_import(app: &AppHandle, id: &str, source: &str, decoded_in_webview: bool) {
+    let state = app.state::<AppState>();
+    let Ok(rec) = state.db.lock().unwrap().recording(id) else {
+        return;
+    };
+    let src = std::path::Path::new(&rec.source_path);
+    let size = if src.is_file() {
+        std::fs::metadata(src).map(|m| m.len()).unwrap_or(0)
+    } else {
+        0
+    };
+    let secs = rec.duration_sec.unwrap_or(0.0);
+    state.analytics.capture(
+        "recording imported",
+        serde_json::json!({
+            "source": source,
+            "format": crate::telemetry::format_of(src),
+            "duration_sec": secs.round(),
+            "duration_bucket": crate::telemetry::duration_bucket(secs),
+            "size_bucket": crate::telemetry::size_bucket_mb(size),
+            "decoded_in_webview": decoded_in_webview,
+        }),
+    );
+}
+
+fn prepare_and_queue(app: &AppHandle, id: String, source: &'static str) {
     let app2 = app.clone();
     tauri::async_runtime::spawn(async move {
         let app3 = app2.clone();
@@ -357,6 +482,7 @@ fn prepare_and_queue(app: &AppHandle, id: String) {
         let state = app2.state::<AppState>();
         match outcome {
             Ok(Ok(worker::Prepared::Samples(_))) => {
+                track_import(&app2, &id, source, false);
                 if let Some(model_id) = default_model_ready(&state) {
                     let _ = queue_transcription(&app2, &id, model_id);
                 } else {
@@ -365,9 +491,26 @@ fn prepare_and_queue(app: &AppHandle, id: String) {
                     events::recording_updated(&app2, &db, &id);
                 }
             }
-            Ok(Ok(worker::Prepared::NeedsDecode)) => {}
+            Ok(Ok(worker::Prepared::NeedsDecode)) => {
+                let format = state
+                    .db
+                    .lock()
+                    .unwrap()
+                    .recording(&id)
+                    .map(|r| crate::telemetry::format_of(std::path::Path::new(&r.source_path)))
+                    .unwrap_or_default();
+                state.analytics.capture(
+                    "recording needs webview decode",
+                    serde_json::json!({ "format": format, "source": source }),
+                );
+            }
             Ok(Err(e)) => {
                 let msg = format!("{e:#}");
+                state.analytics.capture(
+                    "recording import failed",
+                    serde_json::json!({ "source": source, "error_kind": crate::telemetry::error_kind(&msg) }),
+                );
+                crate::telemetry::report_error("import", &msg, &[("source", source)]);
                 let db = state.db.lock().unwrap();
                 let _ = db.set_status(&id, RecordingStatus::Error, Some(&msg));
                 events::recording_updated(&app2, &db, &id);
@@ -459,10 +602,18 @@ pub async fn import_link(app: AppHandle, url: String) -> CmdResult<Recording> {
             })
             .await;
         match result {
-            Ok(()) => prepare_and_queue(&app2, id2),
+            Ok(()) => prepare_and_queue(&app2, id2, "adobe_connect_link"),
             Err(e) => {
                 let msg = format!("{e:#}");
                 let state = app2.state::<AppState>();
+                state.analytics.capture(
+                    "recording import failed",
+                    serde_json::json!({
+                        "source": "adobe_connect_link",
+                        "error_kind": crate::telemetry::error_kind(&msg),
+                        "login_page": msg.contains("login"),
+                    }),
+                );
                 let db = state.db.lock().unwrap();
                 let _ = db.set_status(&id2, RecordingStatus::Error, Some(&msg));
                 events::recording_updated(&app2, &db, &id2);
@@ -537,6 +688,7 @@ pub fn submit_decoded_audio(
             .map_err(anyhow_err)?;
     }
     allow_asset(&app, &pcm);
+    track_import(&app, &id, "file", true);
     if let Some(model_id) = default_model_ready(&state) {
         queue_transcription(&app, &id, model_id).map_err(anyhow_err)?;
     }
@@ -575,6 +727,9 @@ pub fn delete_recording(app: AppHandle, state: State<'_, AppState>, id: String) 
         let _ = std::fs::remove_dir_all(dir);
     }
     let _ = app.emit(events::RECORDING_DELETED, id);
+    state
+        .analytics
+        .capture("recording deleted", serde_json::json!({}));
     Ok(())
 }
 
@@ -694,6 +849,10 @@ pub fn export_transcript(
     let notes = db.notes(&id).map_err(anyhow_err)?;
     let body = export::render(&format, &rec.title, &segs, analysis.as_ref(), &notes)
         .ok_or("unknown export format")?;
+    state.analytics.capture(
+        "transcript exported",
+        serde_json::json!({ "format": format, "segments": segs.len(), "with_notes": !notes.is_empty() }),
+    );
     std::fs::write(&path, body).map_err(err)
 }
 
@@ -713,8 +872,20 @@ pub fn add_note(
     }
     let db = state.db.lock().unwrap();
     db.recording(&recording_id).map_err(anyhow_err)?;
-    db.add_note(&recording_id, start, end, &body, color.as_deref())
-        .map_err(anyhow_err)
+    let note = db
+        .add_note(&recording_id, start, end, &body, color.as_deref())
+        .map_err(anyhow_err)?;
+    drop(db);
+    state.analytics.capture(
+        "note created",
+        serde_json::json!({
+            "chars": note.body.chars().count(),
+            "has_link": note.body.contains("http") || note.body.contains("[rec:"),
+            "color": note.color,
+            "span_sec": (note.end - note.start).round(),
+        }),
+    );
+    Ok(note)
 }
 
 #[tauri::command]
@@ -744,7 +915,11 @@ pub fn delete_note(state: State<'_, AppState>, id: String) -> CmdResult<()> {
         .lock()
         .unwrap()
         .delete_note(&id)
-        .map_err(anyhow_err)
+        .map_err(anyhow_err)?;
+    state
+        .analytics
+        .capture("note deleted", serde_json::json!({}));
+    Ok(())
 }
 
 #[tauri::command]
@@ -776,10 +951,23 @@ pub async fn search(
     } else {
         vec![]
     };
-    Ok(search::merge_hits(
-        vec![notes, lexical, tags, semantic],
-        limit,
-    ))
+    let semantic_n = semantic.len();
+    let hits = search::merge_hits(vec![notes, lexical, tags, semantic], limit);
+    let count = |k: HitKind| hits.iter().filter(|h| h.kind == k).count();
+    state.analytics.capture(
+        "search performed",
+        serde_json::json!({
+            "scope": if recording_id.is_some() { "recording" } else { "library" },
+            "query_chars": query.trim().chars().count(),
+            "results": hits.len(),
+            "lexical": count(HitKind::Lexical),
+            "semantic": count(HitKind::Semantic),
+            "tag": count(HitKind::Tag),
+            "note": count(HitKind::Note),
+            "semantic_available": semantic_n > 0,
+        }),
+    );
+    Ok(hits)
 }
 
 #[tauri::command]

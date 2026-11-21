@@ -179,6 +179,8 @@ let settings: Settings = {
   persianDigits: true,
   preciseWordTimings: false,
   autoAnalyze: true,
+  analyticsEnabled: true,
+  crashReportsEnabled: true,
 };
 
 const models: ModelInfo[] = initialModels(MOCK_SYSTEM.dataDir);
@@ -854,6 +856,8 @@ export const handlers: Record<string, Handler> = {
       embeddingsIndexed: s.embeddingsIndexed,
     };
   },
+  track_ui: () => undefined,
+
   import_link: async (args) => {
     const url = String(args.url ?? "");
     const m = /^https?:\/\/[^/]+\/([^/?#]+)/i.exec(url);

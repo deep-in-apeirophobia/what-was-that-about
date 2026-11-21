@@ -272,6 +272,10 @@ export interface Settings {
   preciseWordTimings: boolean;
   /** Automatically run AI analysis after a transcription finishes (needs API key). */
   autoAnalyze: boolean;
+  /** Anonymous usage statistics (PostHog): counts, models, formats, durations. Never content. */
+  analyticsEnabled: boolean;
+  /** Crash and error reports (Sentry). Turning it on takes effect after a restart. */
+  crashReportsEnabled: boolean;
 }
 
 export interface GpuDevice {

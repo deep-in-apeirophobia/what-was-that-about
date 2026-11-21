@@ -90,6 +90,8 @@ pub struct AppState {
     pub model_status: Mutex<HashMap<String, (ModelStatus, Option<String>)>>,
     /// Running LLM requests: request id -> cancel flag
     pub llm_jobs: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Anonymous usage analytics (no-op when disabled or not configured)
+    pub analytics: Arc<crate::telemetry::Analytics>,
     /// Cached OpenRouter model list
     pub llm_models: tokio::sync::Mutex<Option<Vec<wwta_core::types::LlmModelInfo>>>,
 }

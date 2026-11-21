@@ -86,6 +86,20 @@ A one-hour recording is roughly 40k tokens, a fraction of a cent with these mode
 Only transcript text is sent to OpenRouter, and only when you use these features. Audio never
 leaves your computer.
 
+## Privacy and telemetry
+
+Official builds send **anonymous** usage statistics (PostHog) and crash reports (Sentry). Both
+are on by default and can be turned off in **Settings → Privacy** (or on the first-run screen).
+
+- **Sent:** a random install id, app version, OS, CPU/RAM/GPU model, app opens, which speech
+  and AI models are used, file formats, recording lengths (bucketed), transcription speed,
+  AI request latency/token counts/cost, and counts (searches, notes, exports).
+- **Never sent:** audio, transcripts, notes, chat, generated docs, recording titles, file names
+  or paths, search text, or API keys. Crash reports are scrubbed of paths and tokens.
+- Events queue on disk while offline and are sent later; turning statistics off deletes the queue.
+- Builds without `POSTHOG_KEY` / `SENTRY_DSN` (e.g. your own, see `.env.example`) contain no
+  telemetry at all.
+
 ## Install
 
 Get installers from [Releases](https://github.com/deep-in-apeirophobia/what-was-that-about/releases)
@@ -133,7 +147,7 @@ pnpm dev                # UI only, in a browser, against an in-memory mock backe
 ```
 
 The first build downloads sherpa-onnx's prebuilt libraries and compiles whisper.cpp (several
-minutes).
+minutes). To compile telemetry into a local build, copy `.env.example` to `.env` and fill it in.
 
 ### Command-line tool
 

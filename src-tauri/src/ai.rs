@@ -12,6 +12,62 @@ use wwta_core::types::{now_iso, Analysis, ChatMessage, Doc, LlmStreamEvent, Sear
 
 use crate::events;
 use crate::state::AppState;
+use crate::telemetry;
+
+fn add_usage(acc: &mut Option<llm::Usage>, u: Option<llm::Usage>) {
+    if let Some(u) = u {
+        let a = acc.get_or_insert_with(llm::Usage::default);
+        a.prompt_tokens += u.prompt_tokens;
+        a.completion_tokens += u.completion_tokens;
+        a.cost = match (a.cost, u.cost) {
+            (Some(x), Some(y)) => Some(x + y),
+            (x, y) => x.or(y),
+        };
+    }
+}
+
+/// Record one OpenRouter request for analytics (kind, model, latency, tokens, cost — never
+/// prompts or answers) and report unexpected failures to Sentry.
+fn track_ai<T>(
+    app: &AppHandle,
+    kind: &str,
+    model: &str,
+    started: std::time::Instant,
+    result: &Result<T>,
+    usage: Option<llm::Usage>,
+    extra: serde_json::Value,
+) {
+    let mut props = serde_json::json!({
+        "kind": kind,
+        "model": model,
+        "success": result.is_ok(),
+        "latency_ms": started.elapsed().as_millis() as u64,
+    });
+    if let Some(u) = usage {
+        props["prompt_tokens"] = u.prompt_tokens.into();
+        props["completion_tokens"] = u.completion_tokens.into();
+        if let Some(c) = u.cost {
+            props["cost_usd"] = c.into();
+        }
+    }
+    if let Err(e) = result {
+        let msg = format!("{e:#}");
+        let ek = telemetry::error_kind(&msg);
+        props["error_kind"] = ek.into();
+        if !matches!(
+            ek,
+            "cancelled" | "auth" | "credits" | "rate_limited" | "network"
+        ) {
+            telemetry::report_error("ai_request", &msg, &[("ai_kind", kind), ("model", model)]);
+        }
+    }
+    if let (serde_json::Value::Object(p), serde_json::Value::Object(x)) = (&mut props, extra) {
+        p.extend(x);
+    }
+    app.state::<AppState>()
+        .analytics
+        .capture("ai request", props);
+}
 
 fn client(app: &AppHandle) -> Result<(llm::Client, wwta_core::types::Settings)> {
     let s = app.state::<AppState>().settings();
@@ -71,6 +127,23 @@ impl Drop for LlmJob {
 }
 
 pub async fn analyze(app: &AppHandle, id: &str) -> Result<Analysis> {
+    let started = std::time::Instant::now();
+    let model = app.state::<AppState>().settings().llm_model;
+    let mut usage = None;
+    let r = analyze_inner(app, id, &mut usage).await;
+    let extra = match &r {
+        Ok(a) => serde_json::json!({ "chapters": a.chapters.len(), "tags": a.tags.len() }),
+        Err(_) => serde_json::json!({}),
+    };
+    track_ai(app, "analyze", &model, started, &r, usage, extra);
+    r
+}
+
+async fn analyze_inner(
+    app: &AppHandle,
+    id: &str,
+    usage: &mut Option<llm::Usage>,
+) -> Result<Analysis> {
     let (client, settings) = client(app)?;
     let state = app.state::<AppState>();
     let (rec, segs) = {
@@ -82,7 +155,7 @@ pub async fn analyze(app: &AppHandle, id: &str) -> Result<Analysis> {
     }
     let messages = llm::analysis_messages(&rec.title, &segs, &settings.ai_language);
     let model = settings.llm_model.clone();
-    let raw = match client.complete(&model, &messages, true, 16_000).await {
+    let (raw, u) = match client.complete(&model, &messages, true, 16_000).await {
         Ok(r) => r,
         // some providers reject response_format; retry without it
         Err(e) if e.to_string().contains("response_format") => {
@@ -90,6 +163,7 @@ pub async fn analyze(app: &AppHandle, id: &str) -> Result<Analysis> {
         }
         Err(e) => return Err(e),
     };
+    add_usage(usage, u);
     let value = match llm::extract_json(&raw) {
         Ok(v) => v,
         Err(first) => {
@@ -99,7 +173,9 @@ pub async fn analyze(app: &AppHandle, id: &str) -> Result<Analysis> {
             repair.push(Msg::user(
                 "That was not valid JSON. Reply again with only the corrected JSON object.",
             ));
-            llm::extract_json(&client.complete(&model, &repair, false, 16_000).await?)?
+            let (fixed, u) = client.complete(&model, &repair, false, 16_000).await?;
+            add_usage(usage, u);
+            llm::extract_json(&fixed)?
         }
     };
     let analysis = llm::parse_analysis(&value, &segs, &model, &settings.ai_language);
@@ -116,6 +192,23 @@ pub async fn analyze(app: &AppHandle, id: &str) -> Result<Analysis> {
 }
 
 pub async fn index_embeddings(app: &AppHandle, id: &str) -> Result<()> {
+    let started = std::time::Instant::now();
+    let model = app.state::<AppState>().settings().embedding_model;
+    let mut inputs = 0usize;
+    let r = index_embeddings_inner(app, id, &mut inputs).await;
+    track_ai(
+        app,
+        "embed",
+        &model,
+        started,
+        &r,
+        None,
+        serde_json::json!({ "inputs": inputs }),
+    );
+    r
+}
+
+async fn index_embeddings_inner(app: &AppHandle, id: &str, inputs: &mut usize) -> Result<()> {
     let (client, settings) = client(app)?;
     let state = app.state::<AppState>();
     let segs = state.db.lock().unwrap().segments(id)?;
@@ -124,6 +217,7 @@ pub async fn index_embeddings(app: &AppHandle, id: &str) -> Result<()> {
     }
     let chunks = search::chunk_segments(&segs, 450);
     let texts: Vec<String> = chunks.iter().map(|c| c.2.clone()).collect();
+    *inputs = texts.len();
     let vectors = client.embed(&settings.embedding_model, &texts).await?;
     let rows: Vec<wwta_core::db::EmbeddingRow> = chunks
         .iter()
@@ -169,10 +263,20 @@ pub async fn semantic_search(
     let Ok(client) = llm::Client::new(&settings.openrouter_api_key) else {
         return vec![];
     };
-    let q = match client
+    let started = std::time::Instant::now();
+    let embedded = client
         .embed(&settings.embedding_model, &[query.to_string()])
-        .await
-    {
+        .await;
+    track_ai(
+        app,
+        "semantic_search",
+        &settings.embedding_model,
+        started,
+        &embedded,
+        None,
+        serde_json::json!({}),
+    );
+    let q = match embedded {
         Ok(mut v) if !v.is_empty() => v.remove(0),
         Ok(_) => return vec![],
         Err(e) => {
@@ -221,8 +325,17 @@ pub async fn ask(
     request_id: String,
 ) -> Result<ChatMessage> {
     let job = LlmJob::start(app, &request_id);
-    let r = ask_inner(app, recording_id, question, &job).await;
+    let started = std::time::Instant::now();
+    let model = app.state::<AppState>().settings().llm_model;
+    let kind = if recording_id.is_some() {
+        "ask"
+    } else {
+        "ask_library"
+    };
+    let mut usage = None;
+    let r = ask_inner(app, recording_id, question, &job, &mut usage).await;
     job.finish(&r);
+    track_ai(app, kind, &model, started, &r, usage, serde_json::json!({}));
     r
 }
 
@@ -231,6 +344,7 @@ async fn ask_inner(
     recording_id: Option<String>,
     question: String,
     job: &LlmJob,
+    usage: &mut Option<llm::Usage>,
 ) -> Result<ChatMessage> {
     let (client, settings) = client(app)?;
     let state = app.state::<AppState>();
@@ -276,7 +390,7 @@ async fn ask_inner(
     messages.push(Msg::user(question));
 
     let mut rewriter = rewriter;
-    let answer = client
+    let (answer, u) = client
         .stream(
             &settings.llm_model,
             &messages,
@@ -293,6 +407,7 @@ async fn ask_inner(
             },
         )
         .await?;
+    *usage = u;
     let answer = match rewriter.as_mut() {
         Some(r) => {
             let tail = r.finish();
@@ -370,6 +485,9 @@ pub async fn generate_doc(
     request_id: String,
 ) -> Result<Doc> {
     let job = LlmJob::start(app, &request_id);
+    let started = std::time::Instant::now();
+    let model = app.state::<AppState>().settings().llm_model;
+    let mut usage = None;
     let r = async {
         let (client, settings) = client(app)?;
         let state = app.state::<AppState>();
@@ -384,7 +502,7 @@ pub async fn generate_doc(
             Msg::system(llm::doc_system(&settings.ai_language)),
             Msg::user(llm::doc_user(&prompt, &rec.title, &segs, analysis.as_ref())),
         ];
-        let raw = client
+        let (raw, u) = client
             .stream(
                 &settings.llm_model,
                 &messages,
@@ -393,6 +511,7 @@ pub async fn generate_doc(
                 &mut |d| job.emit(Some(d.to_string()), false, None),
             )
             .await?;
+        usage = u;
         let html = llm::extract_html(&raw)?;
         let now = now_iso();
         let doc = Doc {
@@ -410,6 +529,15 @@ pub async fn generate_doc(
     }
     .await;
     job.finish(&r);
+    track_ai(
+        app,
+        "generate_doc",
+        &model,
+        started,
+        &r,
+        usage,
+        serde_json::json!({}),
+    );
     r
 }
 
@@ -420,6 +548,9 @@ pub async fn revise_doc(
     request_id: String,
 ) -> Result<Doc> {
     let job = LlmJob::start(app, &request_id);
+    let started = std::time::Instant::now();
+    let model = app.state::<AppState>().settings().llm_model;
+    let mut usage = None;
     let r = async {
         let (client, settings) = client(app)?;
         let state = app.state::<AppState>();
@@ -437,11 +568,12 @@ pub async fn revise_doc(
                 "Revise the document: {instruction}\nReturn the complete updated HTML document only."
             )),
         ];
-        let raw = client
+        let (raw, u) = client
             .stream(&settings.llm_model, &messages, 32_000, &job.cancel, &mut |d| {
                 job.emit(Some(d.to_string()), false, None)
             })
             .await?;
+        usage = u;
         let html = llm::extract_html(&raw)?;
         let updated = Doc {
             title: llm::html_title(&html).unwrap_or(doc.title.clone()),
@@ -455,5 +587,14 @@ pub async fn revise_doc(
     }
     .await;
     job.finish(&r);
+    track_ai(
+        app,
+        "revise_doc",
+        &model,
+        started,
+        &r,
+        usage,
+        serde_json::json!({}),
+    );
     r
 }

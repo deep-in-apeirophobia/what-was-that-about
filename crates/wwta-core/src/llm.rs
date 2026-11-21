@@ -42,6 +42,29 @@ impl Msg {
     }
 }
 
+/// Token usage and cost reported by OpenRouter for one request.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Usage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    /// USD, when OpenRouter reports it.
+    pub cost: Option<f64>,
+}
+
+impl Usage {
+    fn from_json(v: &Value) -> Option<Self> {
+        let u = v.get("usage")?;
+        if !u.is_object() {
+            return None;
+        }
+        Some(Self {
+            prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0),
+            completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
+            cost: u["cost"].as_f64(),
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
@@ -116,13 +139,14 @@ impl Client {
         messages: &[Msg],
         json_mode: bool,
         max_tokens: u32,
-    ) -> Result<String> {
+    ) -> Result<(String, Option<Usage>)> {
         let mut body = json!({
             "model": model,
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": 0.2,
             "reasoning": { "exclude": true },
+            "usage": { "include": true },
         });
         if json_mode {
             body["response_format"] = json!({ "type": "json_object" });
@@ -138,10 +162,11 @@ impl Client {
         if let Some(err) = v["error"]["message"].as_str() {
             bail!("OpenRouter: {err}");
         }
-        v["choices"][0]["message"]["content"]
+        let text = v["choices"][0]["message"]["content"]
             .as_str()
             .map(String::from)
-            .ok_or_else(|| anyhow!("empty response from model"))
+            .ok_or_else(|| anyhow!("empty response from model"))?;
+        Ok((text, Usage::from_json(&v)))
     }
 
     /// Streaming completion; `on_delta` receives text pieces as they arrive.
@@ -152,7 +177,7 @@ impl Client {
         max_tokens: u32,
         cancel: &AtomicBool,
         on_delta: &mut (dyn FnMut(&str) + Send),
-    ) -> Result<String> {
+    ) -> Result<(String, Option<Usage>)> {
         let body = json!({
             "model": model,
             "messages": messages,
@@ -160,6 +185,7 @@ impl Client {
             "temperature": 0.3,
             "stream": true,
             "reasoning": { "exclude": true },
+            "usage": { "include": true },
         });
         let resp = Self::check(
             self.req(reqwest::Method::POST, "/chat/completions")
@@ -171,6 +197,7 @@ impl Client {
         let mut stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
         let mut full = String::new();
+        let mut usage: Option<Usage> = None;
         'outer: while let Some(chunk) = stream.next().await {
             if cancel.load(Ordering::Relaxed) {
                 bail!("cancelled");
@@ -193,6 +220,10 @@ impl Client {
                 if let Some(err) = v["error"]["message"].as_str() {
                     bail!("OpenRouter: {err}");
                 }
+                // the final chunk carries token usage and cost
+                if let Some(u) = Usage::from_json(&v) {
+                    usage = Some(u);
+                }
                 if let Some(d) = v["choices"][0]["delta"]["content"].as_str() {
                     if !d.is_empty() {
                         full.push_str(d);
@@ -204,7 +235,7 @@ impl Client {
         if full.is_empty() {
             bail!("the model returned an empty answer");
         }
-        Ok(full)
+        Ok((full, usage))
     }
 
     pub async fn embed(&self, model: &str, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -745,6 +776,18 @@ mod tests {
             out,
             "Budget is low [rec:uuid-b#14] and [rec:uuid-a#3-5] done [x"
         );
+    }
+
+    #[test]
+    fn parses_openrouter_usage() {
+        let v: Value = serde_json::from_str(
+            r#"{"usage":{"prompt_tokens":1200,"completion_tokens":300,"cost":0.00042}}"#,
+        )
+        .unwrap();
+        let u = Usage::from_json(&v).unwrap();
+        assert_eq!((u.prompt_tokens, u.completion_tokens), (1200, 300));
+        assert_eq!(u.cost, Some(0.00042));
+        assert!(Usage::from_json(&serde_json::json!({"choices": []})).is_none());
     }
 
     #[test]

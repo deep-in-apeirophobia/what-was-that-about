@@ -17,6 +17,12 @@ env:
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
   # Build whisper.cpp for a portable baseline (AVX2 on x86-64) instead of the CI machine's CPU.
   GGML_NATIVE: "OFF"
+  # Telemetry keys compiled into the app (empty = built without telemetry). The PostHog token
+  # is a public client token; the Sentry DSN is optional.
+  POSTHOG_KEY: ${{ vars.POSTHOG_KEY }}
+  POSTHOG_HOST: ${{ vars.POSTHOG_HOST }}
+  SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+  WWTA_CHANNEL: release
   # Match bundle.macOS.minimumSystemVersion so the CLI and the app share one native build.
   MACOSX_DEPLOYMENT_TARGET: "11.0"
 

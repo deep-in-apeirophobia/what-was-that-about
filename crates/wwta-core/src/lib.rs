@@ -12,6 +12,9 @@ pub mod search;
 pub mod text;
 pub mod types;
 
+/// Re-exported so the app shares this exact HTTP client build (rustls with ring).
+pub use reqwest;
+
 #[cfg(feature = "asr")]
 pub mod asr;
 pub mod chunking;

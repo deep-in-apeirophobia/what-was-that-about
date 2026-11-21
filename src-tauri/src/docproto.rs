@@ -94,6 +94,10 @@ pub fn handle(app: &AppHandle, req: Request<Vec<u8>>) -> Response<Cow<'static, [
         "analysis": analysis,
         "notes": notes.iter().map(|n| json!({ "start": n.start, "end": n.end, "body": n.body, "color": n.color })).collect::<Vec<_>>(),
     });
+    state.analytics.capture(
+        "doc viewed",
+        serde_json::json!({ "doc_chars": doc.html.len() }),
+    );
     respond(StatusCode::OK, inject(&doc.html, &data))
 }
 

@@ -22,6 +22,8 @@ const base: Settings = {
   persianDigits: true,
   preciseWordTimings: false,
   autoAnalyze: true,
+  analyticsEnabled: true,
+  crashReportsEnabled: true,
 };
 
 describe("useSettings.patch", () => {

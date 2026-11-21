@@ -492,6 +492,32 @@ export function SettingsView() {
             </Row>
           </Section>
 
+          <Section
+            title="Privacy"
+            description="Anonymous and on by default. Never includes recordings, transcripts, notes, titles, file names, search text or keys."
+          >
+            <Row
+              label="Share anonymous usage statistics"
+              description="Counts of app opens, which models and file formats are used, recording lengths and speeds. Helps decide what to improve."
+            >
+              <Switch
+                label="Share anonymous usage statistics"
+                checked={settings.analyticsEnabled}
+                onChange={(analyticsEnabled) => void update({ analyticsEnabled })}
+              />
+            </Row>
+            <Row
+              label="Send crash reports"
+              description="Error details and crash dumps with personal paths removed. Turning it back on takes effect after a restart."
+            >
+              <Switch
+                label="Send crash reports"
+                checked={settings.crashReportsEnabled}
+                onChange={(crashReportsEnabled) => void update({ crashReportsEnabled })}
+              />
+            </Row>
+          </Section>
+
           <Section title="Appearance">
             <Row label="Theme">
               <Segmented<Theme>
