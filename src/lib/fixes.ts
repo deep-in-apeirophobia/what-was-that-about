@@ -172,7 +172,10 @@ export function segmentWordRanges(seg: Pick<Segment, "text" | "words" | "origina
   let bi = 0;
   for (const [am, bm] of pairs) {
     const added = trimPunctuation(b.slice(bi, bm));
-    if (added.length) for (let i = ai; i < am; i++) to[i] = [added[0].start, added[added.length - 1].end];
+    // Only words take the replacement's place; removed punctuation maps to nothing.
+    for (let i = ai; i < am; i++) {
+      if (added.length && a[i].word) to[i] = [added[0].start, added[added.length - 1].end];
+    }
     if (am < a.length) to[am] = [b[bm].start, b[bm].end];
     ai = am + 1;
     bi = bm + 1;

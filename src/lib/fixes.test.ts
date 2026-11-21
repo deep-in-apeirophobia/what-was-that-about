@@ -80,6 +80,12 @@ describe("segmentWordRanges", () => {
     expect(ranges).toEqual(["ما", "می‌خوایم", "می‌خوایم", "که", null, "بریم"]);
   });
 
+  it("doesn't stretch a word over the next one when punctuation after it was removed", () => {
+    const seg = { text: "اون بودجه رو گفت", originalText: "اون، بوجه رو گفت", words: words("اون،", "بوجه", "رو", "گفت") };
+    const ranges = segmentWordRanges(seg).map((r) => r && seg.text.slice(...r));
+    expect(ranges).toEqual(["اون", "بودجه", "رو", "گفت"]);
+  });
+
   it("uses the text directly when nothing was fixed", () => {
     expect(segmentWordRanges({ text: "سلام دنیا", words: words("سلام", "دنیا") })).toEqual([
       [0, 4],
