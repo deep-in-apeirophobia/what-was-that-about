@@ -219,12 +219,22 @@ impl<'a> Ai<'a> {
         max_tokens: u32,
     ) -> Result<String> {
         self.check_cancel()?;
-        let (text, u) = self
-            .client
-            .complete(model, messages, false, max_tokens)
-            .await?;
+        // Stop must not wait for a slow request to come back
+        let stopped = async {
+            match self.job {
+                Some(j) => {
+                    while !j.cancel.load(Ordering::Relaxed) {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        let (text, u) = tokio::select! {
+            r = self.client.complete(model, messages, false, max_tokens) => r?,
+            _ = stopped => bail!("cancelled"),
+        };
         self.add_usage(u);
-        self.check_cancel()?;
         Ok(text.trim().to_string())
     }
 
@@ -673,6 +683,7 @@ async fn attachment_parts(
 /// messages say (transcribing them now if nothing was typed).
 async fn retrieval_query(
     ai: &Ai<'_>,
+    caps: &Caps,
     question: &str,
     attachments: &mut [ChatAttachment],
 ) -> Result<String> {
@@ -687,6 +698,21 @@ async fn retrieval_query(
         if let Some(t) = &a.text {
             q.push(' ');
             q.push_str(t);
+        }
+    }
+    // nothing typed or said: search with what the images show
+    if q.trim().is_empty() {
+        for a in attachments.iter_mut().filter(|a| a.kind == "image") {
+            if a.text.is_none() {
+                if let Err(e) = describe_attachment(ai, caps, a, question).await {
+                    ai.check_cancel()?;
+                    log::info!("image not described for search: {e:#}");
+                }
+            }
+            if let Some(t) = &a.text {
+                q.push(' ');
+                q.push_str(t);
+            }
         }
     }
     Ok(q.trim().to_string())
@@ -742,14 +768,22 @@ async fn compact_history(
         return Ok((thread.summary.clone(), start, false));
     }
     // files the model saw directly have no text yet; the summary needs it to keep them
+    let mut missing = false;
     for m in hist[..fold].iter_mut() {
         let asked = m.content.clone();
         for a in m.attachments.iter_mut().filter(|a| a.text.is_none()) {
             if let Err(e) = attachment_parts(ai, caps, a, false, &asked).await {
                 ai.check_cancel()?;
-                log::warn!("attachment left out of the conversation summary: {e:#}");
+                log::warn!("couldn't put an attachment into words for the summary: {e:#}");
+                missing = true;
             }
         }
+    }
+    // Folding now would lose that file for good; wait for a later turn while the history
+    // still fits comfortably (but not forever, if the describing model stays unavailable).
+    let total: usize = costs.iter().map(|c| c.tokens).sum();
+    if missing && total <= budget * 2 {
+        return Ok((thread.summary.clone(), start, false));
     }
     ai.status("Summarizing earlier messages to fit the model's context…");
     let previous = thread.summary.as_deref();
@@ -1162,7 +1196,7 @@ async fn ask_inner(
             let query = if fits {
                 question.clone()
             } else {
-                retrieval_query(ai, &question, &mut attachments).await?
+                retrieval_query(ai, &caps, &question, &mut attachments).await?
             };
             let transcript =
                 fit_transcript(ai, &caps, &rec.id, &rec.title, &segs, room, Some(&query)).await?;
@@ -1176,7 +1210,7 @@ async fn ask_inner(
             (system, None, transcript.condensed)
         }
         None => {
-            let query = retrieval_query(ai, &question, &mut attachments).await?;
+            let query = retrieval_query(ai, &caps, &question, &mut attachments).await?;
             let room = budget.saturating_sub(fixed + 600).max(2_000);
             let (system, ids) = library_context(app, &query, room).await?;
             (system, Some(CitationRewriter::new(ids)), false)
