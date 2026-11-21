@@ -4,6 +4,8 @@ mod ai;
 mod commands;
 mod docproto;
 mod events;
+#[cfg(target_os = "linux")]
+mod linux_dpi;
 mod state;
 mod sysinfo;
 mod telemetry;
@@ -26,6 +28,9 @@ pub fn run() {
         Some((g, p)) => (Some(g), Some(p)),
         None => (None, None),
     };
+    // Before the builder: Tauri creates the main window and its webview during build.
+    #[cfg(target_os = "linux")]
+    let dpi_fix = linux_dpi::ensure_font_dpi();
     let mut builder = tauri::Builder::default();
     if let Some(p) = sentry_plugin {
         builder = builder.plugin(p);
@@ -61,6 +66,12 @@ pub fn run() {
             analytics.spawn_flusher();
             let (worker, rx) = worker::Worker::new();
             log::info!("data dir: {}", paths.data.display());
+            #[cfg(target_os = "linux")]
+            if let Some(dpi) = dpi_fix {
+                log::warn!(
+                    "GDK reported no font DPI; set {dpi} so WebKit lays pages out correctly"
+                );
+            }
             app.manage(AppState {
                 paths,
                 db: Mutex::new(db),

@@ -37,3 +37,7 @@ tauri-plugin-sentry = "0.9"
 wwta-core = { path = "../crates/wwta-core", features = ["metal"] }
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 wwta-core = { path = "../crates/wwta-core", features = ["vulkan"] }
+
+# Linux: GDK font-DPI guard before the first webview (see linux_dpi.rs).
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"

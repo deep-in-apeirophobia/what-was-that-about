@@ -6730,6 +6730,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dirs",
+ "gtk",
  "log",
  "regex",
  "sentry",
