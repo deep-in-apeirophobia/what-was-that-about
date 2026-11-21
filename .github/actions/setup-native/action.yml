@@ -65,11 +65,68 @@ runs:
         echo "VULKAN_SDK=$sdk" >> "$GITHUB_ENV"
         echo "$sdk/bin" >> "$GITHUB_PATH"
 
+    # sherpa-onnx-sys would download its prebuilt static libs into target/, which rust-cache
+    # doesn't keep while it does keep the build script's output pointing there; a cache hit
+    # followed by a rebuild of the crate then fails to find the libs. Provide them ourselves.
+    - name: Resolve sherpa-onnx prebuilt archive
+      id: sherpa
+      shell: bash
+      run: |
+        v=$(awk '$0 == "name = \"sherpa-onnx-sys\"" { getline; gsub(/"/, "", $3); print $3 }' Cargo.lock)
+        case "${{ runner.os }}-${{ runner.arch }}" in
+          Linux-X64) a=linux-x64-static-lib ;;
+          Linux-ARM64) a=linux-aarch64-static-lib ;;
+          macOS-X64) a=osx-x64-static-lib ;;
+          macOS-ARM64) a=osx-arm64-static-lib ;;
+          Windows-X64) a=win-x64-static-MT-Release-lib ;;
+          Windows-ARM64) a=win-arm64-static-MT-Release-lib ;;
+          *) echo "unsupported runner ${{ runner.os }}-${{ runner.arch }}"; exit 1 ;;
+        esac
+        test -n "$v"
+        echo "version=$v" >> "$GITHUB_OUTPUT"
+        echo "stem=sherpa-onnx-v$v-$a" >> "$GITHUB_OUTPUT"
+
+    - name: Cache sherpa-onnx prebuilt libs
+      id: sherpa-cache
+      uses: actions/cache@v6
+      with:
+        path: ${{ runner.temp }}/sherpa-onnx
+        key: ${{ steps.sherpa.outputs.stem }}
+
+    - name: Download sherpa-onnx prebuilt libs
+      if: steps.sherpa-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        mkdir -p "$RUNNER_TEMP/sherpa-onnx" && cd "$RUNNER_TEMP/sherpa-onnx"
+        curl -fsSL "https://github.com/k2-fsa/sherpa-onnx/releases/download/v${{ steps.sherpa.outputs.version }}/${{ steps.sherpa.outputs.stem }}.tar.bz2" | tar -xj
+        ls "${{ steps.sherpa.outputs.stem }}/lib"
+
+    - name: Use sherpa-onnx prebuilt libs
+      shell: bash
+      run: |
+        d="$RUNNER_TEMP/sherpa-onnx/${{ steps.sherpa.outputs.stem }}/lib"
+        if command -v cygpath >/dev/null; then d=$(cygpath -m "$d"); fi
+        test -d "$d"
+        echo "SHERPA_ONNX_LIB_DIR=$d" >> "$GITHUB_ENV"
+
+    # MSBuild's FileTracker can't handle paths longer than MAX_PATH, and ggml's nested
+    # vulkan-shaders-gen build (target\release\build\whisper-rs-sys-*\out\build\...\CMakeFiles\...)
+    # exceeds it under D:\a\<repo>\<repo>. Build through a short junction to the target dir;
+    # rust-cache and later steps keep using ./target.
+    - name: Short target dir (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force target | Out-Null
+        New-Item -ItemType Junction -Path C:\t -Target (Resolve-Path target).Path | Out-Null
+        Add-Content $env:GITHUB_ENV "CARGO_TARGET_DIR=C:\t"
+
     - uses: dtolnay/rust-toolchain@stable
 
     - uses: Swatinem/rust-cache@v2
       with:
-        key: native
+        # Windows: fresh key after moving the build to C:\t (stale CMake build dirs otherwise).
+        key: ${{ runner.os == 'Windows' && 'native-shortpath' || 'native' }}
         cache-on-failure: true
 
     # Node first: pnpm v11 has no standalone binary for Intel macOS and runs on this Node.

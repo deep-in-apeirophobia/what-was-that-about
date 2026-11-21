@@ -55,8 +55,6 @@ jobs:
       matrix:
         include:
           - name: windows-x64
-            # VS 2022: under VS 2026 (windows-2025) the nested CMake configure of ggml's
-            # vulkan-shaders-gen fails with "No CMAKE_C_COMPILER could be found".
             os: windows-2022
           - name: linux-x64
             os: ubuntu-22.04
