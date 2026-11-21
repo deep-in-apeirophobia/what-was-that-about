@@ -4,6 +4,7 @@ export type Route =
   | { name: "library" }
   | { name: "recording"; id: string }
   | { name: "topics"; tag?: string }
+  | { name: "notes" }
   | { name: "ask" }
   | { name: "models" }
   | { name: "settings" };
@@ -12,6 +13,8 @@ export interface SeekRequest {
   recordingId: string;
   segmentId?: number;
   time?: number;
+  /** Scroll the transcript to this note (and flash it). */
+  noteId?: string;
   play?: boolean;
   nonce: number;
 }

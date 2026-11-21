@@ -2,7 +2,7 @@
 
 import { api } from "../../lib/api";
 import type { Citation } from "../../lib/citations";
-import type { ExportFormat, Recording } from "../../lib/types";
+import type { ExportFormat, Note, Recording } from "../../lib/types";
 import { indexOfSegmentId } from "../../lib/segments";
 import { pickSavePath } from "../../lib/platform";
 import { useApp } from "../../store/app";
@@ -35,6 +35,38 @@ export function followCitation(c: Citation): void {
     return;
   }
   seekToSegment(c.start, true);
+}
+
+/** Play a note of the open recording from its start and scroll the transcript to it. */
+export function goToNote(note: Pick<Note, "id" | "start">, play = true): void {
+  usePlayer.getState().seek(note.start + 0.001, play);
+  useRecording.getState().revealNote(note.id);
+}
+
+/**
+ * Handle a citation chip inside a note, wherever the note is shown. `[12]` refers to
+ * the note's own recording; `[rec:<id>#12]` to any recording.
+ */
+export function followNoteCitation(c: Citation, noteRecordingId: string): void {
+  const target = c.recordingId ?? noteRecordingId;
+  const route = useApp.getState().route;
+  if (route.name === "recording" && route.id === target && useRecording.getState().id === target) {
+    seekToSegment(c.start, true);
+    return;
+  }
+  if (!useLibrary.getState().recordings.some((r) => r.id === target)) {
+    toast.info("That recording isn't in your library anymore");
+    return;
+  }
+  useApp.getState().openRecording(target, { segmentId: c.start, play: true });
+}
+
+/** Copy a `[rec:<id>#<segment>]` link that notes (in any recording) render as a chip. */
+export function copyMomentLink(recordingId: string, segmentId: number): void {
+  navigator.clipboard
+    .writeText(`[rec:${recordingId}#${segmentId}]`)
+    .then(() => toast.success("Link copied — paste it into a note"))
+    .catch((e) => toast.error("Couldn't copy", e));
 }
 
 export async function startTranscription(id: string, modelId: string | null): Promise<void> {

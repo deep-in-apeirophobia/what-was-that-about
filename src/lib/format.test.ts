@@ -6,6 +6,7 @@ import {
   formatDuration,
   formatPrice,
   formatTime,
+  formatTimeRange,
   pluralize,
 } from "./format";
 
@@ -23,6 +24,20 @@ describe("formatTime", () => {
     expect(formatTime(Number.NaN)).toBe("0:00");
     expect(formatTime(-3)).toBe("0:00");
     expect(formatTime(Number.POSITIVE_INFINITY)).toBe("0:00");
+  });
+});
+
+describe("formatTimeRange", () => {
+  it("joins both ends with an en dash", () => {
+    expect(formatTimeRange(65, 82.4)).toBe("1:05–1:22");
+  });
+  it("collapses to one time when the ends round to the same second", () => {
+    expect(formatTimeRange(65.1, 65.8)).toBe("1:05");
+    expect(formatTimeRange(65, 65)).toBe("1:05");
+    expect(formatTimeRange(70, 60)).toBe("1:10");
+  });
+  it("uses hours on both ends once either needs them", () => {
+    expect(formatTimeRange(3590, 3605)).toBe("0:59:50–1:00:05");
   });
 });
 

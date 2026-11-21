@@ -1,7 +1,7 @@
 // In-memory backend used when the UI runs in a plain browser (`pnpm dev`).
 // Mirrors the Tauri commands in api.ts closely enough to exercise every screen:
 // model installs, transcription with live segments, AI analysis, streaming chat,
-// interactive docs, search, tags and related segments.
+// interactive docs, notes, search, tags and related segments.
 
 import type {
   Analysis,
@@ -10,6 +10,9 @@ import type {
   ExportFormat,
   ModelInfo,
   ModelProgress,
+  Note,
+  NoteColor,
+  NoteWithRecording,
   Recording,
   SearchHit,
   Segment,
@@ -18,6 +21,7 @@ import type {
   TranscriptionProgress,
   Waveform,
 } from "./types";
+import { NOTE_COLORS } from "./types";
 import {
   HAFEZ_LINES,
   MEETING_LINES,
@@ -36,6 +40,8 @@ import {
 } from "./mockData";
 import { containsPersian, findMatches, normalizeForMatch } from "./text";
 import { formatTime } from "./format";
+import { compareNotes } from "./notes";
+import { findActiveIndex } from "./segments";
 
 const EV = {
   model: "model://progress",
@@ -131,6 +137,7 @@ interface RecState {
   analysis: Analysis | null;
   docs: Doc[];
   chat: ChatMessage[];
+  notes: Note[];
   embeddingsIndexed: boolean;
   job: { cancelled: boolean } | null;
   audioUrl: string | null;
@@ -246,6 +253,7 @@ function seed(): void {
     analysis: meetingAnalysis(meetingFull, ago(60 * 49)),
     docs: [],
     chat: [],
+    notes: [],
     embeddingsIndexed: true,
     job: null,
     audioUrl: null,
@@ -284,6 +292,41 @@ function seed(): void {
     },
   );
 
+  // Notes: one with a URL, one linking to a moment in the lecture, one range note.
+  const span = (from: number, to: number) => ({ start: meetingFull[from].start, end: meetingFull[to].end });
+  meeting.notes.push(
+    {
+      id: "note-search",
+      recordingId: meeting.rec.id,
+      ...span(4, 6),
+      body:
+        "Strongest signal from the interviews: people can't **find things** in long recordings.\n\n" +
+        "Background on meaning-based search: https://en.wikipedia.org/wiki/Semantic_search",
+      color: "yellow",
+      createdAt: ago(60 * 46),
+      updatedAt: ago(60 * 46),
+    },
+    {
+      id: "note-summaries",
+      recordingId: meeting.rec.id,
+      ...span(12, 13),
+      body: "خلاصه‌سازی خودکار رو با درس حافظ امتحان کنیم — متن ادبی محک خوبیه [rec:rec-hafez#4]",
+      color: "green",
+      createdAt: ago(60 * 45),
+      updatedAt: ago(60 * 30),
+    },
+    {
+      id: "note-actions",
+      recordingId: meeting.rec.id,
+      ...span(36, 38),
+      body:
+        "**Action items**\n- رضا: نمونهٔ اولیهٔ جستجوی معنایی تا آخر هفته\n- سارا: پنج جلسهٔ تست کاربری\n- Me: update the roadmap doc [38]",
+      color: "purple",
+      createdAt: ago(60 * 44),
+      updatedAt: ago(60 * 44),
+    },
+  );
+
   // 2. A Persian lecture with a Persian analysis.
   const hafezFull = bankSegments("hafez");
   const hafez: RecState = {
@@ -303,6 +346,18 @@ function seed(): void {
     analysis: hafezAnalysis(hafezFull, ago(60 * 24 * 5)),
     docs: [],
     chat: [],
+    notes: [
+      {
+        id: "note-goethe",
+        recordingId: "rec-hafez",
+        start: hafezFull[11].start,
+        end: hafezFull[11].end,
+        body: "Read Goethe's *West–östlicher Divan* before the next session.",
+        color: "blue",
+        createdAt: ago(60 * 24 * 4),
+        updatedAt: ago(60 * 24 * 4),
+      },
+    ],
     embeddingsIndexed: false,
     job: null,
     audioUrl: null,
@@ -326,6 +381,7 @@ function seed(): void {
     analysis: null,
     docs: [],
     chat: [],
+    notes: [],
     embeddingsIndexed: false,
     job: null,
     audioUrl: null,
@@ -347,6 +403,7 @@ function seed(): void {
     analysis: null,
     docs: [],
     chat: [],
+    notes: [],
     embeddingsIndexed: false,
     job: null,
     audioUrl: null,
@@ -552,6 +609,28 @@ function hit(s: RecState, seg: Segment, score: number, kind: SearchHit["kind"], 
   };
 }
 
+function noteHits(s: RecState, q: string): SearchHit[] {
+  const out: SearchHit[] = [];
+  for (const n of s.notes) {
+    const m = findMatches(n.body, q);
+    if (!m.length) continue;
+    const seg = s.segments[Math.max(0, findActiveIndex(s.segments, n.start))];
+    out.push({
+      recordingId: s.rec.id,
+      recordingTitle: s.rec.title,
+      segmentId: seg?.id ?? 0,
+      start: n.start,
+      end: n.end,
+      text: n.body,
+      score: Math.min(1, 0.7 + m.length * 0.1),
+      kind: "note",
+      noteId: n.id,
+      highlights: m,
+    });
+  }
+  return out;
+}
+
 function searchLibrary(query: string, recordingId: string | null, limit: number): SearchHit[] {
   const q = query.trim();
   if (!q) return [];
@@ -560,6 +639,7 @@ function searchLibrary(query: string, recordingId: string | null, limit: number)
   const seen = new Set<string>();
   const qTokens = new Set(tokens(q));
   for (const s of scope) {
+    out.push(...noteHits(s, q));
     for (const seg of s.segments) {
       const m = findMatches(seg.text, q);
       if (m.length) {
@@ -610,6 +690,29 @@ function related(id: string, segmentId: number, limit: number): SearchHit[] {
     }
   }
   return out.sort((a, b) => b.score - a.score).slice(0, limit);
+}
+
+// ---- notes --------------------------------------------------------------------------
+
+function noteFields(args: Record<string, unknown>): Pick<Note, "start" | "end" | "body" | "color"> {
+  const start = num(args, "start");
+  const end = num(args, "end");
+  const body = str(args, "body").trim();
+  const color = (args.color ?? null) as NoteColor | null;
+  if (!body) throw new Error("A note can't be empty.");
+  if (start < 0 || end < start) throw new Error("The note's time range is invalid.");
+  if (color !== null && !NOTE_COLORS.includes(color)) throw new Error(`Unknown note color "${String(color)}".`);
+  // Lets the browser preview exercise the failure paths: put [fail] in a note.
+  if (body.includes("[fail]")) throw new Error("Simulated failure (mock): the note contains [fail].");
+  return { start, end, body, color };
+}
+
+function findNote(id: string): { s: RecState; note: Note } {
+  for (const s of recs.values()) {
+    const note = s.notes.find((n) => n.id === id);
+    if (note) return { s, note };
+  }
+  throw new Error("Note not found. It may have been deleted.");
 }
 
 // ---- LLM streaming ------------------------------------------------------------------
@@ -744,6 +847,7 @@ export const handlers: Record<string, Handler> = {
     return {
       recording: withAudio(s),
       segments: s.segments.map((x) => ({ ...x })),
+      notes: s.notes.map((n) => ({ ...n })).sort(compareNotes),
       analysis: s.analysis,
       docs: [...s.docs],
       chat: [...s.chat],
@@ -785,6 +889,7 @@ export const handlers: Record<string, Handler> = {
         analysis: null,
         docs: [],
         chat: [],
+        notes: [],
         embeddingsIndexed: false,
         job: null,
         audioUrl: null,
@@ -890,6 +995,39 @@ export const handlers: Record<string, Handler> = {
     if (!s.segments.length) throw new Error("There's no transcript to export yet.");
     if (!["txt", "srt", "vtt", "json", "md"].includes(format)) throw new Error(`Unknown format ${format}`);
     await sleep(250);
+  },
+
+  // ---- notes
+  add_note: async (args) => {
+    const s = getRec(str(args, "recordingId"));
+    const fields = noteFields(args);
+    await sleep(220);
+    const at = nowIso();
+    const note: Note = { id: uid("note"), recordingId: s.rec.id, ...fields, createdAt: at, updatedAt: at };
+    s.notes.push(note);
+    return { ...note };
+  },
+  update_note: async (args) => {
+    const { s, note } = findNote(str(args, "id"));
+    const fields = noteFields(args);
+    await sleep(220);
+    const updated: Note = { ...note, ...fields, updatedAt: nowIso() };
+    s.notes = s.notes.map((n) => (n.id === note.id ? updated : n));
+    return { ...updated };
+  },
+  delete_note: async (args) => {
+    const { s, note } = findNote(str(args, "id"));
+    await sleep(150);
+    s.notes = s.notes.filter((n) => n.id !== note.id);
+  },
+  list_all_notes: async () => {
+    await sleep(120);
+    const out: NoteWithRecording[] = [];
+    const newestFirst = [...recs.values()].sort((a, b) => b.rec.createdAt.localeCompare(a.rec.createdAt));
+    for (const s of newestFirst) {
+      for (const n of [...s.notes].sort(compareNotes)) out.push({ ...n, recordingTitle: s.rec.title });
+    }
+    return out;
   },
 
   // ---- search

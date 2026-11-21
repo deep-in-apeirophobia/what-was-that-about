@@ -18,7 +18,7 @@ import { errorMessage } from "../../lib/errors";
 import { formatTime } from "../../lib/format";
 import { mediaUrl } from "../../lib/platform";
 import { nextSegmentTime, previousSegmentTime } from "../../lib/segments";
-import type { Chapter, Recording, Segment, Waveform as WaveformData } from "../../lib/types";
+import type { Chapter, Note, Recording, Segment, Waveform as WaveformData } from "../../lib/types";
 import { RATES, usePlayer } from "../../store/player";
 import { IconButton } from "../ui/Button";
 import { Menu } from "../ui/Menu";
@@ -214,12 +214,14 @@ export function PlayerBar({
   waveform,
   waveformError,
   chapters,
+  notes,
 }: {
   recording: Recording;
   segments: readonly Segment[];
   waveform: WaveformData | null;
   waveformError: string | null;
   chapters: readonly Chapter[];
+  notes: readonly Note[];
 }) {
   const { ref, el, source } = useAudioElement(recording);
   const playing = usePlayer((s) => s.playing);
@@ -240,7 +242,7 @@ export function PlayerBar({
       <audio ref={ref} src={source.url ?? undefined} preload="metadata" />
       <div className="relative min-h-[44px]">
         {waveform && el ? (
-          <Waveform media={el} data={waveform} chapters={chapters} />
+          <Waveform media={el} data={waveform} chapters={chapters} notes={notes} />
         ) : (
           <div className="flex h-[44px] items-center justify-center text-[12px] text-faint">
             {waveformError ? "Waveform unavailable" : recording.status === "needsDecode" ? "Waveform appears after decoding" : <Spinner className="size-3.5" />}

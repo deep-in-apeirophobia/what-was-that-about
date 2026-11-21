@@ -1,17 +1,21 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, ChevronUp, Crosshair, Search, Tag as TagIcon, X } from "lucide-react";
+import { ChevronDown, ChevronUp, Crosshair, Search, StickyNote, Tag as TagIcon, X } from "lucide-react";
 import { api } from "../../lib/api";
 import { formatTime, pluralize } from "../../lib/format";
+import { layoutNotes, spanOfSegments } from "../../lib/notes";
 import { findActiveIndex } from "../../lib/segments";
+import { segmentIdsInRange } from "../../lib/selection";
 import { detectDirection, findMatches } from "../../lib/text";
-import type { Chapter, Segment } from "../../lib/types";
+import type { Chapter, Note, Segment } from "../../lib/types";
 import { MOD } from "../../lib/platform";
 import { usePlayer } from "../../store/player";
 import { FONT_SIZES, useRecording } from "../../store/recording";
 import { attempt, toast } from "../../store/toasts";
 import { IconButton } from "../ui/Button";
+import { NoteComposer } from "../notes/NoteComposer";
+import { NoteCard } from "../notes/NoteCard";
 import { NO_RANGES, SegmentRow, type SegmentHandlers } from "./SegmentRow";
-import { seekToSegment } from "./actions";
+import { copyMomentLink, goToNote, seekToSegment } from "./actions";
 import { DecodePanel, TranscribeCta, TranscriptionErrorCard, TranscriptionProgressCard } from "./StatusPanels";
 
 function FindBar({
@@ -128,6 +132,27 @@ function ChapterHeading({ chapter }: { chapter: Chapter }) {
   );
 }
 
+/** Scroll so the span from `top` to `bottom` is visible: centered when it fits, else its start near the top. */
+function scrollSpanIntoView(container: HTMLElement, top: Element, bottom: Element): void {
+  const cr = container.getBoundingClientRect();
+  const t = top.getBoundingClientRect().top;
+  const b = bottom.getBoundingClientRect().bottom;
+  const span = b - t;
+  const offset = span < cr.height * 0.8 ? (cr.height - span) / 2 : cr.height * 0.12;
+  container.scrollTo({ top: container.scrollTop + (t - cr.top) - offset, behavior: "smooth" });
+}
+
+/** Wraps note cards and composers so they line up with the sentence text column. */
+function NoteSlot({ children }: { children: React.ReactNode }) {
+  return <div className="ps-[4.25rem] pe-3 pt-1 pb-2">{children}</div>;
+}
+
+interface SelectionAction {
+  ids: number[];
+  x: number;
+  y: number;
+}
+
 export function Transcript() {
   const detail = useRecording((s) => s.detail);
   const fontSize = useRecording((s) => s.fontSize);
@@ -137,12 +162,16 @@ export function Transcript() {
   const selectedTag = useRecording((s) => s.selectedTag);
   const selectTag = useRecording((s) => s.selectTag);
   const reveal = useRecording((s) => s.reveal);
+  const noteDraft = useRecording((s) => s.noteDraft);
+  const noteEditor = useRecording((s) => s.noteEditor);
+  const noteReveal = useRecording((s) => s.noteReveal);
   const follow = usePlayer((s) => s.follow);
   const playing = usePlayer((s) => s.playing);
 
   const recording = detail!.recording;
   const segments = detail!.segments;
   const analysis = detail!.analysis;
+  const notes = detail!.notes;
 
   const activeIndex = usePlayer((s) => findActiveIndex(segments, s.time));
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -151,6 +180,17 @@ export function Transcript() {
   const [flashId, setFlashId] = useState<number | null>(null);
   const [query, setQuery] = useState("");
   const [findIdx, setFindIdx] = useState(0);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [flashNoteId, setFlashNoteId] = useState<string | null>(null);
+  const [selAction, setSelAction] = useState<SelectionAction | null>(null);
+
+  const noteLayout = useMemo(() => layoutNotes(segments, notes), [segments, notes]);
+  const noteLayoutRef = useRef(noteLayout);
+  noteLayoutRef.current = noteLayout;
+  // Typing a note while follow-along scrolls the composer away would be maddening. A ref, so
+  // closing the composer doesn't itself trigger a jump back to the playhead.
+  const composing = useRef(false);
+  composing.current = (noteDraft != null && noteDraft.anchorSegmentId != null) || noteEditor?.where === "transcript";
 
   const hasText = segments.length > 0;
   const dir = useMemo(
@@ -204,7 +244,7 @@ export function Transcript() {
 
   // ---- follow along
   useEffect(() => {
-    if (!follow || suspended || activeIndex < 0) return;
+    if (!follow || suspended || composing.current || activeIndex < 0) return;
     const c = scrollRef.current;
     const row = c?.querySelector<HTMLElement>(`[data-seg-index="${activeIndex}"]`);
     if (!c || !row) return;
@@ -230,6 +270,69 @@ export function Transcript() {
     return () => clearTimeout(t);
   }, [reveal]);
 
+  // ---- note reveal requests (Notes tab, waveform pins, library Notes page)
+  useEffect(() => {
+    if (!noteReveal) return;
+    const c = scrollRef.current;
+    if (!c) return;
+    const card = c.querySelector(`[data-note-id="${CSS.escape(noteReveal.noteId)}"]`);
+    const firstId = noteLayoutRef.current.firstSegment.get(noteReveal.noteId);
+    const first = firstId != null ? c.querySelector(`[data-seg-id="${firstId}"]`) : null;
+    const top = first ?? card;
+    if (top) scrollSpanIntoView(c, top, card ?? top);
+    setSuspended(false);
+    setFlashNoteId(noteReveal.noteId);
+    const t = setTimeout(() => setFlashNoteId(null), 1400);
+    return () => clearTimeout(t);
+  }, [noteReveal]);
+
+  // ---- "Add note" for a text selection
+  const onContentMouseUp = (e: React.MouseEvent) => {
+    if ((e.target as HTMLElement).closest("[data-note-ui], [data-selection-action]")) return;
+    const clientX = e.clientX;
+    // Let the browser settle the selection first.
+    requestAnimationFrame(() => {
+      const content = contentRef.current;
+      const sel = window.getSelection();
+      if (!content || !sel || sel.isCollapsed || !sel.rangeCount) return setSelAction(null);
+      const range = sel.getRangeAt(0);
+      if (!content.contains(range.commonAncestorContainer)) return setSelAction(null);
+      const ids = segmentIdsInRange(range, content);
+      if (!ids.length) return setSelAction(null);
+      const rects = range.getClientRects();
+      const last = rects.length ? rects[rects.length - 1] : range.getBoundingClientRect();
+      const box = content.getBoundingClientRect();
+      const x = Math.max(56, Math.min(box.width - 56, clientX - box.left));
+      setSelAction({ ids, x, y: last.bottom - box.top + 6 });
+    });
+  };
+
+  useEffect(() => {
+    if (!selAction) return;
+    const onChange = () => {
+      const sel = window.getSelection();
+      if (!sel || sel.isCollapsed) setSelAction(null);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setSelAction(null);
+    };
+    document.addEventListener("selectionchange", onChange);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("selectionchange", onChange);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [selAction]);
+
+  useEffect(() => setSelAction(null), [segments]);
+
+  const addNoteFromSelection = () => {
+    const span = selAction && spanOfSegments(segments, selAction.ids);
+    setSelAction(null);
+    window.getSelection()?.removeAllRanges();
+    if (span) useRecording.getState().startNote({ start: span.start, end: span.end, anchorSegmentId: span.lastId });
+  };
+
   const handlers = useMemo<SegmentHandlers>(
     () => ({
       play: (seg: Segment) => {
@@ -254,8 +357,58 @@ export function Transcript() {
         toast.success("Sentence updated");
         return true;
       },
+      addNote: (seg: Segment) =>
+        useRecording.getState().startNote({ start: seg.start, end: seg.end, anchorSegmentId: seg.id }),
+      copyLink: (seg: Segment) => {
+        const id = useRecording.getState().id;
+        if (id) copyMomentLink(id, seg.id);
+      },
+      showNote: (note: Note) => useRecording.getState().revealNote(note.id),
     }),
     [],
+  );
+
+  const renderNote = (note: Note) => {
+    const store = useRecording.getState();
+    if (noteEditor?.id === note.id && noteEditor.where === "transcript") {
+      return (
+        <NoteSlot key={note.id}>
+          <NoteComposer
+            editing
+            start={note.start}
+            end={note.end}
+            initialBody={noteEditor.body ?? note.body}
+            initialColor={noteEditor.color !== undefined ? noteEditor.color : note.color}
+            onSave={(body, color) => void store.saveEdit(note.id, { start: note.start, end: note.end, body, color })}
+            onCancel={() => store.editNote(null)}
+          />
+        </NoteSlot>
+      );
+    }
+    return (
+      <NoteSlot key={note.id}>
+        <NoteCard
+          note={note}
+          flash={flashNoteId === note.id}
+          onPlay={() => goToNote(note)}
+          onEdit={() => store.editNote({ id: note.id, where: "transcript" })}
+          onDelete={() => void store.deleteNote(note.id)}
+        />
+      </NoteSlot>
+    );
+  };
+
+  const draftComposer = noteDraft && noteDraft.anchorSegmentId != null && (
+    <NoteSlot>
+      <NoteComposer
+        start={noteDraft.start}
+        end={noteDraft.end}
+        initialBody={noteDraft.body}
+        initialColor={noteDraft.color ?? null}
+        onSave={(body, color) => void useRecording.getState().saveDraft(body, color)}
+        onCancel={() => useRecording.getState().cancelNote()}
+      />
+    </NoteSlot>
   );
 
   const fontIdx = FONT_SIZES.indexOf(fontSize as (typeof FONT_SIZES)[number]);
@@ -323,7 +476,14 @@ export function Transcript() {
         )}
 
         {hasText && (
-          <div dir={dir} className="mx-auto max-w-3xl px-4 pt-3 pb-28" style={{ fontSize }}>
+          <div
+            ref={contentRef}
+            dir={dir}
+            className="relative mx-auto max-w-3xl px-4 pt-3 pb-28"
+            style={{ fontSize }}
+            onMouseUp={onContentMouseUp}
+          >
+            {noteLayout.before.map(renderNote)}
             {segments.map((seg, i) => {
               const chapter = chapterById.get(seg.id);
               const ranges = matches.perSeg.get(seg.id) ?? NO_RANGES;
@@ -341,10 +501,29 @@ export function Transcript() {
                     editing={editingId === seg.id}
                     setEditing={setEditingId}
                     handlers={handlers}
+                    notes={noteLayout.bySegment.get(seg.id)}
+                    noteBadge={noteLayout.badgeAt.has(seg.id)}
                   />
+                  {noteLayout.after.get(seg.id)?.map(renderNote)}
+                  {noteDraft?.anchorSegmentId === seg.id && draftComposer}
                 </Fragment>
               );
             })}
+            {selAction && (
+              <button
+                type="button"
+                data-selection-action
+                dir="ltr"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={addNoteFromSelection}
+                style={{ left: selAction.x, top: selAction.y }}
+                className="absolute z-20 flex -translate-x-1/2 items-center gap-1.5 rounded-lg border border-line bg-surface px-2.5 py-1 font-sans text-[12.5px] font-medium text-fg shadow-pop animate-pop-in hover:bg-hover"
+              >
+                <StickyNote className="size-3.5 text-accent" aria-hidden />
+                Add note
+                {selAction.ids.length > 1 && <span className="text-faint">· {pluralize(selAction.ids.length, "sentence")}</span>}
+              </button>
+            )}
           </div>
         )}
       </div>

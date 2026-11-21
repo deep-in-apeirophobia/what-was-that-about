@@ -23,6 +23,9 @@ import type {
   TranscriptionProgress,
   Waveform,
   Analysis,
+  Note,
+  NoteColor,
+  NoteWithRecording,
 } from "./types";
 
 export const isTauri = (): boolean =>
@@ -116,6 +119,16 @@ export const api = {
   preparePlaybackWav: (id: string) => invoke<string>("prepare_playback_wav", { id }),
   exportTranscript: (id: string, format: ExportFormat, path: string) =>
     invoke<void>("export_transcript", { id, format, path }),
+
+  // ---- notes
+  addNote: (recordingId: string, start: number, end: number, body: string, color: NoteColor | null) =>
+    invoke<Note>("add_note", { recordingId, start, end, body, color }),
+  /** Saves all editable fields of the note. */
+  updateNote: (note: Pick<Note, "id" | "start" | "end" | "body" | "color">) =>
+    invoke<Note>("update_note", { id: note.id, start: note.start, end: note.end, body: note.body, color: note.color }),
+  deleteNote: (id: string) => invoke<void>("delete_note", { id }),
+  /** Every note in the library, newest recording first, then by time. */
+  listAllNotes: () => invoke<NoteWithRecording[]>("list_all_notes"),
 
   // ---- search
   /** Lexical search (always available) merged with semantic search when embeddings exist.

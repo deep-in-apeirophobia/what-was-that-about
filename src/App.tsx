@@ -8,6 +8,7 @@ import { Onboarding } from "./components/Onboarding";
 import { LibraryView } from "./views/LibraryView";
 import { RecordingView } from "./views/RecordingView";
 import { TopicsView } from "./views/TopicsView";
+import { NotesView } from "./views/NotesView";
 import { AskLibraryView } from "./views/AskLibraryView";
 import { ModelsView } from "./views/ModelsView";
 import { SettingsView } from "./views/SettingsView";
@@ -29,6 +30,8 @@ function CurrentView() {
       return <RecordingView key={route.id} id={route.id} />;
     case "topics":
       return <TopicsView initialTag={route.tag} />;
+    case "notes":
+      return <NotesView />;
     case "ask":
       return <AskLibraryView />;
     case "models":

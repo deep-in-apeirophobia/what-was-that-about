@@ -12,6 +12,7 @@ import {
   Plus,
   Search,
   Settings,
+  StickyNote,
   Tags,
 } from "lucide-react";
 import { useApp, type Route } from "../store/app";
@@ -191,6 +192,7 @@ export function Sidebar() {
       <nav className="mt-4 space-y-px" aria-label="Main">
         <NavItem icon={<Library />} label="Library" route={{ name: "library" }} collapsed={collapsed} />
         <NavItem icon={<Tags />} label="Topics" route={{ name: "topics" }} collapsed={collapsed} />
+        <NavItem icon={<StickyNote />} label="Notes" route={{ name: "notes" }} collapsed={collapsed} />
         <NavItem icon={<MessagesSquare />} label="Ask library" route={{ name: "ask" }} collapsed={collapsed} />
         <NavItem icon={<Boxes />} label="Models" route={{ name: "models" }} collapsed={collapsed} badge={modelsBadge} />
         <NavItem icon={<Settings />} label="Settings" route={{ name: "settings" }} collapsed={collapsed} />

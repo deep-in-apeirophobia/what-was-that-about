@@ -70,9 +70,12 @@ function usePendingSeek(id: string, ready: boolean) {
       if (i >= 0) time = segments[i].start + 0.001;
       useRecording.getState().revealSegment(req.segmentId);
     }
-    if (time != null) {
+    if (time != null || req.noteId) {
       // Wait a frame so the transcript rows exist before scrolling/highlighting.
-      requestAnimationFrame(() => usePlayer.getState().seek(time!, req.play));
+      requestAnimationFrame(() => {
+        if (time != null) usePlayer.getState().seek(time, req.play);
+        if (req.noteId) useRecording.getState().revealNote(req.noteId);
+      });
     }
   }, [id, ready, pending]);
 }
@@ -133,6 +136,7 @@ export function RecordingView({ id }: { id: string }) {
         waveform={waveform}
         waveformError={waveformError}
         chapters={detail.analysis?.chapters ?? []}
+        notes={detail.notes}
       />
     </div>
   );

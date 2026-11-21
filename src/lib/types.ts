@@ -164,9 +164,33 @@ export interface Doc {
   updatedAt: string;
 }
 
+/** Palette keys for note colors (the UI maps them to theme colors). */
+export const NOTE_COLORS = ["yellow", "green", "blue", "purple", "red"] as const;
+export type NoteColor = (typeof NOTE_COLORS)[number];
+
+/** A user note/comment attached to a stretch of a recording. Anchored by time (not
+ *  segment ids) so it survives re-transcription and transcript edits. */
+export interface Note {
+  id: string;
+  recordingId: string;
+  start: number; // seconds
+  end: number; // seconds
+  /** Markdown. Plain URLs and [text](url) become links; [rec:<id>#12], [12] chips work like in chat. */
+  body: string;
+  color: NoteColor | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface NoteWithRecording extends Note {
+  recordingTitle: string;
+}
+
 export interface RecordingDetail {
   recording: Recording;
   segments: Segment[];
+  /** User notes, sorted by start time. */
+  notes: Note[];
   analysis: Analysis | null;
   docs: Doc[];
   chat: ChatMessage[];
@@ -211,7 +235,9 @@ export interface SearchHit {
   text: string;
   /** Higher is better. Lexical hits are 0..1, semantic hits are cosine similarity. */
   score: number;
-  kind: "lexical" | "semantic" | "tag";
+  kind: "lexical" | "semantic" | "tag" | "note";
+  /** Set for kind "note". */
+  noteId?: string | null;
   /** Ranges inside `text` to highlight, as [startCharIndex, endCharIndex) pairs (UTF-16 indices). */
   highlights: [number, number][];
 }

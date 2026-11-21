@@ -11,6 +11,14 @@ export function formatTime(seconds: number, forceHours = false): string {
   return `${m}:${ss}`;
 }
 
+/** `"1:05–1:22"`; a single time when both ends round to the same second. */
+export function formatTimeRange(start: number, end: number): string {
+  const hours = Math.max(start, end) >= 3600;
+  const a = formatTime(start, hours);
+  const b = formatTime(end, hours);
+  return a === b || !(end > start) ? a : `${a}–${b}`;
+}
+
 /** Human duration: `"1h 02m"`, `"12m 05s"`, `"45s"`. `null` → `"—"`. */
 export function formatDuration(seconds: number | null | undefined): string {
   if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return "—";

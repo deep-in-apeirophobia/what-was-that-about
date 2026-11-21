@@ -34,6 +34,13 @@
   --mark-current: #f59e0b;
   --wave: #c9c8c2;
   --wave-progress: #5b5bd6;
+  /* Note colors (markers, pins, card tints). */
+  --note-default: #a19f98;
+  --note-yellow: #d19a0a;
+  --note-green: #2f9d68;
+  --note-blue: #2f7fc8;
+  --note-purple: #9150d8;
+  --note-red: #d4483d;
   --shadow: 0 1px 2px rgb(0 0 0 / 0.04), 0 4px 16px rgb(0 0 0 / 0.06);
   --shadow-lg: 0 8px 40px rgb(0 0 0 / 0.16);
   color-scheme: light;
@@ -64,6 +71,12 @@
   --mark-current: #b7791f;
   --wave: #3c3c45;
   --wave-progress: #8080f2;
+  --note-default: #74747f;
+  --note-yellow: #e3b341;
+  --note-green: #4cc38a;
+  --note-blue: #5ea7ea;
+  --note-purple: #b18cf6;
+  --note-red: #f2685d;
   --shadow: 0 1px 2px rgb(0 0 0 / 0.3), 0 4px 16px rgb(0 0 0 / 0.3);
   --shadow-lg: 0 8px 40px rgb(0 0 0 / 0.5);
   color-scheme: dark;
@@ -175,6 +188,10 @@
 .prose-app ul { list-style: disc; }
 .prose-app ol { list-style: decimal; }
 .prose-app li { margin: 0.2em 0; }
+/* Items whose direction differs from their list's (a Persian line in an English list or vice
+   versa): the list only pads one side, so give the bullet room on the item's own start side. */
+.prose-app :is(ul, ol):dir(ltr) > li:dir(rtl),
+.prose-app :is(ul, ol):dir(rtl) > li:dir(ltr) { margin-inline-start: 1.4em; }
 .prose-app h1, .prose-app h2, .prose-app h3 { font-weight: 600; margin: 0.9em 0 0.4em; line-height: 1.3; }
 .prose-app h1 { font-size: 1.25em; }
 .prose-app h2 { font-size: 1.12em; }

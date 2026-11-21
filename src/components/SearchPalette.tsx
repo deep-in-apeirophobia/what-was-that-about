@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import clsx from "clsx";
-import { CornerDownLeft, FileAudio, Search, Sparkles, Tag, Type } from "lucide-react";
+import { CornerDownLeft, FileAudio, Search, Sparkles, StickyNote, Tag, Type } from "lucide-react";
 import { api } from "../lib/api";
 import { errorMessage } from "../lib/errors";
 import { formatDuration, formatTime } from "../lib/format";
@@ -13,10 +13,11 @@ import { Badge, Kbd, Spinner } from "./ui/misc";
 import { HighlightedText } from "./HighlightedText";
 import { StatusDot } from "./RecordingStatus";
 
-const KIND = {
-  lexical: { label: "Match", icon: <Type className="size-3" />, tone: "neutral" as const },
-  semantic: { label: "Similar", icon: <Sparkles className="size-3" />, tone: "accent" as const },
-  tag: { label: "Topic", icon: <Tag className="size-3" />, tone: "ok" as const },
+const KIND: Record<SearchHit["kind"], { label: string; icon: React.ReactNode; tone: "neutral" | "accent" | "ok" | "warn" }> = {
+  lexical: { label: "Match", icon: <Type className="size-3" />, tone: "neutral" },
+  semantic: { label: "Similar", icon: <Sparkles className="size-3" />, tone: "accent" },
+  tag: { label: "Topic", icon: <Tag className="size-3" />, tone: "ok" },
+  note: { label: "Note", icon: <StickyNote className="size-3" />, tone: "warn" },
 };
 
 type Row =
@@ -107,6 +108,8 @@ export function SearchPalette() {
     if (!row) return;
     setOpen(false);
     if (row.kind === "recording") openRecording(row.id);
+    else if (row.hit.kind === "note")
+      openRecording(row.hit.recordingId, { time: row.hit.start, noteId: row.hit.noteId ?? undefined });
     else openRecording(row.hit.recordingId, { segmentId: row.hit.segmentId, time: row.hit.start });
   };
 
@@ -140,7 +143,7 @@ export function SearchPalette() {
             ref={inputRef}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search transcripts, topics and recordings…"
+            placeholder="Search transcripts, notes, topics and recordings…"
             aria-label="Search"
             dir="auto"
             role="combobox"
@@ -198,10 +201,10 @@ export function SearchPalette() {
                 rowIndex++;
                 const i = rowIndex;
                 const snip = snippetAround(h.text, h.highlights, 180);
-                const k = KIND[h.kind];
+                const k = KIND[h.kind] ?? KIND.lexical;
                 return (
                   <button
-                    key={`${h.recordingId}-${h.segmentId}-${h.kind}`}
+                    key={`${h.recordingId}-${h.segmentId}-${h.kind}-${h.noteId ?? ""}`}
                     id={`search-row-${i}`}
                     data-row={i}
                     type="button"
@@ -217,7 +220,10 @@ export function SearchPalette() {
                     <span className="mt-0.5 w-11 shrink-0 text-[12px] font-medium text-accent tabular-nums">
                       {formatTime(h.start)}
                     </span>
-                    <span className="min-w-0 flex-1 font-fa text-[13.5px] leading-relaxed" dir="auto">
+                    <span
+                      className={clsx("min-w-0 flex-1 font-fa text-[13.5px] leading-relaxed", h.kind === "note" && "whitespace-pre-line")}
+                      dir="auto"
+                    >
                       <HighlightedText text={snip.text} ranges={snip.ranges} />
                     </span>
                     <Badge tone={k.tone} className="mt-0.5 shrink-0">

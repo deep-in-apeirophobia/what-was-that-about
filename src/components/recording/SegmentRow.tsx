@@ -1,10 +1,11 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import clsx from "clsx";
-import { Check, Copy, Network, Pencil, Play, X } from "lucide-react";
-import { formatTime } from "../../lib/format";
+import { Check, Copy, Link, Network, Pencil, Play, StickyNote, X } from "lucide-react";
+import { formatTime, pluralize } from "../../lib/format";
+import { noteColor } from "../../lib/notes";
 import { findContainingIndex, wordRanges } from "../../lib/segments";
 import { splitByRanges } from "../../lib/text";
-import type { Segment } from "../../lib/types";
+import type { Note, Segment } from "../../lib/types";
 import { usePlayer } from "../../store/player";
 import { textareaClass } from "../ui/misc";
 
@@ -15,6 +16,9 @@ export interface SegmentHandlers {
   copy: (seg: Segment) => void;
   related: (seg: Segment) => void;
   save: (seg: Segment, text: string) => Promise<boolean>;
+  addNote: (seg: Segment) => void;
+  copyLink: (seg: Segment) => void;
+  showNote: (note: Note) => void;
 }
 
 /** Active-row text with the word being spoken highlighted (only this row re-renders per word). */
@@ -123,6 +127,21 @@ export interface SegmentRowProps {
   editing: boolean;
   setEditing: (id: number | null) => void;
   handlers: SegmentHandlers;
+  /** Notes covering this sentence. */
+  notes?: Note[];
+  /** Show the note-count badge (first row of a run with the same notes). */
+  noteBadge?: boolean;
+}
+
+/** Colored bars in the margin, one per note (up to three). */
+function NoteMarkers({ notes }: { notes: Note[] }) {
+  return (
+    <span aria-hidden className="pointer-events-none absolute inset-y-0.5 -start-2.5 flex gap-[2px]">
+      {notes.slice(0, 3).map((n) => (
+        <span key={n.id} className="w-[3px] rounded-full opacity-80" style={{ background: noteColor(n.color) }} />
+      ))}
+    </span>
+  );
 }
 
 function SegmentRowImpl({
@@ -136,6 +155,8 @@ function SegmentRowImpl({
   editing,
   setEditing,
   handlers,
+  notes,
+  noteBadge,
 }: SegmentRowProps) {
   const hasWords = seg.words.length > 0;
   const clickText = () => {
@@ -156,18 +177,35 @@ function SegmentRowImpl({
         flash && "ring-2 ring-accent/50",
       )}
     >
-      <button
-        type="button"
-        onClick={() => handlers.play(seg)}
-        className={clsx(
-          "mt-[0.55em] h-fit w-11 shrink-0 text-start text-[11.5px] tabular-nums transition-colors",
-          active ? "font-medium text-accent" : "text-faint hover:text-accent",
+      {notes && <NoteMarkers notes={notes} />}
+      <div className="mt-[0.55em] flex h-fit w-11 shrink-0 flex-col items-start gap-1">
+        <button
+          type="button"
+          onClick={() => handlers.play(seg)}
+          className={clsx(
+            "text-start text-[11.5px] tabular-nums transition-colors",
+            active ? "font-medium text-accent" : "text-faint hover:text-accent",
+          )}
+          aria-label={`Play from ${formatTime(seg.start)}`}
+          dir="ltr"
+        >
+          {formatTime(seg.start)}
+        </button>
+        {notes && noteBadge && (
+          <button
+            type="button"
+            onClick={() => handlers.showNote(notes[0])}
+            aria-label={`${pluralize(notes.length, "note")} on this part — show`}
+            title={pluralize(notes.length, "note")}
+            className="-ms-1 inline-flex h-4 items-center gap-0.5 rounded px-1 text-[10.5px] font-semibold tabular-nums transition-colors hover:bg-hover"
+            style={{ color: noteColor(notes[0].color) }}
+            dir="ltr"
+          >
+            <StickyNote className="size-3" aria-hidden />
+            {notes.length}
+          </button>
         )}
-        aria-label={`Play from ${formatTime(seg.start)}`}
-        dir="ltr"
-      >
-        {formatTime(seg.start)}
-      </button>
+      </div>
 
       {editing ? (
         <EditBox seg={seg} save={handlers.save} onDone={() => setEditing(null)} />
@@ -176,6 +214,7 @@ function SegmentRowImpl({
           role="button"
           tabIndex={0}
           dir="auto"
+          data-seg-text
           onClick={clickText}
           onKeyDown={(e) => {
             if (e.key === "Enter") {
@@ -210,6 +249,12 @@ function SegmentRowImpl({
           </RowAction>
           <RowAction label="Find related moments" onClick={() => handlers.related(seg)}>
             <Network className="size-3.5" />
+          </RowAction>
+          <RowAction label="Add note" onClick={() => handlers.addNote(seg)}>
+            <StickyNote className="size-3.5" />
+          </RowAction>
+          <RowAction label="Copy link to this moment" onClick={() => handlers.copyLink(seg)}>
+            <Link className="size-3.5" />
           </RowAction>
           <RowAction label="Edit text" onClick={() => setEditing(seg.id)}>
             <Pencil className="size-3.5" />

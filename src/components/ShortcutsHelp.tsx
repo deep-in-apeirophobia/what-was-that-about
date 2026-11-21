@@ -30,6 +30,7 @@ const GROUPS: { title: string; items: [string[], string][] }[] = [
       [["Enter"], "Next match"],
       [["Shift", "Enter"], "Previous match"],
       [["Click"], "Play from that sentence"],
+      [[MOD, "Enter"], "Save a note"],
     ],
   },
 ];

@@ -43,6 +43,11 @@ SHA-256.
   <kbd>Ctrl/⌘ F</kbd> find in transcript, <kbd>?</kbd> all shortcuts.
 - Library search that ignores Arabic/Persian letter variants, diacritics and ZWNJ; tag browser
   across recordings; "related sections" (lexical offline, semantic with embeddings).
+- Notes on any stretch of a recording: select text across sentences (or use a sentence's
+  menu) and write a markdown note with links, colors and links to moments in other recordings
+  ("Copy link to this moment"). Notes appear inline, in a Notes tab, as waveform pins, on a
+  library-wide Notes page, in search, in exports, and as context for AI answers. They are
+  anchored by time, so they survive re-transcription.
 - Export as TXT, SRT, VTT, Markdown or JSON.
 
 ### Adobe Connect recordings

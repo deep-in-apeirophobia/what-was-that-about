@@ -1,9 +1,12 @@
 import { useEffect, useRef } from "react";
 import WaveSurfer from "wavesurfer.js";
 import RegionsPlugin from "wavesurfer.js/dist/plugins/regions.esm.js";
-import type { Chapter, Waveform as WaveformData } from "../../lib/types";
+import { formatTimeRange } from "../../lib/format";
+import { noteColor, notePreview } from "../../lib/notes";
+import type { Chapter, Note, Waveform as WaveformData } from "../../lib/types";
 import { usePlayer } from "../../store/player";
 import { useApp } from "../../store/app";
+import { goToNote } from "./actions";
 
 const CHAPTER_TINTS = [
   "rgba(91, 91, 214, 0.10)",
@@ -30,14 +33,31 @@ const LABEL_STYLE = [
   "cursor: pointer",
 ].join(";");
 
+// A dot at the bottom of the waveform (chapter labels sit at the top), centered on the
+// 2px marker line. Region content is positioned against the line's padding box.
+const PIN_STYLE = [
+  "position: absolute",
+  "bottom: 1px",
+  "left: -6px",
+  "width: 10px",
+  "height: 10px",
+  "border-radius: 50%",
+  "box-shadow: 0 0 0 1.5px var(--surface), 0 1px 2px rgb(0 0 0 / 0.25)",
+  "pointer-events: auto",
+  "cursor: pointer",
+].join(";");
+
 function cssVar(name: string): string {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
 
 type Regions = ReturnType<typeof RegionsPlugin.create>;
+type Region = ReturnType<Regions["addRegion"]>;
 
-function drawChapters(regions: Regions, chapters: readonly Chapter[]): void {
-  regions.clearRegions();
+/** Replace the previous chapter bands with new ones; returns the regions it added. */
+function drawChapters(regions: Regions, chapters: readonly Chapter[], previous: readonly Region[]): Region[] {
+  previous.forEach((r) => r.remove());
+  const out: Region[] = [];
   chapters.forEach((c, i) => {
     if (!(c.end > c.start)) return;
     // Wavesurfer renders inside a shadow root, so page CSS doesn't reach these.
@@ -60,6 +80,36 @@ function drawChapters(regions: Regions, chapters: readonly Chapter[]): void {
     });
     // Let clicks on the band reach the waveform (seek); only the label is clickable.
     if (region.element) region.element.style.pointerEvents = "none";
+    out.push(region);
+  });
+  return out;
+}
+
+/** Replace the previous note pins with new ones; returns the regions it added. */
+function drawNotes(regions: Regions, notes: readonly Note[], previous: readonly Region[]): Region[] {
+  previous.forEach((r) => r.remove());
+  return notes.map((n) => {
+    const color = noteColor(n.color);
+    const pin = document.createElement("div");
+    pin.style.cssText = `${PIN_STYLE};background:${color}`;
+    pin.title = `${formatTimeRange(n.start, n.end)} · ${notePreview(n.body, 90)}`;
+    // Keep wavesurfer's drag-to-seek from starting under the pin.
+    pin.addEventListener("pointerdown", (e) => e.stopPropagation());
+    pin.addEventListener("click", (e) => {
+      e.stopPropagation();
+      goToNote(n);
+    });
+    const region = regions.addRegion({
+      start: n.start,
+      end: n.start,
+      color: `color-mix(in srgb, ${color} 60%, transparent)`,
+      content: pin,
+      drag: false,
+      resize: false,
+      avoidOverlapping: false,
+    });
+    if (region.element) region.element.style.pointerEvents = "none";
+    return region;
   });
 }
 
@@ -71,16 +121,22 @@ export function Waveform({
   media,
   data,
   chapters,
+  notes,
 }: {
   media: HTMLAudioElement | null;
   data: WaveformData;
   chapters: readonly Chapter[];
+  notes: readonly Note[];
 }) {
   const container = useRef<HTMLDivElement>(null);
   const ws = useRef<WaveSurfer | null>(null);
   const regions = useRef<Regions | null>(null);
+  const chapterRegions = useRef<Region[]>([]);
+  const noteRegions = useRef<Region[]>([]);
   const chaptersRef = useRef(chapters);
   chaptersRef.current = chapters;
+  const notesRef = useRef(notes);
+  notesRef.current = notes;
   const dark = useApp((s) => s.dark);
 
   useEffect(() => {
@@ -108,20 +164,32 @@ export function Waveform({
     ws.current = instance;
     regions.current = plugin;
     instance.on("interaction", (t) => usePlayer.setState({ time: t }));
-    const draw = () => drawChapters(plugin, chaptersRef.current);
+    const draw = () => {
+      chapterRegions.current = drawChapters(plugin, chaptersRef.current, chapterRegions.current);
+      noteRegions.current = drawNotes(plugin, notesRef.current, noteRegions.current);
+    };
     instance.on("decode", draw);
     instance.on("error", (e) => console.warn("waveform:", e));
     return () => {
       instance.destroy();
       ws.current = null;
       regions.current = null;
+      chapterRegions.current = [];
+      noteRegions.current = [];
     };
   }, [media, data]);
 
   // Redraw chapter bands when the analysis changes.
   useEffect(() => {
-    if (regions.current && ws.current && ws.current.getDuration() > 0) drawChapters(regions.current, chapters);
+    if (regions.current && ws.current && ws.current.getDuration() > 0)
+      chapterRegions.current = drawChapters(regions.current, chapters, chapterRegions.current);
   }, [chapters]);
+
+  // Redraw note pins when notes are added, moved, recolored or deleted.
+  useEffect(() => {
+    if (regions.current && ws.current && ws.current.getDuration() > 0)
+      noteRegions.current = drawNotes(regions.current, notes, noteRegions.current);
+  }, [notes]);
 
   // Recolor on theme change.
   useEffect(() => {

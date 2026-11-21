@@ -1,19 +1,23 @@
 import { create } from "zustand";
 import { api } from "../lib/api";
 import { errorMessage } from "../lib/errors";
+import { PENDING_NOTE_PREFIX, compareNotes, notePreview, upsertNote } from "../lib/notes";
 import { mergeSegments } from "../lib/segments";
 import type {
   Analysis,
   ChatMessage,
   Doc,
+  Note,
+  NoteColor,
   Recording,
   RecordingDetail,
   SearchHit,
   Segment,
   Waveform,
 } from "../lib/types";
+import { attempt, toast } from "./toasts";
 
-export type PanelTab = "overview" | "topics" | "ask" | "docs" | "related";
+export type PanelTab = "overview" | "notes" | "topics" | "ask" | "docs" | "related";
 
 const LS_FONT = "wwta.transcriptFontSize";
 export const FONT_SIZES = [15, 17, 19, 21, 24, 28] as const;
@@ -39,6 +43,28 @@ export interface PendingAsk {
   question: string;
 }
 
+/** A note being written. */
+export interface NoteDraft {
+  start: number;
+  end: number;
+  /** Transcript segment the composer appears after; null = in the Notes tab. */
+  anchorSegmentId: number | null;
+  /** Restored text after a failed save. */
+  body?: string;
+  color?: NoteColor | null;
+}
+
+/** A note being edited, and where its editor is shown. */
+export interface NoteEditor {
+  id: string;
+  where: "transcript" | "panel";
+  /** Restored text after a failed save. */
+  body?: string;
+  color?: NoteColor | null;
+}
+
+export type NoteFields = Pick<Note, "start" | "end" | "body" | "color">;
+
 interface RecordingState {
   id: string | null;
   detail: RecordingDetail | null;
@@ -56,6 +82,10 @@ interface RecordingState {
   pendingDoc: { requestId: string; prompt: string } | null;
   /** Ask the transcript to scroll to (and briefly flash) a segment. */
   reveal: { segmentId: number; nonce: number } | null;
+  noteDraft: NoteDraft | null;
+  noteEditor: NoteEditor | null;
+  /** Ask the transcript to scroll to (and briefly flash) a note. */
+  noteReveal: { noteId: string; nonce: number } | null;
 
   open: (id: string) => Promise<void>;
   close: () => void;
@@ -79,9 +109,25 @@ interface RecordingState {
   setPendingAsk: (p: PendingAsk | null) => void;
   setPendingDoc: (p: { requestId: string; prompt: string } | null) => void;
   revealSegment: (segmentId: number) => void;
+
+  /** Open the composer for a new note (closes any other editor). */
+  startNote: (draft: NoteDraft) => void;
+  cancelNote: () => void;
+  /** Close the composer and save; reopens it with the text if saving fails. */
+  saveDraft: (body: string, color: NoteColor | null) => Promise<void>;
+  editNote: (editor: NoteEditor | null) => void;
+  /** Close the editor and save; reopens it with the text if saving fails. */
+  saveEdit: (id: string, fields: NoteFields) => Promise<void>;
+  /** Optimistic add: the note shows at once and is replaced by the saved one. */
+  addNote: (fields: NoteFields) => Promise<Note | null>;
+  updateNote: (id: string, fields: NoteFields) => Promise<boolean>;
+  /** Optimistic delete with an "Undo" toast. */
+  deleteNote: (id: string) => Promise<void>;
+  revealNote: (noteId: string) => void;
 }
 
 let revealNonce = 0;
+let pendingNoteSeq = 0;
 
 export const useRecording = create<RecordingState>((set, get) => ({
   id: null,
@@ -98,6 +144,9 @@ export const useRecording = create<RecordingState>((set, get) => ({
   pendingAsk: null,
   pendingDoc: null,
   reveal: null,
+  noteDraft: null,
+  noteEditor: null,
+  noteReveal: null,
 
   open: async (id) => {
     if (get().id === id && get().detail) return;
@@ -114,6 +163,9 @@ export const useRecording = create<RecordingState>((set, get) => ({
       pendingAsk: null,
       pendingDoc: null,
       reveal: null,
+      noteDraft: null,
+      noteEditor: null,
+      noteReveal: null,
       tab: get().tab === "related" ? "overview" : get().tab,
     });
     await get().reload();
@@ -128,7 +180,8 @@ export const useRecording = create<RecordingState>((set, get) => ({
     try {
       const detail = await api.getRecording(id);
       if (get().id !== id) return;
-      set({ detail, loading: false, error: null });
+      const notes = [...(detail.notes ?? [])].sort(compareNotes);
+      set({ detail: { ...detail, notes }, loading: false, error: null });
     } catch (e) {
       if (get().id !== id) return;
       set({ loading: false, error: errorMessage(e) });
@@ -241,4 +294,104 @@ export const useRecording = create<RecordingState>((set, get) => ({
   setPendingAsk: (pendingAsk) => set({ pendingAsk }),
   setPendingDoc: (pendingDoc) => set({ pendingDoc }),
   revealSegment: (segmentId) => set({ reveal: { segmentId, nonce: ++revealNonce } }),
+
+  // ---- notes
+
+  startNote: (noteDraft) => set({ noteDraft, noteEditor: null }),
+  cancelNote: () => set({ noteDraft: null }),
+
+  saveDraft: async (body, color) => {
+    const { noteDraft: draft, id } = get();
+    if (!draft || !id) return;
+    set({ noteDraft: null });
+    const saved = await get().addNote({ start: draft.start, end: draft.end, body, color });
+    if (!saved && get().id === id && !get().noteDraft && !get().noteEditor) {
+      set({ noteDraft: { ...draft, body, color } });
+    }
+  },
+
+  editNote: (noteEditor) => set({ noteEditor, noteDraft: null }),
+
+  saveEdit: async (noteId, fields) => {
+    const { noteEditor: editor, id } = get();
+    if (!id) return;
+    if (editor?.id === noteId) set({ noteEditor: null });
+    const ok = await get().updateNote(noteId, fields);
+    const still = get().detail?.notes.some((n) => n.id === noteId);
+    if (!ok && editor && still && get().id === id && !get().noteDraft && !get().noteEditor) {
+      set({ noteEditor: { ...editor, body: fields.body, color: fields.color } });
+    }
+  },
+
+  addNote: async (fields) => {
+    const recordingId = get().id;
+    if (!recordingId || !get().detail) return null;
+    const now = new Date().toISOString();
+    const pending: Note = { ...fields, id: `${PENDING_NOTE_PREFIX}${++pendingNoteSeq}`, recordingId, createdAt: now, updatedAt: now };
+    mutateNotes(recordingId, (list) => upsertNote(list, pending));
+    try {
+      const saved = await api.addNote(recordingId, fields.start, fields.end, fields.body, fields.color);
+      mutateNotes(recordingId, (list) => upsertNote(list.filter((n) => n.id !== pending.id), saved));
+      return saved;
+    } catch (e) {
+      mutateNotes(recordingId, (list) => list.filter((n) => n.id !== pending.id));
+      toast.error("Couldn't save the note", e);
+      return null;
+    }
+  },
+
+  updateNote: async (noteId, fields) => {
+    const recordingId = get().id;
+    const prev = get().detail?.notes.find((n) => n.id === noteId);
+    if (!recordingId || !prev) return false;
+    const exists = (list: Note[]) => list.some((n) => n.id === noteId);
+    mutateNotes(recordingId, (list) => upsertNote(list, { ...prev, ...fields, updatedAt: new Date().toISOString() }));
+    try {
+      const saved = await api.updateNote({ id: noteId, ...fields });
+      mutateNotes(recordingId, (list) => (exists(list) ? upsertNote(list, saved) : list));
+      return true;
+    } catch (e) {
+      mutateNotes(recordingId, (list) => (exists(list) ? upsertNote(list, prev) : list));
+      toast.error("Couldn't save the note", e);
+      return false;
+    }
+  },
+
+  deleteNote: async (noteId) => {
+    const recordingId = get().id;
+    const prev = get().detail?.notes.find((n) => n.id === noteId);
+    if (!recordingId || !prev) return;
+    mutateNotes(recordingId, (list) => list.filter((n) => n.id !== noteId));
+    if (get().noteEditor?.id === noteId) set({ noteEditor: null });
+    try {
+      await api.deleteNote(noteId);
+    } catch (e) {
+      mutateNotes(recordingId, (list) => upsertNote(list, prev));
+      toast.error("Couldn't delete the note", e);
+      return;
+    }
+    toast.success("Note deleted", notePreview(prev.body, 80), {
+      label: "Undo",
+      onClick: () => void restoreNote(prev),
+    });
+  },
+
+  revealNote: (noteId) => set({ noteReveal: { noteId, nonce: ++revealNonce } }),
 }));
+
+/** Apply `fn` to the open recording's notes, if `recordingId` is still the one open. */
+function mutateNotes(recordingId: string, fn: (notes: Note[]) => Note[]): void {
+  const { id, detail } = useRecording.getState();
+  if (id !== recordingId || !detail) return;
+  useRecording.setState({ detail: { ...detail, notes: fn(detail.notes) } });
+}
+
+/** Undo a delete: add the note again (it gets a new id). */
+async function restoreNote(note: Note): Promise<void> {
+  const fields: NoteFields = { start: note.start, end: note.end, body: note.body, color: note.color };
+  if (useRecording.getState().id === note.recordingId) {
+    await useRecording.getState().addNote(fields);
+    return;
+  }
+  await attempt("Couldn't restore the note", () => api.addNote(note.recordingId, fields.start, fields.end, fields.body, fields.color));
+}
