@@ -28,8 +28,8 @@ const MAX_TOOL_CHARS: usize = 200_000;
 const DEFAULT_RATIO: f64 = 0.4;
 /// The budget never shrinks below this after context-length errors.
 const MIN_BUDGET: usize = 8_000;
-/// Output tokens allowed for one summary.
-const SUMMARY_TOKENS: u32 = 2_000;
+/// Output tokens allowed for one summary (reasoning models spend some of it thinking).
+const SUMMARY_TOKENS: u32 = 6_000;
 
 const SUMMARY_PROMPT: &str = "You compress a conversation so it can go on without the original \
 messages. Write a summary of at most about 600 words that keeps: what the user asked and wants, \
@@ -365,9 +365,9 @@ impl<'a> Agent<'a> {
                 } else {
                     "Assistant"
                 };
-                // only a message bigger than a whole batch is cut: no request could hold it
-                let room = batch.saturating_sub(text.len()).max(1_000);
-                text.push_str(&format!("{who}: {}\n\n", clip(body, room)));
+                // the earlier summary rides on top of the batch; only a message bigger than a
+                // whole batch is cut, since no request could hold it
+                text.push_str(&format!("{who}: {}\n\n", clip(body, batch)));
                 take += 1;
             }
             let msgs = [Msg::system(SUMMARY_PROMPT), Msg::user(text)];
@@ -385,7 +385,12 @@ impl<'a> Agent<'a> {
                 Err(e) => return Err(explain_error(e, self.model)),
             };
             add_usage(&mut self.usage, u);
-            self.ctx.summary = Some(summary.trim().to_string());
+            // never trade real history for an empty summary
+            let summary = summary.trim();
+            if summary.is_empty() {
+                bail!("the model returned an empty summary of the earlier conversation; try again or pick another model");
+            }
+            self.ctx.summary = Some(summary.to_string());
             self.ctx.history.drain(..take);
             self.ctx.folded += take;
             left -= take;
@@ -900,6 +905,48 @@ mod tests {
         let batch = (agent.ctx.budget as f64 / 3.0 / DEFAULT_RATIO) as usize;
         assert!(input(1).starts_with("User: big0") && input(1).len() <= batch + 100);
         assert!(input(2).contains("Assistant: big1") && input(2).len() <= batch + 100);
+    }
+
+    #[tokio::test]
+    async fn keeps_history_when_the_summary_is_empty() {
+        let (base, _) = fake_openrouter(vec![completion("  ")]);
+        let client = Client::with_base("key", &base).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut h = host(Scope::Recording("uuid-a".into()));
+        let history: Vec<Msg> = (0..6)
+            .map(|i| Msg::user(format!("m{i} {}", "x".repeat(3_000))))
+            .collect();
+        let mut ctx = Context::new("system", None, history, Msg::user("now?"));
+        ctx.budget = 12_000;
+        let mut agent = Agent::new(&client, "m", 1_000, &cancel, ctx);
+        let err = agent.run(&mut h).await.unwrap_err().to_string();
+        assert!(err.contains("empty summary"), "{err}");
+        assert_eq!((agent.ctx.folded, agent.ctx.history.len()), (0, 6));
+        assert!(agent.ctx.summary.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_earlier_summary_does_not_cut_the_next_message() {
+        let (base, seen) = fake_openrouter(vec![completion("s2"), answer("ok")]);
+        let client = Client::with_base("key", &base).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut h = host(Scope::Recording("uuid-a".into()));
+        let mut history = vec![Msg::user(format!("m0 {}", "x".repeat(8_000)))];
+        history.extend((0..4).map(|i| Msg::assistant(format!("short {i}"))));
+        // 6 KB of earlier summary plus an 8 KB message, with a 10 KB batch
+        let mut ctx = Context::new(
+            "system",
+            Some("s".repeat(6_000)),
+            history,
+            Msg::user("now?"),
+        );
+        ctx.budget = 12_000;
+        let mut agent = Agent::new(&client, "m", 1_000, &cancel, ctx);
+        assert_eq!(agent.run(&mut h).await.unwrap(), "ok");
+        assert_eq!(agent.ctx.folded, 1);
+        let seen = seen.lock().unwrap();
+        let input = seen[0]["messages"][1]["content"].as_str().unwrap();
+        assert!(input.contains(&"x".repeat(8_000)), "the message was cut");
     }
 
     #[test]
