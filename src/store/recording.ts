@@ -142,6 +142,8 @@ interface RecordingState {
 }
 
 let revealNonce = 0;
+/** Bumped per `reload`, so a slower, older response can't overwrite a newer one. */
+let reloadSeq = 0;
 let pendingNoteSeq = 0;
 
 export const useRecording = create<RecordingState>((set, get) => ({
@@ -193,13 +195,15 @@ export const useRecording = create<RecordingState>((set, get) => ({
   reload: async () => {
     const id = get().id;
     if (!id) return;
+    const seq = ++reloadSeq;
+    const current = () => get().id === id && seq === reloadSeq;
     try {
       const detail = await api.getRecording(id);
-      if (get().id !== id) return;
+      if (!current()) return;
       const notes = [...(detail.notes ?? [])].sort(compareNotes);
       set({ detail: { ...detail, notes }, loading: false, error: null });
     } catch (e) {
-      if (get().id !== id) return;
+      if (!current()) return;
       set({ loading: false, error: errorMessage(e) });
     }
   },

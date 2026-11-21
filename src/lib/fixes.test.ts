@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { diffFix, type FixPiece } from "./fixes";
+import { diffFix, segmentWordRanges, type FixPiece } from "./fixes";
 
 const changes = (pieces: FixPiece[]) => pieces.filter((p) => p.original !== null).map((p) => [p.original, p.text]);
 const joined = (pieces: FixPiece[]) => pieces.map((p) => p.text).join("");
@@ -51,6 +51,10 @@ describe("diffFix", () => {
     ]);
   });
 
+  it("lines a replaced word up with the word it replaced, not a nearby twin", () => {
+    expect(changes(diffFix("این کار کار سختیه", "این بار کار سختیه"))).toEqual([["کار", "بار"]]);
+  });
+
   it("treats Arabic letter variants as corrections", () => {
     expect(changes(diffFix("يک کتاب", "یک کتاب"))).toEqual([["يک", "یک"]]);
   });
@@ -58,5 +62,28 @@ describe("diffFix", () => {
   it("falls back to one change for very long texts", () => {
     const long = Array.from({ length: 600 }, (_, i) => `w${i}`).join(" ");
     expect(diffFix(long, `${long} x`)).toEqual([{ text: `${long} x`, original: long }]);
+  });
+});
+
+describe("segmentWordRanges", () => {
+  const words = (...texts: string[]) => texts.map((text, i) => ({ start: i, end: i + 1, text }));
+
+  it("keeps each timing on its own word after a fix", () => {
+    const seg = { text: "این بار کار سختیه", originalText: "این کار کار سختیه", words: words("این", "کار", "کار", "سختیه") };
+    const ranges = segmentWordRanges(seg).map((r) => r && seg.text.slice(...r));
+    expect(ranges).toEqual(["این", "بار", "کار", "سختیه"]);
+  });
+
+  it("maps split words to their joined form and removed words to nothing", () => {
+    const seg = { text: "ما می‌خوایم که بریم", originalText: "ما می خوایم که که بریم", words: words("ما", "می", "خوایم", "که", "که", "بریم") };
+    const ranges = segmentWordRanges(seg).map((r) => r && seg.text.slice(...r));
+    expect(ranges).toEqual(["ما", "می‌خوایم", "می‌خوایم", "که", null, "بریم"]);
+  });
+
+  it("uses the text directly when nothing was fixed", () => {
+    expect(segmentWordRanges({ text: "سلام دنیا", words: words("سلام", "دنیا") })).toEqual([
+      [0, 4],
+      [5, 9],
+    ]);
   });
 });

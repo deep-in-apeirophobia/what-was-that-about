@@ -1,10 +1,10 @@
 import { Fragment, memo, useEffect, useMemo, useRef, useState } from "react";
 import clsx from "clsx";
 import { Check, Copy, Link, Network, Pencil, Play, StickyNote, Undo2, X } from "lucide-react";
-import { diffFix, type FixPiece } from "../../lib/fixes";
+import { diffFix, segmentWordRanges, type FixPiece } from "../../lib/fixes";
 import { formatTime, pluralize } from "../../lib/format";
 import { noteColor } from "../../lib/notes";
-import { findContainingIndex, wordRanges } from "../../lib/segments";
+import { findContainingIndex } from "../../lib/segments";
 import { splitByRanges } from "../../lib/text";
 import type { Note, Segment } from "../../lib/types";
 import { usePlayer } from "../../store/player";
@@ -26,7 +26,7 @@ export interface SegmentHandlers {
 
 /** Active-row text with the word being spoken highlighted (only this row re-renders per word). */
 function KaraokeText({ seg }: { seg: Segment }) {
-  const ranges = useMemo(() => wordRanges(seg.text, seg.words), [seg]);
+  const ranges = useMemo(() => segmentWordRanges(seg), [seg]);
   const wi = usePlayer((s) => findContainingIndex(seg.words, s.time));
   const r = wi >= 0 ? ranges[wi] : null;
   if (!r) return <>{seg.text}</>;
@@ -74,7 +74,7 @@ function FixText({ pieces, word = null }: { pieces: FixPiece[]; word?: [number, 
 
 /** `FixText` on the active row, following the spoken word like `KaraokeText`. */
 function FixKaraokeText({ seg, pieces }: { seg: Segment; pieces: FixPiece[] }) {
-  const ranges = useMemo(() => wordRanges(seg.text, seg.words), [seg]);
+  const ranges = useMemo(() => segmentWordRanges(seg), [seg]);
   const wi = usePlayer((s) => findContainingIndex(seg.words, s.time));
   return <FixText pieces={pieces} word={wi >= 0 ? ranges[wi] : null} />;
 }

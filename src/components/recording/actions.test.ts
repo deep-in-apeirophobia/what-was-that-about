@@ -78,6 +78,19 @@ describe("fixTranscript", () => {
     expect(mocked.getRecording).toHaveBeenCalledWith("r1");
   });
 
+  it("doesn't let an older, slower load overwrite that final reload", async () => {
+    let slow!: (d: unknown) => void;
+    mocked.getRecording.mockReturnValueOnce(new Promise((r) => (slow = r)));
+    const earlier = useRecording.getState().reload();
+    mocked.getRecording.mockResolvedValueOnce({ segments: [seg(0, "سلام"), seg(1, "خداحافظ", "خداحافز")], notes: [], docs: [], chat: [], analysis: null });
+    mocked.fixTranscript.mockResolvedValueOnce({ changed: 1, batches: 1, failed: 0, error: null });
+    await fixTranscript("r1");
+    await vi.waitFor(() => expect(texts()).toEqual(["سلام", "خداحافظ"]));
+    slow({ segments: [seg(0, "سلام"), seg(1, "خداحافز")], notes: [], docs: [], chat: [], analysis: null });
+    await earlier;
+    expect(texts()).toEqual(["سلام", "خداحافظ"]);
+  });
+
   it("ignores progress for fixes this window didn't start", () => {
     useLibrary.getState().applyFixProgress({ recordingId: "r2", done: 1, total: 2, changed: [] });
     expect(useLibrary.getState().fixing).toEqual({});

@@ -240,6 +240,7 @@ mark.fix-hit.fix-minor {
 /* Where the fix removed words: a thin bar with a wider hover area. */
 mark.fix-removed {
   display: inline-block;
+  box-sizing: content-box;
   width: 2px;
   height: 1.1em;
   padding-inline: 3px;
