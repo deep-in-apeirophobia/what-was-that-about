@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5B5BF7"/>
+      <stop offset="1" stop-color="#16A3A8"/>
+    </linearGradient>
+  </defs>
+  <rect x="64" y="64" width="896" height="896" rx="208" fill="url(#bg)"/>
+  <!-- speech bubble -->
+  <path d="M232 300a96 96 0 0 1 96-96h368a96 96 0 0 1 96 96v300a96 96 0 0 1-96 96H460l-132 104v-104h0a96 96 0 0 1-96-96z" fill="#fff" fill-opacity="0.96"/>
+  <!-- waveform -->
+  <g fill="#5B5BF7">
+    <rect x="322" y="404" width="40" height="96" rx="20"/>
+    <rect x="394" y="344" width="40" height="216" rx="20"/>
+    <rect x="466" y="300" width="40" height="304" rx="20"/>
+    <rect x="538" y="372" width="40" height="160" rx="20"/>
+    <rect x="610" y="332" width="40" height="240" rx="20"/>
+    <rect x="682" y="412" width="40" height="80" rx="20"/>
+  </g>
+  <!-- question mark badge -->
+  <circle cx="770" cy="738" r="118" fill="#FFB547"/>
+  <path d="M728 704a44 44 0 1 1 64 39c-14 8-22 17-22 33v6" fill="none" stroke="#1f2340" stroke-width="30" stroke-linecap="round"/>
+  <circle cx="770" cy="826" r="18" fill="#1f2340"/>
+</svg>

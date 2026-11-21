@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build a release for (e.g. v0.1.0)
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  # Build whisper.cpp for a portable baseline (AVX2 on x86-64) instead of the CI machine's CPU.
+  GGML_NATIVE: "OFF"
+
+jobs:
+  build:
+    name: Release ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-2025
+          - name: linux-x64
+            os: ubuntu-22.04
+          - name: macos-arm64
+            os: macos-15
+          - name: macos-x64
+            os: macos-15-intel
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - uses: ./.github/actions/setup-native
+
+      - name: Build installers and publish to a draft release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ env.RELEASE_TAG }}
+          releaseName: What Was That About ${{ env.RELEASE_TAG }}
+          releaseBody: |
+            Desktop installers for Windows, Linux and macOS. Speech models are not bundled:
+            install them from the app's **Models** page (or import files you downloaded yourself).
+            See the README for details. macOS builds are not notarized; right-click → Open on first launch.
+          releaseDraft: true
+          prerelease: false
+
+      - name: Build and attach CLI
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p wwta-cli
+          if [ -f target/release/wwta.exe ]; then f=wwta-cli-${{ matrix.name }}.exe; cp target/release/wwta.exe "$f";
+          else f=wwta-cli-${{ matrix.name }}; cp target/release/wwta "$f"; fi
+          gh release upload "$RELEASE_TAG" "$f" --clobber

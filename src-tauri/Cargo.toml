@@ -1,0 +1,33 @@
+[package]
+name = "what-was-that-about"
+description = "Transcribe Persian audio locally, then explore it with AI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "what-was-that-about"
+
+[lib]
+name = "wwta_app"
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+wwta-core = { path = "../crates/wwta-core", features = ["asr"] }
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-log = "2"
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+log.workspace = true
+uuid = { version = "1", features = ["v4"] }
+
+# GPU backend for whisper.cpp: Metal on macOS, Vulkan elsewhere.
+[target.'cfg(target_os = "macos")'.dependencies]
+wwta-core = { path = "../crates/wwta-core", features = ["metal"] }
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+wwta-core = { path = "../crates/wwta-core", features = ["vulkan"] }

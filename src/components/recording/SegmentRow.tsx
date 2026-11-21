@@ -1,0 +1,237 @@
+import { memo, useEffect, useMemo, useRef, useState } from "react";
+import clsx from "clsx";
+import { Check, Copy, Network, Pencil, Play, X } from "lucide-react";
+import { formatTime } from "../../lib/format";
+import { findContainingIndex, wordRanges } from "../../lib/segments";
+import { splitByRanges } from "../../lib/text";
+import type { Segment } from "../../lib/types";
+import { usePlayer } from "../../store/player";
+import { textareaClass } from "../ui/misc";
+
+export const NO_RANGES: [number, number][] = [];
+
+export interface SegmentHandlers {
+  play: (seg: Segment) => void;
+  copy: (seg: Segment) => void;
+  related: (seg: Segment) => void;
+  save: (seg: Segment, text: string) => Promise<boolean>;
+}
+
+/** Active-row text with the word being spoken highlighted (only this row re-renders per word). */
+function KaraokeText({ seg }: { seg: Segment }) {
+  const ranges = useMemo(() => wordRanges(seg.text, seg.words), [seg]);
+  const wi = usePlayer((s) => findContainingIndex(seg.words, s.time));
+  const r = wi >= 0 ? ranges[wi] : null;
+  if (!r) return <>{seg.text}</>;
+  return (
+    <>
+      {seg.text.slice(0, r[0])}
+      <span className="word-active">{seg.text.slice(r[0], r[1])}</span>
+      {seg.text.slice(r[1])}
+    </>
+  );
+}
+
+function FindText({ text, ranges, current }: { text: string; ranges: [number, number][]; current: number }) {
+  const pieces = useMemo(() => splitByRanges(text, ranges), [text, ranges]);
+  return (
+    <>
+      {pieces.map((p, i) =>
+        p.highlighted ? (
+          <mark key={i} className="find-hit" data-current={p.rangeIndex === current ? "true" : undefined}>
+            {p.text}
+          </mark>
+        ) : (
+          <span key={i}>{p.text}</span>
+        ),
+      )}
+    </>
+  );
+}
+
+function EditBox({ seg, onDone, save }: { seg: Segment; onDone: () => void; save: SegmentHandlers["save"] }) {
+  const [text, setText] = useState(seg.text);
+  const [busy, setBusy] = useState(false);
+  const ref = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.focus();
+    el.setSelectionRange(el.value.length, el.value.length);
+  }, []);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight + 2}px`;
+  }, [text]);
+  const commit = async () => {
+    const t = text.trim();
+    if (!t || t === seg.text) return onDone();
+    setBusy(true);
+    const ok = await save(seg, t);
+    setBusy(false);
+    if (ok) onDone();
+  };
+  return (
+    <div className="flex-1">
+      <textarea
+        ref={ref}
+        value={text}
+        dir="auto"
+        disabled={busy}
+        aria-label="Edit sentence"
+        onChange={(e) => setText(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && !e.shiftKey) {
+            e.preventDefault();
+            void commit();
+          } else if (e.key === "Escape") {
+            e.preventDefault();
+            e.stopPropagation();
+            onDone();
+          }
+        }}
+        className={clsx(textareaClass, "font-fa leading-[1.9]")}
+        style={{ fontSize: "inherit" }}
+      />
+      <div className="mt-1.5 flex items-center gap-2 text-[11.5px] text-faint">
+        <button
+          type="button"
+          onClick={() => void commit()}
+          className="inline-flex items-center gap-1 rounded-md bg-accent px-2 py-1 font-medium text-accent-fg"
+        >
+          <Check className="size-3" /> Save
+        </button>
+        <button type="button" onClick={onDone} className="inline-flex items-center gap-1 rounded-md px-2 py-1 hover:bg-hover">
+          <X className="size-3" /> Cancel
+        </button>
+        <span>Enter to save · Shift+Enter for a new line · Esc to cancel</span>
+      </div>
+    </div>
+  );
+}
+
+export interface SegmentRowProps {
+  seg: Segment;
+  index: number;
+  active: boolean;
+  tagged: boolean;
+  flash: boolean;
+  findRanges: [number, number][];
+  currentFind: number;
+  editing: boolean;
+  setEditing: (id: number | null) => void;
+  handlers: SegmentHandlers;
+}
+
+function SegmentRowImpl({
+  seg,
+  index,
+  active,
+  tagged,
+  flash,
+  findRanges,
+  currentFind,
+  editing,
+  setEditing,
+  handlers,
+}: SegmentRowProps) {
+  const hasWords = seg.words.length > 0;
+  const clickText = () => {
+    // Don't hijack a text selection.
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed && sel.toString().trim()) return;
+    handlers.play(seg);
+  };
+
+  return (
+    <div
+      data-seg-index={index}
+      data-seg-id={seg.id}
+      className={clsx(
+        "group relative flex gap-3 rounded-xl px-3 py-1.5 transition-colors duration-200",
+        active ? "bg-active-row" : tagged ? "bg-ok-soft/50 hover:bg-ok-soft/80" : "hover:bg-hover/50",
+        tagged && "shadow-[inset_3px_0_0_var(--ok)] rtl:shadow-[inset_-3px_0_0_var(--ok)]",
+        flash && "ring-2 ring-accent/50",
+      )}
+    >
+      <button
+        type="button"
+        onClick={() => handlers.play(seg)}
+        className={clsx(
+          "mt-[0.55em] h-fit w-11 shrink-0 text-start text-[11.5px] tabular-nums transition-colors",
+          active ? "font-medium text-accent" : "text-faint hover:text-accent",
+        )}
+        aria-label={`Play from ${formatTime(seg.start)}`}
+        dir="ltr"
+      >
+        {formatTime(seg.start)}
+      </button>
+
+      {editing ? (
+        <EditBox seg={seg} save={handlers.save} onDone={() => setEditing(null)} />
+      ) : (
+        <div
+          role="button"
+          tabIndex={0}
+          dir="auto"
+          onClick={clickText}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              handlers.play(seg);
+            }
+          }}
+          className={clsx(
+            "min-w-0 flex-1 cursor-pointer font-fa leading-[1.9] outline-none focus-visible:rounded-md focus-visible:ring-2 focus-visible:ring-accent/40",
+            active ? "text-fg" : "text-fg/85",
+          )}
+        >
+          {findRanges.length ? (
+            <FindText text={seg.text} ranges={findRanges} current={currentFind} />
+          ) : active && hasWords ? (
+            <KaraokeText seg={seg} />
+          ) : (
+            seg.text
+          )}
+        </div>
+      )}
+
+      {!editing && (
+        <div
+          className="pointer-events-none absolute -top-3 end-3 z-[1] flex items-center gap-0.5 rounded-lg border border-line bg-surface p-0.5 opacity-0 shadow-card transition-opacity group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100"
+        >
+          <RowAction label="Play from here" onClick={() => handlers.play(seg)}>
+            <Play className="size-3.5" />
+          </RowAction>
+          <RowAction label="Copy sentence" onClick={() => handlers.copy(seg)}>
+            <Copy className="size-3.5" />
+          </RowAction>
+          <RowAction label="Find related moments" onClick={() => handlers.related(seg)}>
+            <Network className="size-3.5" />
+          </RowAction>
+          <RowAction label="Edit text" onClick={() => setEditing(seg.id)}>
+            <Pencil className="size-3.5" />
+          </RowAction>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RowAction({ label, onClick, children }: { label: string; onClick: () => void; children: React.ReactNode }) {
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      title={label}
+      onClick={onClick}
+      className="inline-flex size-6 items-center justify-center rounded-md text-muted hover:bg-hover hover:text-fg"
+    >
+      {children}
+    </button>
+  );
+}
+
+export const SegmentRow = memo(SegmentRowImpl);

@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  frontend:
+    name: Frontend (typecheck, tests, build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@v6
+        with:
+          cache: true
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+
+  core:
+    name: Core library (fmt, clippy, tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: core
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked -p wwta-core --all-targets -- -D warnings
+      - run: cargo test --locked -p wwta-core
+
+  # Only gated on the core job: the native CLI build and smoke test give per-platform signal
+  # even while the frontend is failing (the frontend is only needed by `tauri build`).
+  build:
+    name: Build ${{ matrix.name }}
+    needs: [core]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-2025
+          - name: linux-x64
+            os: ubuntu-22.04
+          - name: macos-arm64
+            os: macos-15
+          - name: macos-x64
+            os: macos-15-intel
+    runs-on: ${{ matrix.os }}
+    env:
+      # Build whisper.cpp for a portable baseline (AVX2 on x86-64) instead of the CI machine's CPU.
+      GGML_NATIVE: "OFF"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-native
+
+      - name: Build CLI
+        run: cargo build --release --locked -p wwta-cli
+
+      - name: Cache Shenava model (smoke test)
+        uses: actions/cache@v6
+        with:
+          path: ci-models
+          key: shenava-koochik-v1.0-8ec9237
+
+      - name: Smoke test — install model with the app's downloader, transcribe a Persian clip
+        shell: bash
+        run: |
+          set -euo pipefail
+          cli=target/release/wwta
+          [ -f target/release/wwta.exe ] && cli=target/release/wwta.exe
+          "$cli" info
+          model=$("$cli" install shenava-koochik --models-dir ci-models | tail -1)
+          "$cli" transcribe tests/fixtures/radio-geek-002-excerpt.mp3 --model-file "$model" --kind shenava | tee transcript.txt
+          # expect Persian text ("اخبار" = news) in the transcript
+          grep -q "اخبار" transcript.txt
+
+      - name: Build desktop app
+        run: pnpm tauri build
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          b=target/release/bundle
+          for f in "$b"/nsis/*.exe "$b"/msi/*.msi "$b"/appimage/*.AppImage "$b"/deb/*.deb "$b"/rpm/*.rpm "$b"/dmg/*.dmg; do
+            [ -f "$f" ] && cp "$f" out/
+          done
+          if [ -f target/release/wwta.exe ]; then cp target/release/wwta.exe out/wwta-cli-${{ matrix.name }}.exe;
+          else cp target/release/wwta out/wwta-cli-${{ matrix.name }}; fi
+          ls -la out
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: what-was-that-about-${{ matrix.name }}
+          path: out/*
+          if-no-files-found: error

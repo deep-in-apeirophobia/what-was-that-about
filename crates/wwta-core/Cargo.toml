@@ -1,0 +1,39 @@
+[package]
+name = "wwta-core"
+description = "Core library for What Was That About: audio, ASR engines, model management, library storage, search and LLM features"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Native speech engines (sherpa-onnx for Shenava + VAD, whisper.cpp for Taraneh).
+asr = ["dep:sherpa-onnx", "dep:whisper-rs"]
+vulkan = ["asr", "whisper-rs/vulkan"]
+metal = ["asr", "whisper-rs/metal"]
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+log.workspace = true
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+symphonia = { version = "0.6", default-features = false, features = ["mp3", "mp1", "mp2", "aac", "isomp4", "flac", "wav", "pcm", "ogg", "vorbis", "alac", "adpcm", "mkv", "aiff", "caf"] }
+hound = "3.5"
+safetensors = "0.8"
+memmap2 = "0.9"
+half = "2"
+sha2 = "0.10"
+rusqlite = { version = "0.43", features = ["bundled"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "stream", "http2", "charset", "system-proxy"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+futures-util = "0.3"
+regex = "1"
+sherpa-onnx = { workspace = true, optional = true }
+whisper-rs = { workspace = true, optional = true, features = ["log_backend", "raw-api"] }
+
+[dev-dependencies]
+tempfile = "3"

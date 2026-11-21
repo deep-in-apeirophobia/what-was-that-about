@@ -1,0 +1,14 @@
+# sherpa-onnx's prebuilt Linux libraries (and the onnxruntime inside them) are compiled with
+# the old libstdc++ string ABI. whisper.cpp is linked into the same binary, so it must use the
+# same ABI or identically-named std::regex internals with different layouts get merged.
+[env]
+CXXFLAGS_x86_64_unknown_linux_gnu = "-D_GLIBCXX_USE_CXX11_ABI=0"
+CXXFLAGS_aarch64_unknown_linux_gnu = "-D_GLIBCXX_USE_CXX11_ABI=0"
+
+# sherpa-onnx ships /MT (static CRT) libraries for Windows; build everything else the same way
+# so the C++ objects agree and the app needs no Visual C++ redistributable.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

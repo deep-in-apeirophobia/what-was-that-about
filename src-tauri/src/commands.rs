@@ -1,0 +1,747 @@
+//! Tauri commands. Names and argument shapes mirror `src/lib/api.ts`.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use tauri::{AppHandle, Emitter, Manager, State};
+use wwta_core::types::*;
+use wwta_core::{audio, export, ggml, models, search};
+
+use crate::events;
+use crate::state::{store_settings, AppState};
+use crate::worker::{self, Job};
+
+type CmdResult<T> = Result<T, String>;
+
+fn err(e: impl std::fmt::Display) -> String {
+    e.to_string()
+}
+
+fn anyhow_err(e: anyhow::Error) -> String {
+    format!("{e:#}")
+}
+
+// ------------------------------------------------------------------ system & settings
+
+#[tauri::command]
+pub fn get_system_info(state: State<'_, AppState>) -> SystemInfo {
+    use wwta_core::asr::whisper;
+    let gpu_available = whisper::GPU_BACKEND != "none" && whisper::runtime_available();
+    SystemInfo {
+        os: std::env::consts::OS.into(),
+        arch: std::env::consts::ARCH.into(),
+        app_version: env!("CARGO_PKG_VERSION").into(),
+        cpu_cores: std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(1),
+        total_memory_bytes: crate::sysinfo::total_memory(),
+        gpu_backend: whisper::GPU_BACKEND.into(),
+        gpu_devices: if gpu_available {
+            crate::sysinfo::gpu_devices_cached()
+        } else {
+            vec![]
+        },
+        gpu_available: gpu_available && !crate::sysinfo::gpu_devices_cached().is_empty(),
+        data_dir: state.paths.data.to_string_lossy().into_owned(),
+        engines: Engines {
+            whisper: whisper::runtime_available(),
+            shenava: true,
+        },
+    }
+}
+
+#[tauri::command]
+pub fn get_settings(state: State<'_, AppState>) -> Settings {
+    state.settings()
+}
+
+#[tauri::command]
+pub fn save_settings(state: State<'_, AppState>, settings: Settings) -> CmdResult<Settings> {
+    store_settings(&state.paths.settings, &settings).map_err(anyhow_err)?;
+    *state.settings.write().unwrap() = settings.clone();
+    Ok(settings)
+}
+
+// ------------------------------------------------------------------ models
+
+fn model_infos(state: &AppState) -> Vec<ModelInfo> {
+    let overrides = state.model_status.lock().unwrap().clone();
+    models::catalog()
+        .iter()
+        .map(|spec| models::model_info(&state.paths.models, spec, overrides.get(spec.id).cloned()))
+        .collect()
+}
+
+#[tauri::command]
+pub fn list_models(state: State<'_, AppState>) -> Vec<ModelInfo> {
+    model_infos(&state)
+}
+
+fn emit_model(app: &AppHandle, p: ModelProgress) {
+    let _ = app.emit(events::MODEL_PROGRESS, p);
+}
+
+/// Shared driver for downloads and manual imports.
+fn spawn_model_job<F, Fut>(app: AppHandle, model_id: String, run: F) -> CmdResult<()>
+where
+    F: FnOnce(AppHandle, Arc<AtomicBool>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    let state = app.state::<AppState>();
+    if models::spec(&model_id).is_none() {
+        return Err(format!("unknown model {model_id}"));
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut jobs = state.model_jobs.lock().unwrap();
+        if jobs.contains_key(&model_id) {
+            return Err("this model is already being installed".into());
+        }
+        jobs.insert(model_id.clone(), cancel.clone());
+    }
+    state
+        .model_status
+        .lock()
+        .unwrap()
+        .insert(model_id.clone(), (ModelStatus::Downloading, None));
+    tauri::async_runtime::spawn(async move {
+        let result = run(app.clone(), cancel.clone()).await;
+        let state = app.state::<AppState>();
+        state.model_jobs.lock().unwrap().remove(&model_id);
+        let (stage, message) = match &result {
+            Ok(()) => {
+                state.model_status.lock().unwrap().remove(&model_id);
+                (ModelProgressStage::Done, None)
+            }
+            Err(_) if cancel.load(Ordering::Relaxed) => {
+                state.model_status.lock().unwrap().remove(&model_id);
+                (ModelProgressStage::Cancelled, None)
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                log::error!("installing {model_id} failed: {msg}");
+                state
+                    .model_status
+                    .lock()
+                    .unwrap()
+                    .insert(model_id.clone(), (ModelStatus::Error, Some(msg.clone())));
+                (ModelProgressStage::Error, Some(msg))
+            }
+        };
+        emit_model(
+            &app,
+            ModelProgress {
+                model_id,
+                stage,
+                file: None,
+                done_bytes: 0,
+                total_bytes: 0,
+                message,
+            },
+        );
+    });
+    Ok(())
+}
+
+fn progress_reporter(app: &AppHandle) -> impl FnMut(ModelProgress) + Send + 'static {
+    let app = app.clone();
+    move |p: ModelProgress| {
+        let status = match p.stage {
+            ModelProgressStage::Converting => ModelStatus::Converting,
+            _ => ModelStatus::Downloading,
+        };
+        app.state::<AppState>()
+            .model_status
+            .lock()
+            .unwrap()
+            .insert(p.model_id.clone(), (status, None));
+        emit_model(&app, p);
+    }
+}
+
+#[tauri::command]
+pub fn install_model(app: AppHandle, model_id: String) -> CmdResult<()> {
+    let id = model_id.clone();
+    spawn_model_job(app, model_id, move |app, cancel| async move {
+        let state = app.state::<AppState>();
+        let spec = models::spec(&id).unwrap();
+        let settings = state.settings();
+        let mut report = progress_reporter(&app);
+        models::install(
+            &state.paths.models,
+            &spec,
+            ggml::OutType::parse(&settings.whisper_quant),
+            settings.keep_source_weights,
+            &cancel,
+            &mut report,
+        )
+        .await
+    })
+}
+
+#[tauri::command]
+pub fn cancel_model_install(state: State<'_, AppState>, model_id: String) {
+    if let Some(c) = state.model_jobs.lock().unwrap().get(&model_id) {
+        c.store(true, Ordering::Relaxed);
+    }
+}
+
+#[tauri::command]
+pub fn import_model_files(app: AppHandle, model_id: String, paths: Vec<String>) -> CmdResult<()> {
+    let id = model_id.clone();
+    spawn_model_job(app, model_id, move |app, cancel| async move {
+        let state = app.state::<AppState>();
+        let spec = models::spec(&id).unwrap();
+        let quant = ggml::OutType::parse(&state.settings().whisper_quant);
+        let root = state.paths.models.clone();
+        let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+        let mut report = progress_reporter(&app);
+        tokio::task::block_in_place(|| {
+            models::import_files(&root, &spec, &paths, quant, &cancel, &mut report)
+        })
+    })
+}
+
+#[tauri::command]
+pub fn delete_model(state: State<'_, AppState>, model_id: String) -> CmdResult<()> {
+    if state.model_jobs.lock().unwrap().contains_key(&model_id) {
+        return Err("cancel the running install first".into());
+    }
+    state.model_status.lock().unwrap().remove(&model_id);
+    models::delete(&state.paths.models, &model_id).map_err(anyhow_err)
+}
+
+// ------------------------------------------------------------------ library
+
+#[tauri::command]
+pub fn list_recordings(state: State<'_, AppState>) -> CmdResult<Vec<Recording>> {
+    state
+        .db
+        .lock()
+        .unwrap()
+        .list_recordings()
+        .map_err(anyhow_err)
+}
+
+#[tauri::command]
+pub fn get_recording(state: State<'_, AppState>, id: String) -> CmdResult<RecordingDetail> {
+    let settings = state.settings();
+    let db = state.db.lock().unwrap();
+    Ok(RecordingDetail {
+        recording: db.recording(&id).map_err(anyhow_err)?,
+        segments: db.segments(&id).map_err(anyhow_err)?,
+        analysis: db.analysis(&id).map_err(anyhow_err)?,
+        docs: db.docs(&id).map_err(anyhow_err)?,
+        chat: db.chat(Some(&id)).map_err(anyhow_err)?,
+        embeddings_indexed: db
+            .has_embeddings(&id, &settings.embedding_model)
+            .unwrap_or(false),
+    })
+}
+
+fn default_model_ready(state: &AppState) -> Option<String> {
+    let s = state.settings();
+    let ready = |id: &str| models::read_manifest(&state.paths.models, id).is_some();
+    if ready(&s.default_model_id) {
+        return Some(s.default_model_id);
+    }
+    models::catalog()
+        .into_iter()
+        .map(|m| m.id.to_string())
+        .find(|id| ready(id))
+}
+
+fn allow_asset(app: &AppHandle, path: &str) {
+    let _ = app.asset_protocol_scope().allow_file(path);
+}
+
+#[tauri::command]
+pub async fn import_files(app: AppHandle, paths: Vec<String>) -> CmdResult<Vec<Recording>> {
+    let state = app.state::<AppState>();
+    let copy = state.settings().copy_into_library;
+    let mut created = Vec::new();
+    for p in paths {
+        let src = PathBuf::from(&p);
+        if !src.is_file() {
+            return Err(format!("not a file: {p}"));
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let dir = state.paths.recording_dir(&id);
+        std::fs::create_dir_all(&dir).map_err(err)?;
+        let audio_path = if copy {
+            let ext = src
+                .extension()
+                .map(|e| e.to_string_lossy().to_lowercase())
+                .unwrap_or_else(|| "bin".into());
+            let dst = dir.join(format!("source.{ext}"));
+            let (s, d) = (src.clone(), dst.clone());
+            tokio::task::spawn_blocking(move || std::fs::copy(&s, &d))
+                .await
+                .map_err(err)?
+                .map_err(|e| format!("copying {p}: {e}"))?;
+            dst
+        } else {
+            src.clone()
+        };
+        let title = src
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Recording".into());
+        let now = now_iso();
+        let rec = Recording {
+            id: id.clone(),
+            title,
+            source_path: p.clone(),
+            audio_path: audio_path.to_string_lossy().into_owned(),
+            playback_wav_path: None,
+            duration_sec: None,
+            created_at: now.clone(),
+            updated_at: now,
+            status: RecordingStatus::New,
+            model_id: None,
+            error: None,
+            segment_count: 0,
+            has_analysis: false,
+            tags: vec![],
+            blurb: None,
+        };
+        state
+            .db
+            .lock()
+            .unwrap()
+            .insert_recording(&rec)
+            .map_err(anyhow_err)?;
+        allow_asset(&app, &rec.audio_path);
+        allow_asset(&app, &rec.source_path);
+        created.push(rec);
+    }
+    // Decode in the background (waveform + duration), then queue transcription.
+    for rec in &created {
+        let app2 = app.clone();
+        let id = rec.id.clone();
+        tauri::async_runtime::spawn(async move {
+            let app3 = app2.clone();
+            let id2 = id.clone();
+            let outcome = tauri::async_runtime::spawn_blocking(move || {
+                let state = app3.state::<AppState>();
+                let _permit = state.decode_slots.acquire();
+                worker::prepare_audio(&app3, &id2, &AtomicBool::new(false))
+            })
+            .await;
+            let state = app2.state::<AppState>();
+            match outcome {
+                Ok(Ok(worker::Prepared::Samples(_))) => {
+                    if let Some(model_id) = default_model_ready(&state) {
+                        let _ = queue_transcription(&app2, &id, model_id);
+                    } else {
+                        let db = state.db.lock().unwrap();
+                        events::recording_updated(&app2, &db, &id);
+                    }
+                }
+                Ok(Ok(worker::Prepared::NeedsDecode)) => {}
+                Ok(Err(e)) => {
+                    let db = state.db.lock().unwrap();
+                    let _ = db.set_status(&id, RecordingStatus::Error, Some(&format!("{e:#}")));
+                    events::recording_updated(&app2, &db, &id);
+                }
+                Err(e) => log::error!("decode task failed: {e}"),
+            }
+        });
+    }
+    Ok(created)
+}
+
+fn queue_transcription(app: &AppHandle, id: &str, model_id: String) -> anyhow::Result<()> {
+    let state = app.state::<AppState>();
+    {
+        let db = state.db.lock().unwrap();
+        db.set_status(id, RecordingStatus::Queued, None)?;
+        events::recording_updated(app, &db, id);
+    }
+    worker::progress(app, id, TranscriptionStage::Queued, 0.0, None, vec![]);
+    state.worker.enqueue(Job {
+        recording_id: id.to_string(),
+        model_id,
+    })
+}
+
+#[tauri::command]
+pub fn submit_decoded_audio(
+    app: AppHandle,
+    request: tauri::ipc::Request<'_>,
+) -> CmdResult<Recording> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("expected raw PCM body".into());
+    };
+    let header = |k: &str| {
+        request
+            .headers()
+            .get(k)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+    };
+    let id = header("x-recording-id").ok_or("missing x-recording-id")?;
+    let rate: u32 = header("x-sample-rate")
+        .and_then(|r| r.parse().ok())
+        .ok_or("missing x-sample-rate")?;
+    let samples: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let samples = if rate == audio::TARGET_RATE {
+        samples
+    } else {
+        audio::resample(&samples, rate, audio::TARGET_RATE)
+    };
+    if samples.len() < (audio::TARGET_RATE / 10) as usize {
+        return Err("decoded audio is empty".into());
+    }
+    worker::store_pcm(&app, &id, &samples).map_err(anyhow_err)?;
+    let state = app.state::<AppState>();
+    let pcm = state.paths.pcm_path(&id).to_string_lossy().into_owned();
+    {
+        let db = state.db.lock().unwrap();
+        db.set_playback_wav(&id, &pcm).map_err(anyhow_err)?;
+        db.set_status(&id, RecordingStatus::New, None)
+            .map_err(anyhow_err)?;
+    }
+    allow_asset(&app, &pcm);
+    if let Some(model_id) = default_model_ready(&state) {
+        queue_transcription(&app, &id, model_id).map_err(anyhow_err)?;
+    }
+    let rec = state.db.lock().unwrap().recording(&id);
+    rec.map_err(anyhow_err)
+}
+
+#[tauri::command]
+pub fn rename_recording(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    title: String,
+) -> CmdResult<Recording> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("title can't be empty".into());
+    }
+    let db = state.db.lock().unwrap();
+    db.set_title(&id, title).map_err(anyhow_err)?;
+    events::recording_updated(&app, &db, &id);
+    db.recording(&id).map_err(anyhow_err)
+}
+
+#[tauri::command]
+pub fn delete_recording(app: AppHandle, state: State<'_, AppState>, id: String) -> CmdResult<()> {
+    state.worker.cancel(&id);
+    state
+        .db
+        .lock()
+        .unwrap()
+        .delete_recording(&id)
+        .map_err(anyhow_err)?;
+    let dir = state.paths.recording_dir(&id);
+    if dir.starts_with(&state.paths.library) && dir.exists() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    let _ = app.emit(events::RECORDING_DELETED, id);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn transcribe(app: AppHandle, id: String, model_id: Option<String>) -> CmdResult<()> {
+    let state = app.state::<AppState>();
+    if state.worker.is_active(&id) {
+        return Err("this recording is already being transcribed".into());
+    }
+    let model_id = model_id.unwrap_or_else(|| state.settings().default_model_id);
+    let spec = models::spec(&model_id).ok_or_else(|| format!("unknown model {model_id}"))?;
+    if models::read_manifest(&state.paths.models, spec.id).is_none() {
+        return Err(format!(
+            "{} is not installed yet. Install it from the Models page.",
+            spec.name
+        ));
+    }
+    queue_transcription(&app, &id, model_id).map_err(anyhow_err)
+}
+
+#[tauri::command]
+pub fn cancel_transcription(app: AppHandle, state: State<'_, AppState>, id: String) {
+    let was_queued = state.worker.queue.lock().unwrap().contains(&id);
+    if state.worker.cancel(&id) && was_queued {
+        let db = state.db.lock().unwrap();
+        let ready = db
+            .recording(&id)
+            .map(|r| r.segment_count > 0)
+            .unwrap_or(false);
+        let _ = db.set_status(
+            &id,
+            if ready {
+                RecordingStatus::Ready
+            } else {
+                RecordingStatus::New
+            },
+            None,
+        );
+        events::recording_updated(&app, &db, &id);
+        worker::progress(&app, &id, TranscriptionStage::Cancelled, 0.0, None, vec![]);
+    }
+}
+
+#[tauri::command]
+pub fn update_segment_text(
+    state: State<'_, AppState>,
+    id: String,
+    segment_id: u32,
+    text: String,
+) -> CmdResult<Segment> {
+    state
+        .db
+        .lock()
+        .unwrap()
+        .update_segment_text(&id, segment_id, text.trim())
+        .map_err(anyhow_err)
+}
+
+#[tauri::command]
+pub fn get_waveform(state: State<'_, AppState>, id: String) -> CmdResult<Waveform> {
+    let peaks = audio::read_peaks(&state.paths.peaks_path(&id))
+        .map_err(|_| "waveform not ready yet".to_string())?;
+    let duration = state
+        .db
+        .lock()
+        .unwrap()
+        .recording(&id)
+        .map_err(anyhow_err)?
+        .duration_sec;
+    Ok(Waveform {
+        duration_sec: duration.unwrap_or(peaks.len() as f64 / audio::PEAKS_PER_SECOND as f64),
+        peaks,
+        peaks_per_second: audio::PEAKS_PER_SECOND,
+    })
+}
+
+#[tauri::command]
+pub async fn prepare_playback_wav(app: AppHandle, id: String) -> CmdResult<String> {
+    let state = app.state::<AppState>();
+    let rec = state
+        .db
+        .lock()
+        .unwrap()
+        .recording(&id)
+        .map_err(anyhow_err)?;
+    if let Some(p) = rec.playback_wav_path.filter(|p| Path::new(p).is_file()) {
+        allow_asset(&app, &p);
+        return Ok(p);
+    }
+    let dst = state.paths.playback_path(&id);
+    let src = PathBuf::from(&rec.audio_path);
+    let pcm = state.paths.pcm_path(&id);
+    let d2 = dst.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        match audio::decode_to_playback_wav(&src, &d2, &AtomicBool::new(false)) {
+            Ok(()) => Ok(()),
+            // fall back to the 16 kHz cache (always decodable)
+            Err(_) if pcm.is_file() => Ok(std::fs::copy(&pcm, &d2).map(|_| ())?),
+            Err(e) => Err(anyhow::anyhow!("{e}")),
+        }
+    })
+    .await
+    .map_err(err)?
+    .map_err(anyhow_err)?;
+    let p = dst.to_string_lossy().into_owned();
+    state
+        .db
+        .lock()
+        .unwrap()
+        .set_playback_wav(&id, &p)
+        .map_err(anyhow_err)?;
+    allow_asset(&app, &p);
+    Ok(p)
+}
+
+#[tauri::command]
+pub fn export_transcript(
+    state: State<'_, AppState>,
+    id: String,
+    format: String,
+    path: String,
+) -> CmdResult<()> {
+    let db = state.db.lock().unwrap();
+    let rec = db.recording(&id).map_err(anyhow_err)?;
+    let segs = db.segments(&id).map_err(anyhow_err)?;
+    let analysis = db.analysis(&id).map_err(anyhow_err)?;
+    let body = export::render(&format, &rec.title, &segs, analysis.as_ref())
+        .ok_or("unknown export format")?;
+    std::fs::write(&path, body).map_err(err)
+}
+
+// ------------------------------------------------------------------ search
+
+#[tauri::command]
+pub async fn search(
+    app: AppHandle,
+    query: String,
+    recording_id: Option<String>,
+    limit: Option<usize>,
+) -> CmdResult<Vec<SearchHit>> {
+    let limit = limit.unwrap_or(50).clamp(1, 500);
+    let state = app.state::<AppState>();
+    let (lexical, tags) = {
+        let db = state.db.lock().unwrap();
+        (
+            search::lexical(&db, &query, recording_id.as_deref(), limit).map_err(anyhow_err)?,
+            search::tag_hits(&db, &query, recording_id.as_deref()).map_err(anyhow_err)?,
+        )
+    };
+    let semantic = if query.trim().chars().count() >= 3 {
+        crate::ai::semantic_search(&app, &query, recording_id.as_deref(), limit.min(30)).await
+    } else {
+        vec![]
+    };
+    Ok(search::merge_hits(vec![lexical, tags, semantic], limit))
+}
+
+#[tauri::command]
+pub fn related_segments(
+    state: State<'_, AppState>,
+    id: String,
+    segment_id: u32,
+    limit: Option<usize>,
+) -> CmdResult<Vec<SearchHit>> {
+    let limit = limit.unwrap_or(10).clamp(1, 100);
+    let model = state.settings().embedding_model;
+    let db = state.db.lock().unwrap();
+    let rows = db.embeddings(&model, None).map_err(anyhow_err)?;
+    if let Some(own) = rows
+        .iter()
+        .find(|r| r.recording_id == id && r.start_seg <= segment_id && r.end_seg >= segment_id)
+    {
+        let hits =
+            search::semantic_hits(&db, &rows, &own.vector, Some((&id, segment_id)), limit, 0.5)
+                .map_err(anyhow_err)?;
+        if !hits.is_empty() {
+            return Ok(hits);
+        }
+    }
+    search::lexical_related(&db, &id, segment_id, limit).map_err(anyhow_err)
+}
+
+#[tauri::command]
+pub fn list_tags(state: State<'_, AppState>) -> CmdResult<Vec<TagSummary>> {
+    search::list_tags(&state.db.lock().unwrap()).map_err(anyhow_err)
+}
+
+#[tauri::command]
+pub fn segments_for_tag(state: State<'_, AppState>, tag: String) -> CmdResult<Vec<SearchHit>> {
+    search::segments_for_tag(&state.db.lock().unwrap(), &tag).map_err(anyhow_err)
+}
+
+// ------------------------------------------------------------------ AI
+
+#[tauri::command]
+pub async fn list_llm_models(state: State<'_, AppState>) -> CmdResult<Vec<LlmModelInfo>> {
+    let mut cache = state.llm_models.lock().await;
+    if let Some(m) = cache.as_ref() {
+        return Ok(m.clone());
+    }
+    let models = wwta_core::llm::list_models()
+        .await
+        .map_err(|e| format!("couldn't load the model list (offline?): {e:#}"))?;
+    *cache = Some(models.clone());
+    Ok(models)
+}
+
+#[tauri::command]
+pub async fn test_api_key(api_key: String) -> CmdResult<String> {
+    wwta_core::llm::Client::new(&api_key)
+        .map_err(anyhow_err)?
+        .key_info()
+        .await
+        .map_err(anyhow_err)
+}
+
+#[tauri::command]
+pub async fn analyze(
+    app: AppHandle,
+    id: String,
+    parts: Option<Vec<String>>,
+) -> CmdResult<Analysis> {
+    let _ = parts; // the full analysis is cheap enough to always produce together
+    crate::ai::analyze(&app, &id).await.map_err(anyhow_err)
+}
+
+#[tauri::command]
+pub async fn index_embeddings(app: AppHandle, id: String) -> CmdResult<()> {
+    crate::ai::index_embeddings(&app, &id)
+        .await
+        .map_err(anyhow_err)
+}
+
+#[tauri::command]
+pub async fn ask(
+    app: AppHandle,
+    recording_id: Option<String>,
+    question: String,
+    request_id: String,
+) -> CmdResult<ChatMessage> {
+    crate::ai::ask(&app, recording_id, question, request_id)
+        .await
+        .map_err(anyhow_err)
+}
+
+#[tauri::command]
+pub fn clear_chat(state: State<'_, AppState>, recording_id: Option<String>) -> CmdResult<()> {
+    state
+        .db
+        .lock()
+        .unwrap()
+        .clear_chat(recording_id.as_deref())
+        .map_err(anyhow_err)
+}
+
+#[tauri::command]
+pub fn list_library_chat(state: State<'_, AppState>) -> CmdResult<Vec<ChatMessage>> {
+    state.db.lock().unwrap().chat(None).map_err(anyhow_err)
+}
+
+#[tauri::command]
+pub async fn generate_doc(
+    app: AppHandle,
+    id: String,
+    prompt: String,
+    request_id: String,
+) -> CmdResult<Doc> {
+    crate::ai::generate_doc(&app, id, prompt, request_id)
+        .await
+        .map_err(anyhow_err)
+}
+
+#[tauri::command]
+pub async fn revise_doc(
+    app: AppHandle,
+    doc_id: String,
+    instruction: String,
+    request_id: String,
+) -> CmdResult<Doc> {
+    crate::ai::revise_doc(&app, doc_id, instruction, request_id)
+        .await
+        .map_err(anyhow_err)
+}
+
+#[tauri::command]
+pub fn delete_doc(state: State<'_, AppState>, doc_id: String) -> CmdResult<()> {
+    state
+        .db
+        .lock()
+        .unwrap()
+        .delete_doc(&doc_id)
+        .map_err(anyhow_err)
+}
+
+#[tauri::command]
+pub fn cancel_llm(state: State<'_, AppState>, request_id: String) {
+    if let Some(c) = state.llm_jobs.lock().unwrap().get(&request_id) {
+        c.store(true, Ordering::Relaxed);
+    }
+}

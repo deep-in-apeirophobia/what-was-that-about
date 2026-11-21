@@ -1,0 +1,86 @@
+name: Set up native build dependencies
+description: Vulkan SDK (Windows/Linux), Linux system libraries, Rust and Node toolchains.
+inputs:
+  vulkan-version:
+    description: LunarG Vulkan SDK version
+    default: "1.4.363.1"
+runs:
+  using: composite
+  steps:
+    - name: Linux system packages
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update -q
+        sudo apt-get install -y -q --no-install-recommends \
+          build-essential cmake clang libclang-dev pkg-config patchelf file xdg-utils libfuse2 \
+          libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev \
+          libsoup-3.0-dev libssl-dev libvulkan-dev libvulkan1 mesa-vulkan-drivers
+        # linuxdeploy (AppImage bundling) is itself an AppImage; don't depend on FUSE in CI.
+        echo "APPIMAGE_EXTRACT_AND_RUN=1" >> "$GITHUB_ENV"
+
+    - name: Cache Vulkan SDK
+      if: runner.os != 'macOS'
+      id: vulkan-cache
+      uses: actions/cache@v6
+      with:
+        path: ${{ runner.os == 'Windows' && 'C:\VulkanSDK' || '~/vulkan-sdk' }}
+        key: vulkan-sdk-${{ inputs.vulkan-version }}-${{ runner.os }}-${{ runner.arch }}
+
+    - name: Install Vulkan SDK (Windows)
+      if: runner.os == 'Windows' && steps.vulkan-cache.outputs.cache-hit != 'true'
+      shell: pwsh
+      run: |
+        $v = "${{ inputs.vulkan-version }}"
+        curl.exe -fsSL -o "$env:RUNNER_TEMP\vulkan-sdk.exe" "https://sdk.lunarg.com/sdk/download/$v/windows/vulkansdk-windows-X64-$v.exe"
+        & "$env:RUNNER_TEMP\vulkan-sdk.exe" --root "C:\VulkanSDK\$v" --accept-licenses --default-answer --confirm-command install | Out-Host
+        if (!(Test-Path "C:\VulkanSDK\$v\Bin\glslc.exe")) { throw "Vulkan SDK install failed: glslc.exe missing" }
+        if (!(Test-Path "C:\VulkanSDK\$v\Lib\vulkan-1.lib")) { throw "Vulkan SDK install failed: vulkan-1.lib missing" }
+
+    - name: Use Vulkan SDK (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $v = "${{ inputs.vulkan-version }}"
+        Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\$v"
+        Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$v\Bin"
+
+    - name: Install Vulkan SDK (Linux)
+      if: runner.os == 'Linux' && steps.vulkan-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        v="${{ inputs.vulkan-version }}"
+        mkdir -p ~/vulkan-sdk
+        curl -fsSL "https://sdk.lunarg.com/sdk/download/$v/linux/vulkansdk-linux-x86_64-$v.tar.xz" | tar -xJ -C ~/vulkan-sdk
+        test -x ~/vulkan-sdk/$v/x86_64/bin/glslc
+
+    # Headers and glslc come from the SDK (Ubuntu 22.04's are too old for ggml's Vulkan
+    # backend); the binary links against the distro's libvulkan (libvulkan-dev above).
+    - name: Use Vulkan SDK (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        v="${{ inputs.vulkan-version }}"
+        sdk="$HOME/vulkan-sdk/$v/x86_64"
+        echo "VULKAN_SDK=$sdk" >> "$GITHUB_ENV"
+        echo "$sdk/bin" >> "$GITHUB_PATH"
+
+    - uses: dtolnay/rust-toolchain@stable
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: native
+        cache-on-failure: true
+
+    # Node first: pnpm v11 has no standalone binary for Intel macOS and runs on this Node.
+    - uses: actions/setup-node@v7
+      with:
+        node-version: 22
+
+    - uses: pnpm/action-setup@v6
+      with:
+        cache: true
+
+    - name: Install frontend dependencies
+      shell: bash
+      run: pnpm install --frozen-lockfile
