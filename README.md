@@ -121,6 +121,9 @@ Prerequisites: Rust (stable), Node 22 + pnpm, CMake, a C/C++ toolchain, and
 - Linux: `libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libsoup-3.0-dev libssl-dev clang
   libclang-dev`, plus the Vulkan SDK (or distro `libvulkan-dev` + `glslc`). NixOS: `nix develop`.
 - macOS: Xcode command line tools.
+- NixOS / Nix: `nix develop` gives a shell with everything (the flake is pinned; run all the
+  commands below inside it, including the built app, so it finds WebKitGTK, GStreamer and the
+  GPU drivers).
 
 ```sh
 pnpm install

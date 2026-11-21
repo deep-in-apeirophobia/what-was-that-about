@@ -35,7 +35,8 @@
             gst_all_1.gst-libav
           ];
           shellHook = ''
-            export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [ pkgs.vulkan-loader pkgs.libGL ]}:''${LD_LIBRARY_PATH:-}
+            # /run/opengl-driver/lib: NixOS GPU drivers (NVIDIA's Vulkan ICD is found by soname)
+            export LD_LIBRARY_PATH=/run/opengl-driver/lib:${pkgs.lib.makeLibraryPath [ pkgs.vulkan-loader pkgs.libGL ]}:''${LD_LIBRARY_PATH:-}
             export WEBKIT_DISABLE_DMABUF_RENDERER=1
           '';
         };

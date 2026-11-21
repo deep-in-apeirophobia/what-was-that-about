@@ -100,11 +100,15 @@ fn best_gpu(gpus: &[GgmlGpu]) -> Option<usize> {
     })
 }
 
+/// GPUs for display, the one Whisper will use first.
 pub fn gpu_devices() -> Vec<GpuDevice> {
     let gpus = ggml_gpus();
     let best = best_gpu(&gpus);
-    gpus.iter()
-        .enumerate()
+    let mut order: Vec<usize> = (0..gpus.len()).collect();
+    order.sort_by_key(|&i| Some(i) != best);
+    order
+        .into_iter()
+        .map(|i| (i, &gpus[i]))
         .map(|(i, g)| GpuDevice {
             name: g.description.clone(),
             description: format!(
