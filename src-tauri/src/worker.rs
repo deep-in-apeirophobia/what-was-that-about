@@ -118,7 +118,15 @@ pub fn prepare_audio(app: &AppHandle, id: &str, cancel: &AtomicBool) -> Result<P
     progress(app, id, TranscriptionStage::Decoding, 0.0, None, vec![]);
     let app2 = app.clone();
     let id2 = id.to_string();
-    let decoded = audio::decode_to_16k_mono(Path::new(&rec.audio_path), cancel, &mut |p| {
+    // Containers (Adobe Connect archives, FLV) play from the decoded cache, so audio_path
+    // points at the not-yet-written PCM file; decode from the original instead.
+    let input =
+        if Path::new(&rec.audio_path) == pcm.as_path() || !Path::new(&rec.audio_path).exists() {
+            rec.source_path.clone()
+        } else {
+            rec.audio_path.clone()
+        };
+    let decoded = audio::decode_to_16k_mono(Path::new(&input), cancel, &mut |p| {
         progress(&app2, &id2, TranscriptionStage::Decoding, p, None, vec![]);
     });
     let samples = match decoded {

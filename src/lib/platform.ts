@@ -7,6 +7,8 @@ import type { ExportFormat } from "./types";
 export const AUDIO_EXTENSIONS = [
   "mp3", "m4a", "aac", "wav", "flac", "ogg", "opus", "oga", "webm",
   "mp4", "mkv", "mov", "wma", "amr", "3gp",
+  // Adobe Connect source archives and Flash streams
+  "zip", "flv", "f4a",
 ];
 
 export const isMac =

@@ -750,6 +750,14 @@ export const handlers: Record<string, Handler> = {
       embeddingsIndexed: s.embeddingsIndexed,
     };
   },
+  import_link: async (args) => {
+    const url = String(args.url ?? "");
+    const m = /^https?:\/\/[^/]+\/([^/?#]+)/i.exec(url);
+    if (!m) throw new Error("not a valid link");
+    const [rec] = (await handlers.import_files({ paths: [`/home/you/Downloads/${m[1]}.mp3`] })) as Recording[];
+    return rec;
+  },
+
   import_files: async (args) => {
     const paths = strArray(args, "paths");
     const out: Recording[] = [];

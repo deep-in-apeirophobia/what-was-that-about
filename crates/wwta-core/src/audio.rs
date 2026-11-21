@@ -188,12 +188,30 @@ struct Opened {
     num_frames: Option<u64>,
 }
 
-fn open(path: &Path) -> Result<Opened, DecodeError> {
-    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+enum Input<'a> {
+    Path(&'a Path),
+    Bytes(Vec<u8>, &'a str),
+}
+
+fn open(input: Input<'_>) -> Result<Opened, DecodeError> {
+    let (mss, ext) = match input {
+        Input::Path(path) => {
+            let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+            (
+                MediaSourceStream::new(Box::new(file), Default::default()),
+                path.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_ascii_lowercase()),
+            )
+        }
+        Input::Bytes(bytes, ext) => (
+            MediaSourceStream::new(Box::new(std::io::Cursor::new(bytes)), Default::default()),
+            Some(ext.to_string()),
+        ),
+    };
     let mut hint = Hint::new();
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        hint.with_extension(&ext.to_ascii_lowercase());
+    if let Some(ext) = &ext {
+        hint.with_extension(ext);
     }
     let format = symphonia::default::get_probe()
         .probe(
@@ -232,12 +250,12 @@ fn open(path: &Path) -> Result<Opened, DecodeError> {
 
 /// Decode every packet, calling `sink(interleaved_samples, channels, sample_rate)`.
 fn decode_with(
-    path: &Path,
+    input: Input<'_>,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(f32),
     sink: &mut dyn FnMut(&[f32], usize, u32),
 ) -> Result<(), DecodeError> {
-    let mut o = open(path)?;
+    let mut o = open(input)?;
     let mut interleaved: Vec<f32> = Vec::new();
     let mut decoded_any = false;
     let mut last_report = 0f32;
@@ -299,16 +317,76 @@ fn decode_with(
     Ok(())
 }
 
-/// Decode any supported file to 16 kHz mono f32.
+fn connect_err(e: anyhow::Error) -> DecodeError {
+    if e.to_string() == "cancelled" {
+        DecodeError::Cancelled
+    } else {
+        DecodeError::Other(e)
+    }
+}
+
+/// Decode any supported input to 16 kHz mono f32: audio/video files (Symphonia), FLV
+/// streams, and Adobe Connect recordings (source ZIP or extracted folder).
 pub fn decode_to_16k_mono(
     path: &Path,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(f32),
+) -> Result<Vec<f32>, DecodeError> {
+    if path.is_dir() {
+        if crate::adobe_connect::is_connect_dir(path) {
+            return crate::adobe_connect::decode_dir(path, cancel, progress).map_err(connect_err);
+        }
+        return Err(DecodeError::Unsupported(
+            "folders are only supported for extracted Adobe Connect recordings".into(),
+        ));
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "zip" => {
+            if !crate::adobe_connect::is_connect_zip(path) {
+                return Err(DecodeError::Unsupported(
+                    "ZIP files are only supported for Adobe Connect recordings".into(),
+                ));
+            }
+            crate::adobe_connect::decode_zip(path, cancel, progress).map_err(connect_err)
+        }
+        "flv" | "f4a" => match crate::flv::decode_file(path) {
+            Ok(Some(pcm)) => {
+                progress(1.0);
+                Ok(pcm)
+            }
+            Ok(None) => Err(DecodeError::Unsupported(
+                "this FLV file has no audio".into(),
+            )),
+            Err(e) => Err(DecodeError::Unsupported(format!("{e:#}"))),
+        },
+        _ => symphonia_to_16k(Input::Path(path), cancel, progress),
+    }
+}
+
+/// Decode an in-memory file (e.g. an MP3 inside an archive) to 16 kHz mono.
+pub fn decode_bytes_to_16k_mono(bytes: Vec<u8>, ext: &str) -> Result<Vec<f32>> {
+    symphonia_to_16k(
+        Input::Bytes(bytes, ext),
+        &AtomicBool::new(false),
+        &mut |_| {},
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn symphonia_to_16k(
+    input: Input<'_>,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(f32),
 ) -> Result<Vec<f32>, DecodeError> {
     let mut out: Vec<f32> = Vec::new();
     let mut resampler: Option<(u32, Resampler)> = None;
     let mut mono: Vec<f32> = Vec::new();
-    decode_with(path, cancel, progress, &mut |inter, ch, rate| {
+    decode_with(input, cancel, progress, &mut |inter, ch, rate| {
         mono.clear();
         mono.extend(
             inter

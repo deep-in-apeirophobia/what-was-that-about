@@ -1,6 +1,7 @@
 import { Sidebar } from "./components/Sidebar";
 import { Toasts } from "./components/Toasts";
 import { DropOverlay } from "./components/DropOverlay";
+import { ConnectLinkDialog } from "./components/ConnectLinkDialog";
 import { SearchPalette } from "./components/SearchPalette";
 import { ShortcutsHelp } from "./components/ShortcutsHelp";
 import { Onboarding } from "./components/Onboarding";
@@ -51,6 +52,7 @@ export default function App() {
         <CurrentView />
       </main>
       <SearchPalette />
+      <ConnectLinkDialog />
       <ShortcutsHelp />
       <Onboarding />
       <DropOverlay />

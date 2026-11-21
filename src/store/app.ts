@@ -41,6 +41,7 @@ interface AppState {
   sidebarCollapsed: boolean;
   searchOpen: boolean;
   shortcutsOpen: boolean;
+  linkDialogOpen: boolean;
   onboardingDismissed: boolean;
   /** Seek to apply once the target recording's view is ready. */
   pendingSeek: SeekRequest | null;
@@ -53,6 +54,7 @@ interface AppState {
   takeSeek: (recordingId: string) => SeekRequest | null;
   toggleSidebar: () => void;
   setSearchOpen: (open: boolean) => void;
+  setLinkDialogOpen: (open: boolean) => void;
   setShortcutsOpen: (open: boolean) => void;
   dismissOnboarding: () => void;
   reopenOnboarding: () => void;
@@ -66,6 +68,7 @@ export const useApp = create<AppState>((set, get) => ({
   route: { name: "library" },
   sidebarCollapsed: readBool(LS.sidebar),
   searchOpen: false,
+  linkDialogOpen: false,
   shortcutsOpen: false,
   onboardingDismissed: readBool(LS.onboarding),
   pendingSeek: null,
@@ -90,6 +93,7 @@ export const useApp = create<AppState>((set, get) => ({
       return { sidebarCollapsed: !s.sidebarCollapsed };
     }),
   setSearchOpen: (searchOpen) => set({ searchOpen }),
+  setLinkDialogOpen: (linkDialogOpen) => set({ linkDialogOpen }),
   setShortcutsOpen: (shortcutsOpen) => set({ shortcutsOpen }),
   dismissOnboarding: () => {
     writeBool(LS.onboarding, true);

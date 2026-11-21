@@ -93,6 +93,9 @@ export const api = {
   getRecording: (id: string) => invoke<RecordingDetail>("get_recording", { id }),
   /** Import audio/video files. Returns the new recordings. */
   importFiles: (paths: string[]) => invoke<Recording[]>("import_files", { paths }),
+  /** Import an Adobe Connect recording from its link; the source archive downloads in the
+   *  background (progress via `transcription://progress`, stage "decoding"). */
+  importLink: (url: string) => invoke<Recording>("import_link", { url }),
   /** For recordings in status "needsDecode": the UI decoded the file with Web Audio
    *  and sends mono float32 PCM. Body is sent as raw bytes for speed. */
   submitDecodedAudio: (id: string, samples: Float32Array, sampleRate: number) =>

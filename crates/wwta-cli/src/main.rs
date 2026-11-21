@@ -1,6 +1,7 @@
 //! `wwta` — headless access to the What Was That About engine.
 //!
 //! wwta info
+//! wwta decode <audio|video|flv|adobe-connect.zip|folder> <out.wav>
 //! wwta convert <hf-model-dir> <out.bin> [--f16]
 //! wwta transcribe <audio> --model-file <path> --kind whisper|shenava [--cpu] [--json] [--no-dtw]
 //! wwta install <model-id> --models-dir <dir> [--f16]
@@ -24,7 +25,7 @@ fn has(args: &[String], flag: &str) -> bool {
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  wwta info\n  wwta convert <hf-model-dir> <out.bin> [--f16]\n  \
+        "usage:\n  wwta info\n  wwta decode <input> <out.wav>\n  wwta convert <hf-model-dir> <out.bin> [--f16]\n  \
          wwta transcribe <audio> --model-file <path> --kind whisper|shenava [--cpu] [--json] [--no-dtw] [--no-digits]\n  \
          wwta install <model-id> --models-dir <dir> [--f16]"
     );
@@ -58,6 +59,21 @@ async fn main() -> Result<()> {
                 }
             })?;
             eprintln!("done in {:.1}s", t.elapsed().as_secs_f32());
+            Ok(())
+        }
+        Some("decode") => {
+            let (Some(input), Some(out)) = (args.get(1), args.get(2)) else {
+                usage()
+            };
+            let cancel = AtomicBool::new(false);
+            let pcm =
+                wwta_core::audio::decode_to_16k_mono(&PathBuf::from(input), &cancel, &mut |_| {})
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            wwta_core::audio::write_wav_16k(&PathBuf::from(out), &pcm)?;
+            eprintln!(
+                "wrote {:.1}s of 16 kHz mono audio",
+                wwta_core::audio::duration_secs(pcm.len())
+            );
             Ok(())
         }
         Some("install") => {

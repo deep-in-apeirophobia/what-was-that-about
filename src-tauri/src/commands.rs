@@ -263,13 +263,17 @@ pub async fn import_files(app: AppHandle, paths: Vec<String>) -> CmdResult<Vec<R
     let mut created = Vec::new();
     for p in paths {
         let src = PathBuf::from(&p);
-        if !src.is_file() {
+        let container = is_container(&src);
+        if !src.is_file() && !(container && src.is_dir()) {
             return Err(format!("not a file: {p}"));
         }
         let id = uuid::Uuid::new_v4().to_string();
         let dir = state.paths.recording_dir(&id);
         std::fs::create_dir_all(&dir).map_err(err)?;
-        let audio_path = if copy {
+        let audio_path = if container {
+            // Adobe Connect archives / FLV can't play in a web view: play the decoded mix.
+            state.paths.pcm_path(&id)
+        } else if copy {
             let ext = src
                 .extension()
                 .map(|e| e.to_string_lossy().to_lowercase())
@@ -318,38 +322,161 @@ pub async fn import_files(app: AppHandle, paths: Vec<String>) -> CmdResult<Vec<R
     }
     // Decode in the background (waveform + duration), then queue transcription.
     for rec in &created {
-        let app2 = app.clone();
-        let id = rec.id.clone();
-        tauri::async_runtime::spawn(async move {
-            let app3 = app2.clone();
-            let id2 = id.clone();
-            let outcome = tauri::async_runtime::spawn_blocking(move || {
-                let state = app3.state::<AppState>();
-                let _permit = state.decode_slots.acquire();
-                worker::prepare_audio(&app3, &id2, &AtomicBool::new(false))
-            })
-            .await;
-            let state = app2.state::<AppState>();
-            match outcome {
-                Ok(Ok(worker::Prepared::Samples(_))) => {
-                    if let Some(model_id) = default_model_ready(&state) {
-                        let _ = queue_transcription(&app2, &id, model_id);
-                    } else {
-                        let db = state.db.lock().unwrap();
-                        events::recording_updated(&app2, &db, &id);
-                    }
-                }
-                Ok(Ok(worker::Prepared::NeedsDecode)) => {}
-                Ok(Err(e)) => {
-                    let db = state.db.lock().unwrap();
-                    let _ = db.set_status(&id, RecordingStatus::Error, Some(&format!("{e:#}")));
-                    events::recording_updated(&app2, &db, &id);
-                }
-                Err(e) => log::error!("decode task failed: {e}"),
-            }
-        });
+        prepare_and_queue(&app, rec.id.clone());
     }
     Ok(created)
+}
+
+/// Inputs decoded into the PCM cache rather than played directly: Adobe Connect source
+/// archives (ZIP or extracted folder) and FLV streams.
+fn is_container(p: &std::path::Path) -> bool {
+    if p.is_dir() {
+        return wwta_core::adobe_connect::is_connect_dir(p);
+    }
+    matches!(
+        p.extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .as_deref(),
+        Some("zip" | "flv" | "f4a")
+    )
+}
+
+/// Decode a freshly imported recording (waveform, duration) and queue its transcription.
+fn prepare_and_queue(app: &AppHandle, id: String) {
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let app3 = app2.clone();
+        let id2 = id.clone();
+        let outcome = tauri::async_runtime::spawn_blocking(move || {
+            let state = app3.state::<AppState>();
+            let _permit = state.decode_slots.acquire();
+            worker::prepare_audio(&app3, &id2, &AtomicBool::new(false))
+        })
+        .await;
+        let state = app2.state::<AppState>();
+        match outcome {
+            Ok(Ok(worker::Prepared::Samples(_))) => {
+                if let Some(model_id) = default_model_ready(&state) {
+                    let _ = queue_transcription(&app2, &id, model_id);
+                } else {
+                    let db = state.db.lock().unwrap();
+                    let _ = db.set_status(&id, RecordingStatus::New, None);
+                    events::recording_updated(&app2, &db, &id);
+                }
+            }
+            Ok(Ok(worker::Prepared::NeedsDecode)) => {}
+            Ok(Err(e)) => {
+                let msg = format!("{e:#}");
+                let db = state.db.lock().unwrap();
+                let _ = db.set_status(&id, RecordingStatus::Error, Some(&msg));
+                events::recording_updated(&app2, &db, &id);
+                worker::progress(
+                    &app2,
+                    &id,
+                    TranscriptionStage::Error,
+                    0.0,
+                    Some(msg),
+                    vec![],
+                );
+            }
+            Err(e) => log::error!("decode task failed: {e}"),
+        }
+    });
+}
+
+/// Import an Adobe Connect recording from its link (downloads the source archive).
+#[tauri::command]
+pub async fn import_link(app: AppHandle, url: String) -> CmdResult<Recording> {
+    use wwta_core::adobe_connect;
+    let link = adobe_connect::parse_link(&url).map_err(anyhow_err)?;
+    let state = app.state::<AppState>();
+    let id = uuid::Uuid::new_v4().to_string();
+    let dir = state.paths.recording_dir(&id);
+    std::fs::create_dir_all(&dir).map_err(err)?;
+    let zip = dir.join("source.zip");
+    let now = now_iso();
+    let rec = Recording {
+        id: id.clone(),
+        title: link.id.clone(),
+        source_path: zip.to_string_lossy().into_owned(),
+        audio_path: state.paths.pcm_path(&id).to_string_lossy().into_owned(),
+        playback_wav_path: None,
+        duration_sec: None,
+        created_at: now.clone(),
+        updated_at: now,
+        status: RecordingStatus::Transcribing,
+        model_id: None,
+        error: None,
+        segment_count: 0,
+        has_analysis: false,
+        tags: vec![],
+        blurb: None,
+    };
+    state
+        .db
+        .lock()
+        .unwrap()
+        .insert_recording(&rec)
+        .map_err(anyhow_err)?;
+    let app2 = app.clone();
+    let id2 = id.clone();
+    tauri::async_runtime::spawn(async move {
+        let msg = "Downloading from Adobe Connect…".to_string();
+        worker::progress(
+            &app2,
+            &id2,
+            TranscriptionStage::Decoding,
+            0.0,
+            Some(msg),
+            vec![],
+        );
+        let mut last = std::time::Instant::now();
+        let (app3, id3) = (app2.clone(), id2.clone());
+        let result =
+            adobe_connect::download(&link, &zip, &AtomicBool::new(false), &mut |done, total| {
+                if last.elapsed() < std::time::Duration::from_millis(250) {
+                    return;
+                }
+                last = std::time::Instant::now();
+                let p = if total > 0 {
+                    done as f32 / total as f32
+                } else {
+                    0.0
+                };
+                let msg = format!(
+                    "Downloading from Adobe Connect… {:.1} MB",
+                    done as f64 / 1e6
+                );
+                worker::progress(
+                    &app3,
+                    &id3,
+                    TranscriptionStage::Decoding,
+                    p,
+                    Some(msg),
+                    vec![],
+                );
+            })
+            .await;
+        match result {
+            Ok(()) => prepare_and_queue(&app2, id2),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                let state = app2.state::<AppState>();
+                let db = state.db.lock().unwrap();
+                let _ = db.set_status(&id2, RecordingStatus::Error, Some(&msg));
+                events::recording_updated(&app2, &db, &id2);
+                worker::progress(
+                    &app2,
+                    &id2,
+                    TranscriptionStage::Error,
+                    0.0,
+                    Some(msg),
+                    vec![],
+                );
+            }
+        }
+    });
+    Ok(rec)
 }
 
 fn queue_transcription(app: &AppHandle, id: &str, model_id: String) -> anyhow::Result<()> {

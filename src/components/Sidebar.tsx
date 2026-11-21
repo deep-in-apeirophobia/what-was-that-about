@@ -5,6 +5,7 @@ import {
   Boxes,
   CircleHelp,
   Library,
+  Link2,
   MessagesSquare,
   PanelLeftClose,
   PanelLeftOpen,
@@ -152,6 +153,20 @@ export function Sidebar() {
       >
         <Plus className="size-4" />
         {!collapsed && "Import audio"}
+      </button>
+
+      <button
+        type="button"
+        onClick={() => useApp.getState().setLinkDialogOpen(true)}
+        title="Import an Adobe Connect recording from its link"
+        aria-label={collapsed ? "Import Adobe Connect link" : undefined}
+        className={clsx(
+          "mt-1.5 flex h-7 items-center gap-1.5 rounded-md text-[12px] text-muted transition-colors hover:bg-hover hover:text-fg",
+          collapsed ? "w-full justify-center" : "w-full px-2",
+        )}
+      >
+        <Link2 className="size-3.5 shrink-0" />
+        {!collapsed && "Adobe Connect link…"}
       </button>
 
       <button

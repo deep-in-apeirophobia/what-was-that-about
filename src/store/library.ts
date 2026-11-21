@@ -17,6 +17,7 @@ interface LibraryState {
   remove: (id: string) => void;
   applyProgress: (p: TranscriptionProgress) => void;
   importPaths: (paths: string[]) => Promise<Recording[]>;
+  importLink: (url: string) => Promise<Recording | null>;
 }
 
 const byNewest = (a: Recording, b: Recording) => b.createdAt.localeCompare(a.createdAt);
@@ -61,6 +62,17 @@ export const useLibrary = create<LibraryState>((set, get) => ({
       const title = get().recordings.find((r) => r.id === p.recordingId)?.title ?? "A recording";
       toast.error(`Transcription failed: ${title}`, p.message ?? "Unknown error");
     }
+  },
+
+  importLink: async (url) => {
+    const rec = await attempt("Couldn't import the link", () => api.importLink(url));
+    if (!rec) return null;
+    get().upsert(rec);
+    toast.success("Downloading the recording…", "It will be transcribed when the download finishes.", {
+      label: "Open",
+      onClick: () => useApp.getState().openRecording(rec.id),
+    });
+    return rec;
   },
 
   importPaths: async (paths) => {

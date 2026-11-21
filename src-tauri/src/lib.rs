@@ -102,6 +102,7 @@ pub fn run() {
             commands::list_recordings,
             commands::get_recording,
             commands::import_files,
+            commands::import_link,
             commands::submit_decoded_audio,
             commands::rename_recording,
             commands::delete_recording,
