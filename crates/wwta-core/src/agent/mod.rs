@@ -26,6 +26,10 @@ const KEEP_RECENT: usize = 4;
 const MAX_TOOL_CHARS: usize = 200_000;
 /// Tokens per character before the first reply tells us better (Persian runs ~2.5 chars/token).
 const DEFAULT_RATIO: f64 = 0.4;
+/// The budget never shrinks below this after context-length errors.
+const MIN_BUDGET: usize = 8_000;
+/// Output tokens allowed for one summary.
+const SUMMARY_TOKENS: u32 = 2_000;
 
 const SUMMARY_PROMPT: &str = "You compress a conversation so it can go on without the original \
 messages. Write a summary of at most about 600 words that keeps: what the user asked and wants, \
@@ -69,7 +73,12 @@ fn msg_chars(m: &Msg) -> usize {
         .iter()
         .map(|c| c.name.len() + c.arguments.chars().count() + 16)
         .sum();
-    m.content.chars().count() + calls + 8
+    let reasoning: usize = m
+        .reasoning_details
+        .iter()
+        .map(|r| r.to_string().len())
+        .sum();
+    m.content.chars().count() + calls + reasoning + 8
 }
 
 impl Context {
@@ -260,11 +269,7 @@ impl<'a> Agent<'a> {
                     if last {
                         self.ctx.turn.pop();
                     }
-                    let lower = match overflow_limit(&e) {
-                        Some(limit) => limit.saturating_sub(self.max_tokens as usize) * 9 / 10,
-                        None => self.ctx.tokens() * 2 / 3,
-                    };
-                    self.ctx.budget = lower.clamp(8_000, self.ctx.budget);
+                    self.shrink_budget(&e, self.max_tokens);
                     self.compact().await?;
                     continue;
                 }
@@ -283,9 +288,10 @@ impl<'a> Agent<'a> {
             }
             host.on_reset();
             rounds += 1;
-            self.ctx
-                .turn
-                .push(Msg::tool_calls(reply.content, reply.tool_calls.clone()));
+            self.ctx.turn.push(Msg {
+                reasoning_details: reply.reasoning_details,
+                ..Msg::tool_calls(reply.content, reply.tool_calls.clone())
+            });
             for call in &reply.tool_calls {
                 self.check_cancel()?;
                 self.stats.tool_calls += 1;
@@ -295,6 +301,19 @@ impl<'a> Agent<'a> {
                     .push(Msg::tool_result(&call.id, clip(&out, MAX_TOOL_CHARS)));
             }
         }
+    }
+
+    /// After a context-length error, fit the budget to the model (its stated limit minus the
+    /// output tokens asked for). Returns false when the budget can't shrink any further.
+    fn shrink_budget(&mut self, e: &anyhow::Error, output_tokens: u32) -> bool {
+        let lower = match overflow_limit(e) {
+            Some(limit) => limit.saturating_sub(output_tokens as usize) * 9 / 10,
+            None => self.ctx.tokens().min(self.ctx.budget) * 2 / 3,
+        };
+        let budget = lower.max(MIN_BUDGET).min(self.ctx.budget);
+        let shrunk = budget < self.ctx.budget;
+        self.ctx.budget = budget;
+        shrunk
     }
 
     /// Bring the context under half the budget: drop old tool output, summarize earlier
@@ -325,10 +344,10 @@ impl<'a> Agent<'a> {
         } else {
             len
         };
-        // bytes of conversation per summary request: a third of the budget
-        let batch = (self.ctx.budget as f64 / 3.0 / self.ctx.ratio) as usize;
         while left > 0 {
             self.check_cancel()?;
+            // bytes of conversation per summary request: a third of the budget
+            let batch = (self.ctx.budget as f64 / 3.0 / self.ctx.ratio) as usize;
             let mut text = String::new();
             if let Some(s) = &self.ctx.summary {
                 text.push_str(&format!(
@@ -337,27 +356,34 @@ impl<'a> Agent<'a> {
             }
             let mut take = 0;
             for m in &self.ctx.history[..left] {
+                let body = m.content.trim();
+                if take > 0 && text.len() + body.len() + 16 > batch {
+                    break;
+                }
                 let who = if m.role == "user" {
                     "User"
                 } else {
                     "Assistant"
                 };
-                let piece = format!(
-                    "{who}: {}\n\n",
-                    clip(m.content.trim(), (batch / 2).min(20_000))
-                );
-                if take > 0 && text.len() + piece.len() > batch {
-                    break;
-                }
-                text.push_str(&piece);
+                // only a message bigger than a whole batch is cut: no request could hold it
+                let room = batch.saturating_sub(text.len()).max(1_000);
+                text.push_str(&format!("{who}: {}\n\n", clip(body, room)));
                 take += 1;
             }
             let msgs = [Msg::system(SUMMARY_PROMPT), Msg::user(text)];
-            let (summary, u) = self
+            let (summary, u) = match self
                 .client
-                .complete(self.model, &msgs, false, 2_000)
+                .complete(self.model, &msgs, false, SUMMARY_TOKENS)
                 .await
-                .map_err(|e| explain_error(e, self.model))?;
+            {
+                Ok(r) => r,
+                // the model's context is smaller than the budget assumed: retry smaller
+                Err(e) if is_context_overflow(&e) && self.shrink_budget(&e, SUMMARY_TOKENS) => {
+                    log::warn!("summary too large for the model ({e:#}); retrying smaller");
+                    continue;
+                }
+                Err(e) => return Err(explain_error(e, self.model)),
+            };
             add_usage(&mut self.usage, u);
             self.ctx.summary = Some(summary.trim().to_string());
             self.ctx.history.drain(..take);
@@ -705,10 +731,12 @@ mod tests {
 
     #[tokio::test]
     async fn runs_tools_until_the_model_answers() {
-        let (base, seen) = fake_openrouter(vec![
-            calls("Let me search.", &[("search", json!({ "query": "بودجه" }))]),
-            answer("The budget is low [R1#1]."),
-        ]);
+        let mut first = calls("Let me search.", &[("search", json!({ "query": "بودجه" }))]);
+        let thought = json!({ "choices": [{ "delta": { "reasoning_details": [
+            { "type": "reasoning.encrypted", "data": "opaque", "index": 0, "format": "google-gemini-v1" }
+        ] } }] });
+        first.body = format!("data: {thought}\n\n{}", first.body);
+        let (base, seen) = fake_openrouter(vec![first, answer("The budget is low [R1#1].")]);
         let client = Client::with_base("key", &base).unwrap();
         let cancel = AtomicBool::new(false);
         let mut h = host(Scope::Library);
@@ -724,6 +752,9 @@ mod tests {
         assert_eq!(seen[0]["tools"][0]["function"]["name"], "list_recordings");
         let msgs = seen[1]["messages"].as_array().unwrap();
         assert_eq!(msgs[2]["tool_calls"][0]["function"]["name"], "search");
+        // reasoning blocks go back unchanged with the tool results
+        assert_eq!(msgs[2]["reasoning_details"][0]["data"], "opaque");
+        assert!(seen[0].get("reasoning").is_none());
         assert_eq!(msgs[3]["role"], "tool");
         assert!(msgs[3]["content"]
             .as_str()
@@ -824,6 +855,51 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("Summary of the conversation before this:\ns1"));
+    }
+
+    #[tokio::test]
+    async fn shrinks_summary_batches_after_a_context_error() {
+        let overflow = Canned {
+            status: 400,
+            content_type: "application/json",
+            body: json!({ "error": { "message": "This endpoint's maximum context length is 30000 tokens." } }).to_string(),
+        };
+        let (base, seen) = fake_openrouter(vec![
+            overflow,
+            completion("s1"),
+            completion("s2"),
+            answer("ok"),
+        ]);
+        let client = Client::with_base("key", &base).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut h = host(Scope::Recording("uuid-a".into()));
+        // two big old messages (over a quarter of the default budget), four short recent ones
+        let mut history = vec![
+            Msg::user(format!("big0 {}", "x".repeat(90_000))),
+            Msg::assistant(format!("big1 {}", "y".repeat(90_000))),
+        ];
+        history.extend((0..4).map(|i| Msg::user(format!("short {i}"))));
+        let ctx = Context::new("system", None, history, Msg::user("now?"));
+        let mut agent = Agent::new(&client, "m", 1_000, &cancel, ctx);
+        assert_eq!(agent.run(&mut h).await.unwrap(), "ok");
+        assert_eq!(
+            agent.ctx.budget,
+            (30_000 - SUMMARY_TOKENS as usize) * 9 / 10
+        );
+        assert_eq!(agent.ctx.folded, 2);
+        assert_eq!(agent.ctx.summary.as_deref(), Some("s2"));
+        let seen = seen.lock().unwrap();
+        let input = |i: usize| {
+            seen[i]["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert!(input(0).contains("big0") && input(0).contains("big1"));
+        // after the error each big message gets its own, smaller request
+        let batch = (agent.ctx.budget as f64 / 3.0 / DEFAULT_RATIO) as usize;
+        assert!(input(1).starts_with("User: big0") && input(1).len() <= batch + 100);
+        assert!(input(2).contains("Assistant: big1") && input(2).len() <= batch + 100);
     }
 
     #[test]

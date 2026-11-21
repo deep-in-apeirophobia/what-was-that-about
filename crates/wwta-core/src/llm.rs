@@ -23,6 +23,9 @@ pub struct Msg {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
     pub tool_call_id: Option<String>,
+    /// The model's reasoning blocks (possibly encrypted) from a tool-calling turn. Some models
+    /// (e.g. Gemini 3) need them sent back unchanged with the tool results.
+    pub reasoning_details: Vec<Value>,
 }
 
 impl Msg {
@@ -79,6 +82,9 @@ impl Serialize for Msg {
         if let Some(id) = &self.tool_call_id {
             v["tool_call_id"] = id.as_str().into();
         }
+        if !self.reasoning_details.is_empty() {
+            v["reasoning_details"] = self.reasoning_details.clone().into();
+        }
         v.serialize(s)
     }
 }
@@ -130,6 +136,29 @@ pub struct Reply {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<Usage>,
+    /// Reasoning blocks to replay with the tool results (never shown).
+    pub reasoning_details: Vec<Value>,
+}
+
+/// Add one streamed reasoning-detail chunk: pieces of the same block share an `index`, and
+/// their text fields are concatenated in order.
+fn merge_reasoning(acc: &mut Vec<Value>, chunk: &Value) {
+    let index = chunk["index"].as_u64();
+    let Some(block) = index.and_then(|i| acc.iter_mut().find(|b| b["index"].as_u64() == Some(i)))
+    else {
+        acc.push(chunk.clone());
+        return;
+    };
+    for (k, v) in chunk.as_object().into_iter().flatten() {
+        match (k.as_str(), v, &mut block[k]) {
+            (_, Value::Null, _) => {}
+            ("text" | "summary" | "data" | "signature", Value::String(add), Value::String(cur)) => {
+                cur.push_str(add)
+            }
+            (_, v, slot) if slot.is_null() => *slot = v.clone(),
+            _ => {}
+        }
+    }
 }
 
 /// Assembles a [`Reply`] from streamed chunks. Tool calls arrive in pieces keyed by `index`
@@ -150,6 +179,9 @@ impl ReplyBuilder {
             self.reply.usage = Some(u);
         }
         let delta = &v["choices"][0]["delta"];
+        for d in delta["reasoning_details"].as_array().into_iter().flatten() {
+            merge_reasoning(&mut self.reply.reasoning_details, d);
+        }
         let calls = &mut self.reply.tool_calls;
         for tc in delta["tool_calls"].as_array().into_iter().flatten() {
             let id = tc["id"].as_str().filter(|s| !s.is_empty());
@@ -323,7 +355,8 @@ impl Client {
             "max_tokens": req.max_tokens,
             "temperature": 0.3,
             "stream": true,
-            "reasoning": { "exclude": true },
+            // no `reasoning.exclude`: tool turns must send the reasoning blocks back, and
+            // hiding them doesn't save tokens (only `delta.content` is shown)
             "usage": { "include": true },
         });
         if !req.tools.is_empty() {
@@ -849,6 +882,34 @@ mod tests {
     }
 
     #[test]
+    fn collects_streamed_reasoning_blocks() {
+        let mut b = ReplyBuilder::default();
+        for c in [
+            r#"{"choices":[{"delta":{"reasoning":"thi","reasoning_details":[{"type":"reasoning.text","text":"thi","index":0,"format":"anthropic-claude-v1"}]}}]}"#,
+            r#"{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"nk","signature":null,"index":0}]}}]}"#,
+            r#"{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","signature":"sig","index":0}]}}]}"#,
+            r#"{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.encrypted","data":"abc","index":1}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"get_notes","arguments":"{}"}}]}}]}"#,
+        ] {
+            assert_eq!(b.apply(&serde_json::from_str(c).unwrap()).unwrap(), None);
+        }
+        let r = b.finish().unwrap();
+        assert_eq!(
+            r.reasoning_details,
+            vec![
+                serde_json::json!({"type":"reasoning.text","text":"think","signature":"sig","index":0,"format":"anthropic-claude-v1"}),
+                serde_json::json!({"type":"reasoning.encrypted","data":"abc","index":1}),
+            ]
+        );
+        let m = Msg {
+            reasoning_details: r.reasoning_details,
+            ..Msg::tool_calls("", r.tool_calls)
+        };
+        let v = serde_json::to_value(m).unwrap();
+        assert_eq!(v["reasoning_details"][1]["data"], "abc");
+    }
+
+    #[test]
     fn serializes_tool_messages() {
         let call = ToolCall {
             id: "c1".into(),
@@ -861,6 +922,7 @@ mod tests {
         let t = serde_json::to_value(Msg::tool_result("c1", "ok")).unwrap();
         assert_eq!(t["role"], "tool");
         assert_eq!(t["tool_call_id"], "c1");
+        assert!(a.get("reasoning_details").is_none());
         let u = serde_json::to_value(Msg::user("hi")).unwrap();
         assert_eq!(u, serde_json::json!({"role": "user", "content": "hi"}));
     }
