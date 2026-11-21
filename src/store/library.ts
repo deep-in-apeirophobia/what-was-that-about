@@ -18,6 +18,7 @@ interface LibraryState {
   applyProgress: (p: TranscriptionProgress) => void;
   importPaths: (paths: string[]) => Promise<Recording[]>;
   importLink: (url: string) => Promise<Recording | null>;
+  insertIfMissing: (r: Recording) => void;
 }
 
 const byNewest = (a: Recording, b: Recording) => b.createdAt.localeCompare(a.createdAt);
@@ -41,6 +42,12 @@ export const useLibrary = create<LibraryState>((set, get) => ({
       if (r.status !== "queued" && r.status !== "transcribing") delete progress[r.id];
       return { recordings, progress };
     }),
+
+  // Import commands return a snapshot taken before background work starts; status events
+  // for the same recording can arrive first and are newer, so don't overwrite them.
+  insertIfMissing: (r) => {
+    if (!get().recordings.some((x) => x.id === r.id)) get().upsert(r);
+  },
 
   remove: (id) =>
     set((s) => {
@@ -67,7 +74,7 @@ export const useLibrary = create<LibraryState>((set, get) => ({
   importLink: async (url) => {
     const rec = await attempt("Couldn't import the link", () => api.importLink(url));
     if (!rec) return null;
-    get().upsert(rec);
+    get().insertIfMissing(rec);
     toast.success("Downloading the recording…", "It will be transcribed when the download finishes.", {
       label: "Open",
       onClick: () => useApp.getState().openRecording(rec.id),
@@ -79,7 +86,7 @@ export const useLibrary = create<LibraryState>((set, get) => ({
     if (!paths.length) return [];
     const added = await attempt("Import failed", () => api.importFiles(paths));
     if (!added?.length) return [];
-    for (const r of added) get().upsert(r);
+    for (const r of added) get().insertIfMissing(r);
     if (added.length === 1) {
       toast.success("Imported", added[0].title, {
         label: "Open",
