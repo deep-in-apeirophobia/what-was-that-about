@@ -204,7 +204,9 @@ impl Engine for Whisper {
         progress: &mut Progress<'_>,
     ) -> Result<Vec<Segment>> {
         let sr = TARGET_RATE as usize;
-        let chunks = merge_regions(regions, samples.len(), 28 * sr, sr / 5);
+        // ~20 s windows: closer to the fine-tuning data than whisper's 30 s, and with
+        // no-timestamp decoding a shorter window loses less if the model stops early.
+        let chunks = merge_regions(regions, samples.len(), 20 * sr, sr / 5);
         let mut state = self
             .ctx
             .create_state()
@@ -212,8 +214,11 @@ impl Engine for Whisper {
         let eot = self.ctx.token_eot();
         let threads = effective_threads(opts.threads);
         let mut out = Vec::new();
-        let n_chunks = chunks.len().max(1);
-        for (ci, &(s, e)) in chunks.iter().enumerate() {
+        let speech_total: usize = chunks.iter().map(|(a, b)| b - a).sum::<usize>().max(1);
+        let mut speech_done = 0usize;
+        let mut queue: std::collections::VecDeque<(usize, usize, u32)> =
+            chunks.iter().map(|&(a, b)| (a, b, 0)).collect();
+        while let Some((s, e, retry)) = queue.pop_front() {
             if cancel.load(Ordering::Relaxed) {
                 bail!("cancelled");
             }
@@ -230,6 +235,10 @@ impl Engine for Whisper {
             params.set_translate(false);
             params.set_n_threads(threads);
             params.set_no_context(true);
+            // Taraneh was fine-tuned with <|notimestamps|> (see its config.json); decoding with
+            // timestamp tokens produces stray tokens like " 1" or "we" at window starts. Timing
+            // comes from DTW word alignment instead, and sentences are split afterwards.
+            params.set_no_timestamps(self.dtw);
             params.set_token_timestamps(true);
             params.set_print_special(false);
             params.set_print_progress(false);
@@ -337,8 +346,43 @@ impl Engine for Whisper {
                     words,
                 });
             }
+            // If the model ended the window early (last aligned word well before the window
+            // end) while VAD still hears speech there, decode the remainder again.
+            let mut resume_at: Option<usize> = None;
+            if self.dtw && retry < 3 {
+                let last_word = new
+                    .iter()
+                    .rev()
+                    .find_map(|seg: &Segment| seg.words.last().map(|w| w.start));
+                let boundary = match last_word {
+                    Some(t) => ((t + 0.6) * sr as f64) as usize,
+                    None => s,
+                };
+                if boundary > s + sr / 2 && e > boundary + 2 * sr {
+                    let speech_after: usize = regions
+                        .iter()
+                        .map(|&(a, b)| b.min(e).saturating_sub(a.max(boundary)))
+                        .sum();
+                    if speech_after > sr {
+                        resume_at = Some(boundary);
+                    }
+                }
+            }
+            if let Some(b) = resume_at {
+                // keep only what precedes the resume point
+                let b_secs = b as f64 / sr as f64;
+                for seg in &mut new {
+                    seg.words.retain(|w| ((w.start * sr as f64) as usize) < b);
+                    seg.end = seg.end.min(b_secs).max(seg.start);
+                }
+                new.retain(|seg| !seg.words.is_empty() || ((seg.start * sr as f64) as usize) < b);
+                queue.push_front((b, e, retry + 1));
+                speech_done += b - s;
+            } else {
+                speech_done += e - s;
+            }
             out.extend(new.iter().cloned());
-            progress((ci + 1) as f32 / n_chunks as f32, new);
+            progress((speech_done as f32 / speech_total as f32).min(1.0), new);
         }
         Ok(out)
     }
