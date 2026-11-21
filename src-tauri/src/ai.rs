@@ -334,8 +334,14 @@ async fn condensed_transcript(
             return Ok(context::clip_middle(&notes, budget));
         }
         level += 1;
-        sections = sections
-            .chunks(context::SECTIONS_PER_GROUP)
+        // each group's notes form one condensing request, so they must fit like a section
+        let sizes: Vec<usize> = sections
+            .iter()
+            .map(|s| context::estimate_tokens(&s.text) + 16)
+            .collect();
+        sections = context::group_by_tokens(&sizes, max_section, context::SECTIONS_PER_GROUP)
+            .into_iter()
+            .map(|r| &sections[r])
             .map(|g| Section {
                 first: g[0].first,
                 last: g[g.len() - 1].last,
@@ -716,12 +722,12 @@ async fn compact_history(
     ai: &Ai<'_>,
     caps: &Caps,
     thread: &ChatThread,
-    msgs: &[ChatMessage],
+    msgs: &mut [ChatMessage],
     budget: usize,
     about: &str,
 ) -> Result<(Option<String>, usize, bool)> {
     let start = (thread.compacted_count as usize).min(msgs.len());
-    let hist = &msgs[start..];
+    let hist = &mut msgs[start..];
     let plan = history_file_plan(caps, hist, speech_model_installed(ai.app));
     let costs: Vec<MsgCost> = hist
         .iter()
@@ -734,6 +740,16 @@ async fn compact_history(
     let fold = context::messages_to_fold(&costs, budget, KEEP_LAST_MESSAGES);
     if fold == 0 {
         return Ok((thread.summary.clone(), start, false));
+    }
+    // files the model saw directly have no text yet; the summary needs it to keep them
+    for m in hist[..fold].iter_mut() {
+        let asked = m.content.clone();
+        for a in m.attachments.iter_mut().filter(|a| a.text.is_none()) {
+            if let Err(e) = attachment_parts(ai, caps, a, false, &asked).await {
+                ai.check_cancel()?;
+                log::warn!("attachment left out of the conversation summary: {e:#}");
+            }
+        }
     }
     ai.status("Summarizing earlier messages to fit the model's context…");
     let previous = thread.summary.as_deref();
@@ -1081,7 +1097,7 @@ async fn ask_inner(
     let (summary, kept_from) = match &thread {
         Some(t) => {
             let (summary, from, compacted) =
-                compact_history(ai, &caps, t, &prior, history_budget, &about).await?;
+                compact_history(ai, &caps, t, &mut prior, history_budget, &about).await?;
             stats.compacted = compacted;
             (summary, from)
         }

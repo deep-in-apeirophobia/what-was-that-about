@@ -104,9 +104,12 @@ export const useChats = create<ChatsState>((set, get) => {
     });
 
   const loadMessages = async (scope: ChatScope, threadId: string) => {
+    const before = chat(scope).messages[threadId];
     try {
       const messages = await api.listChatMessages(threadId);
       patch(scope, (c) => {
+        // an answer arrived (or another load finished) meanwhile: that copy is newer
+        if (c.messages[threadId] !== before) return {};
         const loadErrors = { ...c.loadErrors };
         delete loadErrors[threadId];
         return { messages: { ...c.messages, [threadId]: messages }, loadErrors };
@@ -154,7 +157,10 @@ export const useChats = create<ChatsState>((set, get) => {
         return;
       }
       // a question, rename or delete finished meanwhile: this list is out of date
-      if (chat(scope).rev !== rev) return;
+      if (chat(scope).rev !== rev) {
+        patch(scope, () => ({ loaded: true }));
+        return;
+      }
       const first = !chat(scope).loaded;
       patch(scope, (c) => {
         const keep = c.activeId && threads.some((t) => t.id === c.activeId);

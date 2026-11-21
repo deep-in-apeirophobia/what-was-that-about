@@ -187,6 +187,30 @@ describe("chat threads", () => {
     expect(state().activeId).toBe("t3");
   });
 
+  it("finishes the first load even when an answer lands before it", async () => {
+    const slow = deferred<ChatThread[]>();
+    mocked.listChatThreads.mockReturnValueOnce(slow.promise);
+    const loading = useChats.getState().load("r1");
+    mocked.ask.mockResolvedValue({ thread: thread("t3", "2026-11-21T10:00:00Z"), question: message("t3", "user", "q"), answer: message("t3", "assistant", "a") });
+    await useChats.getState().ask("r1", "q");
+    slow.resolve([thread("t2", "2026-11-20T10:00:00Z")]);
+    await loading;
+    expect(state().loaded).toBe(true);
+    expect(state().activeId).toBe("t3");
+  });
+
+  it("a slow message fetch doesn't erase a newer answer", async () => {
+    await useChats.getState().load("r1");
+    const slow = deferred<ChatMessage[]>();
+    mocked.listChatMessages.mockReturnValueOnce(slow.promise);
+    const reloading = useChats.getState().reloadMessages("r1", "t2");
+    mocked.ask.mockResolvedValue({ thread: thread("t2", "2026-11-21T10:00:00Z"), question: message("t2", "user", "q2"), answer: message("t2", "assistant", "a2") });
+    await useChats.getState().ask("r1", "q2");
+    slow.resolve([message("t2", "user", "q"), message("t2", "assistant", "a")]);
+    await reloading;
+    expect(state().messages.t2.map((m) => m.content)).toEqual(["q", "a", "q2", "a2"]);
+  });
+
   it("recovers from a conversation that failed to load", async () => {
     mocked.listChatMessages.mockRejectedValueOnce("database is locked");
     await useChats.getState().load("r1");

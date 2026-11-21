@@ -93,6 +93,26 @@ pub fn sections(segs: &[Segment], line_tokens: &[usize], max_tokens: usize) -> V
     out
 }
 
+/// Split consecutive items into groups of at most `max_items` whose tokens stay within
+/// `max_tokens` (an item bigger than that gets a group of its own). Used to condense
+/// section notes together without overflowing the model's context.
+pub fn group_by_tokens(tokens: &[usize], max_tokens: usize, max_items: usize) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    let (mut start, mut acc) = (0usize, 0usize);
+    for (i, &t) in tokens.iter().enumerate() {
+        if i > start && (acc + t > max_tokens || i - start >= max_items) {
+            out.push(start..i);
+            start = i;
+            acc = 0;
+        }
+        acc += t;
+    }
+    if start < tokens.len() {
+        out.push(start..tokens.len());
+    }
+    out
+}
+
 /// Pick transcript lines to quote verbatim: each hit (index into the transcript, best first)
 /// with `radius` neighbours on both sides, until `budget` tokens are used. Returns sorted
 /// indices.
@@ -233,6 +253,18 @@ mod tests {
         let mut toks = vec![50; 30];
         toks[4] = 400; // one sentence got much longer
         assert_eq!(sections(&segs, &toks, MAX_SECTION_TOKENS), before);
+    }
+
+    #[test]
+    fn groups_notes_by_size_and_count() {
+        assert_eq!(group_by_tokens(&[10; 7], 1_000, 3), vec![0..3, 3..6, 6..7]);
+        assert_eq!(group_by_tokens(&[40, 40, 40, 10], 90, 6), vec![0..2, 2..4]);
+        // an oversized item still gets condensed, on its own
+        assert_eq!(
+            group_by_tokens(&[10, 500, 10], 100, 6),
+            vec![0..1, 1..2, 2..3]
+        );
+        assert!(group_by_tokens(&[], 100, 6).is_empty());
     }
 
     #[test]

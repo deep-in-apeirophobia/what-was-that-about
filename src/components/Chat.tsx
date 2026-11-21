@@ -431,6 +431,8 @@ function Composer({
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const recorderRef = useRef<VoiceRecorder | null>(null);
   recorderRef.current = recorder;
+  const mounted = useRef(true);
+  const starting = useRef(false);
   const pending = chat.pending;
   const uploading = chat.drafts.some((d) => !d.attachment);
   const canSend = !pending && !uploading && (!!draft.trim() || chat.drafts.length > 0);
@@ -443,7 +445,13 @@ function Composer({
   }, [draft]);
 
   // a recording in progress is dropped when the panel goes away
-  useEffect(() => () => recorderRef.current?.cancel(), []);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      recorderRef.current?.cancel();
+    };
+  }, []);
 
   const send = async (text: string) => {
     const q = text.trim();
@@ -460,10 +468,17 @@ function Composer({
   };
 
   const record = async () => {
+    if (starting.current || recorderRef.current) return;
+    starting.current = true;
     try {
-      setRecorder(await startVoiceRecording());
+      const r = await startVoiceRecording();
+      // the panel closed while the microphone was being opened
+      if (mounted.current) setRecorder(r);
+      else r.cancel();
     } catch (e) {
-      toast.error("Couldn't record", e);
+      if (mounted.current) toast.error("Couldn't record", e);
+    } finally {
+      starting.current = false;
     }
   };
 
