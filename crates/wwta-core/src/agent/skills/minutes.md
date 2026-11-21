@@ -33,5 +33,3 @@ const MINUTES = {
 - Action items as a table (task, owner, due, time button) with a checkbox per row that only
   strikes the row through.
 - Every item ends with a small time button.
-- A "Copy as text" button that copies plain-text minutes with `navigator.clipboard.writeText`
-  (wrap it in try/catch; show "Copied" for a moment).

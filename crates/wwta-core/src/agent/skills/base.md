@@ -11,6 +11,7 @@ audio player. Your final answer is that file and nothing else.
 - Start with `<!doctype html>` and end with `</html>`. No markdown fences, no commentary.
 - Inline all CSS and JavaScript. No external resources: no CDNs, web fonts, image URLs,
   fetch/XHR, iframes or forms. The frame's security policy blocks them and the doc breaks.
+  The clipboard, storage, downloads and pop-ups are blocked too, so don't add buttons for them.
 - Don't paste the transcript into the HTML. Read it at runtime from `WWTA.segments`. Embed
   only what you write yourself (titles, explanations, questions) and the segment ids you
   refer to.
