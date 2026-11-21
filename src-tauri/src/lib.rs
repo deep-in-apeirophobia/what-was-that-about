@@ -1,6 +1,7 @@
 //! What Was That About — desktop app (Tauri).
 
 mod ai;
+mod attachments;
 mod commands;
 mod docproto;
 mod events;
@@ -44,6 +45,11 @@ pub fn run() {
         )
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        // The microphone is only used to record voice messages for Ask.
+        .on_permission_request(|_, kind| match kind {
+            tauri::webview::PermissionKind::Microphone => tauri::webview::PermissionResponse::Allow,
+            _ => tauri::webview::PermissionResponse::Default,
+        })
         .register_uri_scheme_protocol("wwta-doc", |ctx, req| {
             docproto::handle(ctx.app_handle(), req)
         })
@@ -77,6 +83,7 @@ pub fn run() {
                 db: Mutex::new(db),
                 settings: RwLock::new(settings),
                 worker,
+                engine: Mutex::new(None),
                 decode_slots: Slots::new(2),
                 model_jobs: Mutex::default(),
                 model_status: Mutex::default(),
@@ -86,6 +93,18 @@ pub fn run() {
             });
             telemetry_app_opened(app.handle().clone());
             worker::spawn(app.handle().clone(), rx);
+            attachments::sweep(app.handle());
+            // Voice messages record through getUserMedia; WebKitGTK ships with media
+            // streams off.
+            #[cfg(target_os = "linux")]
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.with_webview(|wv| {
+                    use webkit2gtk::{SettingsExt, WebViewExt};
+                    if let Some(s) = WebViewExt::settings(&wv.inner()) {
+                        s.set_enable_media_stream(true);
+                    }
+                });
+            }
             // Debug builds only: evaluate JS lines written to the FIFO named by
             // WWTA_E2E_EVAL_FIFO in the main webview (headless end-to-end runs).
             #[cfg(debug_assertions)]
@@ -155,8 +174,13 @@ pub fn run() {
             commands::analyze,
             commands::index_embeddings,
             commands::ask,
-            commands::clear_chat,
-            commands::list_library_chat,
+            commands::list_chat_threads,
+            commands::list_chat_messages,
+            commands::rename_chat_thread,
+            commands::delete_chat_thread,
+            commands::add_chat_attachment_file,
+            commands::add_chat_attachment,
+            commands::discard_chat_attachment,
             commands::generate_doc,
             commands::revise_doc,
             commands::delete_doc,

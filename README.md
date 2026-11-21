@@ -75,7 +75,21 @@ A one-hour recording is roughly 40k tokens, a fraction of a cent with these mode
 - **Analyze:** title, summary, key points, chapters, topic tags with the segments that discuss
   them, action items and suggested questions.
 - **Ask:** chat about one recording or the whole library; answers cite segments like `[12]`,
-  and clicking a citation plays that moment.
+  and clicking a citation plays that moment. Keep as many separate conversations as you like
+  (switch, rename or delete them from the bar above the chat). Attach images (picker, drag and
+  drop onto the chat, or paste) and voice messages (record with the mic button or attach an
+  audio file):
+  - models that accept images or audio get the files themselves;
+  - otherwise a voice message is transcribed first with your installed speech model, and an
+    image is described by the newest OpenAI Luna model on OpenRouter (`openai/gpt-6-luna` if
+    the model list can't be loaded), and the chat model gets that text.
+- **Long conversations and long recordings:** the app sizes every request to the model's
+  context window. When a conversation gets long, older messages are summarized and the
+  summary is sent instead of them (a divider in the chat marks the spot). When a transcript
+  doesn't fit, it's condensed section by section into notes that keep segment ids, so
+  citations still work; questions also get the verbatim passages most relevant to them.
+  Condensed notes are cached per recording and redone only for edited sections. Analyze and
+  Docs use the same condensed transcript.
 - **Docs:** the model writes a self-contained HTML/JS page (mind map, timeline, flashcards,
   quiz, minutes…) shown inside the app. Docs run in a sandboxed iframe on their own origin with
   a Content-Security-Policy that blocks all network access; they can only read the transcript
@@ -83,8 +97,10 @@ A one-hour recording is roughly 40k tokens, a fraction of a cent with these mode
 - **Semantic search:** optional embeddings (default `baai/bge-m3`) for meaning-based search and
   related sections.
 
-Only transcript text is sent to OpenRouter, and only when you use these features. Audio never
-leaves your computer.
+Only what a feature needs is sent to OpenRouter, and only when you use it: transcript text,
+your notes and chat, plus images and voice messages you attach to a question. Voice messages
+go to OpenRouter only when the chosen model accepts audio (otherwise they're transcribed on
+your computer). Your recordings' audio never leaves your computer.
 
 ## Privacy and telemetry
 
@@ -93,9 +109,10 @@ are on by default and can be turned off in **Settings → Privacy** (or on the f
 
 - **Sent:** a random install id, app version, OS, CPU/RAM/GPU model, app opens, which speech
   and AI models are used, file formats, recording lengths (bucketed), transcription speed,
-  AI request latency/token counts/cost, and counts (searches, notes, exports).
-- **Never sent:** audio, transcripts, notes, chat, generated docs, recording titles, file names
-  or paths, search text, or API keys. Crash reports are scrubbed of paths and tokens.
+  AI request latency/token counts/cost, and counts (searches, notes, exports, images and voice
+  messages attached to questions).
+- **Never sent:** audio, transcripts, notes, chat, attachments, generated docs, recording titles,
+  file names or paths, search text, or API keys. Crash reports are scrubbed of paths and tokens.
 - Events queue on disk while offline and are sent later; turning statistics off deletes the queue.
 - Builds without `POSTHOG_KEY` / `SENTRY_DSN` (e.g. your own, see `.env.example`) contain no
   telemetry at all.
