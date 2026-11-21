@@ -509,13 +509,16 @@ export const MOCK_SYSTEM: SystemInfo = {
   engines: { whisper: true, shenava: true },
 };
 
+const TEXT = ["text"];
+const VISION = ["text", "image"];
+
 export const MOCK_LLM_MODELS: LlmModelInfo[] = [
-  { id: "deepseek/deepseek-v4-flash", name: "DeepSeek V4 Flash", contextLength: 128_000, promptPrice: 0.1, completionPrice: 0.3 },
-  { id: "openai/gpt-6-luna", name: "OpenAI GPT-6 Luna", contextLength: 256_000, promptPrice: 0.15, completionPrice: 0.6 },
-  { id: "anthropic/claude-haiku-5.5", name: "Anthropic Claude Haiku 5.5", contextLength: 200_000, promptPrice: 0.8, completionPrice: 4 },
-  { id: "google/gemini-3-flash", name: "Google Gemini 3 Flash", contextLength: 1_000_000, promptPrice: 0.1, completionPrice: 0.4 },
-  { id: "qwen/qwen3.5-72b-instruct", name: "Qwen 3.5 72B Instruct", contextLength: 131_000, promptPrice: 0.12, completionPrice: 0.39 },
-  { id: "mistralai/mistral-small-4", name: "Mistral Small 4", contextLength: 128_000, promptPrice: 0.05, completionPrice: 0.15 },
-  { id: "meta-llama/llama-5-scout", name: "Meta Llama 5 Scout", contextLength: 512_000, promptPrice: 0.08, completionPrice: 0.3 },
-  { id: "openrouter/free-router", name: "Free router", contextLength: 32_000, promptPrice: 0, completionPrice: 0 },
+  { id: "deepseek/deepseek-v4-flash", name: "DeepSeek V4 Flash", contextLength: 128_000, promptPrice: 0.1, completionPrice: 0.3, inputModalities: TEXT, created: 1_790_000_000 },
+  { id: "openai/gpt-6-luna", name: "OpenAI GPT-6 Luna", contextLength: 256_000, promptPrice: 0.15, completionPrice: 0.6, inputModalities: VISION, created: 1_785_000_000 },
+  { id: "anthropic/claude-haiku-5.5", name: "Anthropic Claude Haiku 5.5", contextLength: 200_000, promptPrice: 0.8, completionPrice: 4, inputModalities: VISION, created: 1_788_000_000 },
+  { id: "google/gemini-3-flash", name: "Google Gemini 3 Flash", contextLength: 1_000_000, promptPrice: 0.1, completionPrice: 0.4, inputModalities: ["text", "image", "audio"], created: 1_786_000_000 },
+  { id: "qwen/qwen3.5-72b-instruct", name: "Qwen 3.5 72B Instruct", contextLength: 131_000, promptPrice: 0.12, completionPrice: 0.39, inputModalities: TEXT, created: 1_780_000_000 },
+  { id: "mistralai/mistral-small-4", name: "Mistral Small 4", contextLength: 128_000, promptPrice: 0.05, completionPrice: 0.15, inputModalities: VISION, created: 1_781_000_000 },
+  { id: "meta-llama/llama-5-scout", name: "Meta Llama 5 Scout", contextLength: 512_000, promptPrice: 0.08, completionPrice: 0.3, inputModalities: VISION, created: 1_782_000_000 },
+  { id: "openrouter/free-router", name: "Free router", contextLength: 32_000, promptPrice: 0, completionPrice: 0, inputModalities: TEXT, created: 1_770_000_000 },
 ];

@@ -1,13 +1,12 @@
-import { useCallback, useEffect, type ReactNode } from "react";
+import { useCallback, type ReactNode } from "react";
 import { MessagesSquare } from "lucide-react";
 import type { Citation } from "../lib/citations";
 import { useApp } from "../store/app";
 import { useLibrary } from "../store/library";
-import { useLibraryChat } from "../store/chat";
 import { hasApiKey, useSettings } from "../store/settings";
 import { toast } from "../store/toasts";
-import { ChatThread } from "../components/Chat";
-import { EmptyState, Spinner } from "../components/ui/misc";
+import { ChatPanel } from "../components/Chat";
+import { EmptyState } from "../components/ui/misc";
 import { NoKeyCta } from "../components/recording/AiCta";
 
 const SUGGESTIONS = [
@@ -18,20 +17,10 @@ const SUGGESTIONS = [
 ];
 
 export function AskLibraryView() {
-  const messages = useLibraryChat((s) => s.messages);
-  const loaded = useLibraryChat((s) => s.loaded);
-  const pending = useLibraryChat((s) => s.pending);
-  const load = useLibraryChat((s) => s.load);
-  const ask = useLibraryChat((s) => s.ask);
-  const clear = useLibraryChat((s) => s.clear);
   const recordings = useLibrary((s) => s.recordings);
   const settings = useSettings((s) => s.settings);
   const openRecording = useApp((s) => s.openRecording);
   const transcribed = recordings.filter((r) => r.status === "ready" && r.segmentCount > 0).length;
-
-  useEffect(() => {
-    void load();
-  }, [load]);
 
   const onCite = useCallback(
     (c: Citation) => {
@@ -71,34 +60,26 @@ export function AskLibraryView() {
         </p>
       </header>
       <div className="mx-auto flex min-h-0 w-full max-w-3xl flex-1 flex-col">
-        {!loaded ? (
-          <div className="flex flex-1 items-center justify-center">
-            <Spinner />
-          </div>
-        ) : (
-          <ChatThread
-            messages={messages}
-            pending={pending}
-            onAsk={ask}
-            onClear={clear}
-            onCite={onCite}
-            renderCite={renderCite}
-            suggestions={SUGGESTIONS}
-            placeholder="Ask across all your recordings…"
-            blocked={
-              !hasApiKey(settings) ? (
-                <NoKeyCta what="ask questions across your library" compact />
-              ) : transcribed === 0 ? (
-                <div className="py-1 text-center text-[12.5px] text-muted">Transcribe a recording first, then ask away.</div>
-              ) : undefined
-            }
-            empty={
-              <EmptyState icon={<MessagesSquare />} title="What was that about?" className="pt-16">
-                Ask about anything said in any recording — “when did we decide on the budget?” — and jump to the answer.
-              </EmptyState>
-            }
-          />
-        )}
+        <ChatPanel
+          scope={null}
+          onCite={onCite}
+          renderCite={renderCite}
+          suggestions={SUGGESTIONS}
+          placeholder="Ask across all your recordings…"
+          blocked={
+            !hasApiKey(settings) ? (
+              <NoKeyCta what="ask questions across your library" compact />
+            ) : transcribed === 0 ? (
+              <div className="py-1 text-center text-[12.5px] text-muted">Transcribe a recording first, then ask away.</div>
+            ) : undefined
+          }
+          empty={
+            <EmptyState icon={<MessagesSquare />} title="What was that about?" className="pt-16">
+              Ask about anything said in any recording — “when did we decide on the budget?” — and jump to the answer. Attach
+              images or voice messages when it helps.
+            </EmptyState>
+          }
+        />
       </div>
     </div>
   );

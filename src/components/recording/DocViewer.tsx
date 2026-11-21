@@ -80,6 +80,7 @@ export function DocFrame({ doc, title, onEscape }: { doc: Doc; title: string; on
       ref={frame}
       title={title}
       sandbox="allow-scripts"
+      allow="microphone 'none'; camera 'none'; geolocation 'none'; display-capture 'none'"
       referrerPolicy="no-referrer"
       {...(src ? { src } : { srcDoc: srcdoc })}
       // Inside an iframe, prefers-color-scheme follows the frame's color-scheme, so docs

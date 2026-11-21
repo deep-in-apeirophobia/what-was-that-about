@@ -5,7 +5,6 @@ import { PENDING_NOTE_PREFIX, compareNotes, notePreview, upsertNote } from "../l
 import { mergeSegments } from "../lib/segments";
 import type {
   Analysis,
-  ChatMessage,
   Doc,
   Note,
   NoteColor,
@@ -36,11 +35,6 @@ export interface RelatedState {
   text: string;
   hits: SearchHit[] | null;
   error: string | null;
-}
-
-export interface PendingAsk {
-  requestId: string;
-  question: string;
 }
 
 /** A note being written. */
@@ -77,7 +71,6 @@ interface RecordingState {
   related: RelatedState | null;
   findOpen: boolean;
   fontSize: number;
-  pendingAsk: PendingAsk | null;
   /** In-flight doc generation (new doc) for the Docs tab. */
   pendingDoc: { requestId: string; prompt: string } | null;
   /** Ask the transcript to scroll to (and briefly flash) a segment. */
@@ -99,14 +92,11 @@ interface RecordingState {
   setEmbeddingsIndexed: (v: boolean) => void;
   upsertDoc: (doc: Doc) => void;
   removeDoc: (docId: string) => void;
-  appendChat: (...msgs: ChatMessage[]) => void;
-  clearChat: () => void;
   setTab: (tab: PanelTab) => void;
   selectTag: (tag: string | null) => void;
   findRelated: (seg: Segment) => Promise<void>;
   setFindOpen: (open: boolean) => void;
   setFontSize: (size: number) => void;
-  setPendingAsk: (p: PendingAsk | null) => void;
   setPendingDoc: (p: { requestId: string; prompt: string } | null) => void;
   revealSegment: (segmentId: number) => void;
 
@@ -141,7 +131,6 @@ export const useRecording = create<RecordingState>((set, get) => ({
   related: null,
   findOpen: false,
   fontSize: readFont(),
-  pendingAsk: null,
   pendingDoc: null,
   reveal: null,
   noteDraft: null,
@@ -160,7 +149,6 @@ export const useRecording = create<RecordingState>((set, get) => ({
       selectedTag: null,
       related: null,
       findOpen: false,
-      pendingAsk: null,
       pendingDoc: null,
       reveal: null,
       noteDraft: null,
@@ -256,16 +244,6 @@ export const useRecording = create<RecordingState>((set, get) => ({
     if (detail) set({ detail: { ...detail, docs: detail.docs.filter((d) => d.id !== docId) } });
   },
 
-  appendChat: (...msgs) => {
-    const { detail } = get();
-    if (detail) set({ detail: { ...detail, chat: [...detail.chat, ...msgs] } });
-  },
-
-  clearChat: () => {
-    const { detail } = get();
-    if (detail) set({ detail: { ...detail, chat: [] } });
-  },
-
   setTab: (tab) => set({ tab }),
   selectTag: (selectedTag) => set({ selectedTag }),
 
@@ -291,7 +269,6 @@ export const useRecording = create<RecordingState>((set, get) => ({
     }
     set({ fontSize });
   },
-  setPendingAsk: (pendingAsk) => set({ pendingAsk }),
   setPendingDoc: (pendingDoc) => set({ pendingDoc }),
   revealSegment: (segmentId) => set({ reveal: { segmentId, nonce: ++revealNonce } }),
 

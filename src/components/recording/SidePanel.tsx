@@ -1,4 +1,5 @@
 import clsx from "clsx";
+import { scopeKey, useChats } from "../../store/chat";
 import { useRecording, type PanelTab } from "../../store/recording";
 import { AskTab } from "./AskTab";
 import { DocsTab } from "./DocsTab";
@@ -20,7 +21,10 @@ export function SidePanel() {
   const tab = useRecording((s) => s.tab);
   const setTab = useRecording((s) => s.setTab);
   const docCount = useRecording((s) => s.detail?.docs.length ?? 0);
-  const chatCount = useRecording((s) => s.detail?.chat.length ?? 0);
+  const recordingId = useRecording((s) => s.id);
+  const loadedThreads = useChats((s) => (recordingId ? s.scopes[scopeKey(recordingId)]?.threads.length : undefined));
+  const detailThreads = useRecording((s) => s.detail?.threads.length ?? 0);
+  const threadCount = loadedThreads ?? detailThreads;
   const noteCount = useRecording((s) => s.detail?.notes.length ?? 0);
   const hasRelated = useRecording((s) => !!s.related);
 
@@ -44,7 +48,7 @@ export function SidePanel() {
       >
         {TABS.map((t) => {
           const selected = t.id === tab;
-          const count = t.id === "docs" ? docCount : t.id === "ask" ? Math.ceil(chatCount / 2) : t.id === "notes" ? noteCount : 0;
+          const count = t.id === "docs" ? docCount : t.id === "ask" ? threadCount : t.id === "notes" ? noteCount : 0;
           return (
             <button
               key={t.id}
