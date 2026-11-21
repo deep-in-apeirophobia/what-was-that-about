@@ -292,16 +292,22 @@ fn hf_tensor_order(enc_layers: i32, dec_layers: i32) -> Vec<String> {
 fn to_f32(dtype: Dtype, data: &[u8]) -> Result<Vec<f32>> {
     Ok(match dtype {
         Dtype::F32 => data
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect(),
         Dtype::F16 => data
-            .chunks_exact(2)
-            .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| f16::from_le_bytes(*c).to_f32())
             .collect(),
         Dtype::BF16 => data
-            .chunks_exact(2)
-            .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| half::bf16::from_le_bytes(*c).to_f32())
             .collect(),
         other => bail!("unsupported tensor dtype {other:?}"),
     })
@@ -309,7 +315,7 @@ fn to_f32(dtype: Dtype, data: &[u8]) -> Result<Vec<f32>> {
 
 /// Q8_0 reference quantization (ggml `quantize_row_q8_0_ref`). `x.len()` must be a multiple of 32.
 pub fn quantize_q8_0(x: &[f32], out: &mut Vec<u8>) {
-    for block in x.chunks_exact(QK8_0) {
+    for block in x.as_chunks::<QK8_0>().0 {
         let amax = block.iter().fold(0f32, |m, v| m.max(v.abs()));
         let d = amax / 127.0;
         let id = if d != 0.0 { 1.0 / d } else { 0.0 };
