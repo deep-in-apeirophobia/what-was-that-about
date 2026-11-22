@@ -197,9 +197,10 @@ export const api = {
       : invoke<ChatAttachment>("add_chat_attachment", { kind: "audio", name, samples, sampleRate }),
   /** Drop an attachment that wasn't sent. */
   discardChatAttachment: (id: string) => invoke<void>("discard_chat_attachment", { id }),
-  /** Generate an interactive HTML doc. Streams on `llm://stream`. */
-  generateDoc: (id: string, prompt: string, requestId: string) =>
-    invoke<Doc>("generate_doc", { id, prompt, requestId }),
+  /** Generate an interactive HTML doc. Streams on `llm://stream`. `skill` names the design
+   *  guide of a template (e.g. "quiz") so the model gets it up front. */
+  generateDoc: (id: string, prompt: string, skill: string | null, requestId: string) =>
+    invoke<Doc>("generate_doc", { id, prompt, skill, requestId }),
   /** Revise an existing doc with an instruction. */
   reviseDoc: (docId: string, instruction: string, requestId: string) =>
     invoke<Doc>("revise_doc", { docId, instruction, requestId }),

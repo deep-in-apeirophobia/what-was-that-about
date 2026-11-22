@@ -1,6 +1,7 @@
 //! Core library for What Was That About.
 
 pub mod adobe_connect;
+pub mod agent;
 pub mod audio;
 pub mod context;
 pub mod db;

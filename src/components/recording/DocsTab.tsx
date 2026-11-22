@@ -23,6 +23,7 @@ import { ProgressBar, textareaClass } from "../ui/misc";
 import { NoKeyCta, PanelSection } from "./AiCta";
 import { DocViewer } from "./DocViewer";
 
+/** `key` is also the name of the template's design guide (crates/wwta-core/src/agent/skills). */
 const TEMPLATES: { key: string; label: string; icon: ReactNode; prompt: string }[] = [
   {
     key: "mindmap",
@@ -74,14 +75,18 @@ function GeneratingCard({ requestId, prompt }: { requestId: string; prompt: stri
   return (
     <div className="rounded-xl border border-accent/25 bg-accent-soft/30 p-3">
       <div className="flex items-center gap-2 text-[13px] font-medium">
-        <Wand2 className="size-3.5 animate-pulse text-accent" />
-        Generating…
+        <Wand2 className="size-3.5 shrink-0 animate-pulse text-accent" />
+        {len > 0 ? "Writing…" : "Generating…"}
         <span className="ml-auto text-[12px] font-normal text-muted tabular-nums">{len > 0 ? formatBytes(len) : "thinking"}</span>
       </div>
       <p className="mt-1 line-clamp-2 text-[12px] text-muted" dir="auto">
         {prompt}
       </p>
-      {status && len === 0 && <p className="mt-1 text-[11.5px] text-faint">{status}</p>}
+      {status && len === 0 && (
+        <p className="mt-1 text-[11.5px] text-faint" dir="auto">
+          {status}
+        </p>
+      )}
       <ProgressBar className="mt-2.5" label="Generating doc" />
       <div className="mt-2 flex justify-end">
         <Button size="sm" onClick={() => stopLlm(requestId)}>
@@ -103,7 +108,8 @@ export function DocsTab() {
   const canGenerate = keyOk && segments.length > 0 && recording.status === "ready" && !pending;
   const viewing = docs.find((d) => d.id === openDoc) ?? null;
 
-  const generate = async (text: string) => {
+  /** `skill` is the template's design guide; custom prompts let the model pick one. */
+  const generate = async (text: string, skill: string | null = null) => {
     const p = text.trim();
     if (!p || !canGenerate) return;
     const id = recording.id;
@@ -111,7 +117,7 @@ export function DocsTab() {
     useStreams.getState().start(requestId);
     useRecording.getState().setPendingDoc({ requestId, prompt: p });
     try {
-      const doc: Doc = await api.generateDoc(id, p, requestId);
+      const doc: Doc = await api.generateDoc(id, p, skill, requestId);
       const rec = useRecording.getState();
       if (rec.id === id) {
         rec.upsertDoc(doc);
@@ -143,7 +149,7 @@ export function DocsTab() {
                   disabled={!canGenerate}
                   onClick={() => {
                     void api.trackUi("doc template used", { template: t.key });
-                    void generate(t.prompt);
+                    void generate(t.prompt, t.key);
                   }}
                   title={t.prompt}
                   className="flex items-center gap-2 rounded-lg border border-line bg-surface px-2.5 py-2 text-left text-[12.5px] font-medium transition-colors hover:border-accent hover:bg-accent-soft/40 disabled:pointer-events-none disabled:opacity-50 [&>svg]:size-4 [&>svg]:shrink-0 [&>svg]:text-accent"

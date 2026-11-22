@@ -510,6 +510,9 @@ pub struct LlmModelInfo {
     /// Unix seconds when OpenRouter added the model.
     #[serde(default)]
     pub created: Option<u64>,
+    /// Takes tool definitions, which Ask and Docs need.
+    #[serde(default)]
+    pub tools: bool,
 }
 
 impl LlmModelInfo {
@@ -525,9 +528,13 @@ pub struct LlmStreamEvent {
     pub delta: Option<String>,
     pub done: bool,
     pub error: Option<String>,
-    /// What the request is doing before the answer streams ("Transcribing the voice message…").
+    /// What the request is doing before the answer streams ("Transcribing the voice message…",
+    /// "Reading the transcript").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    /// Discard the text streamed so far: it was the model's preface to tool calls.
+    #[serde(default)]
+    pub reset: bool,
 }
 
 pub fn now_iso() -> String {

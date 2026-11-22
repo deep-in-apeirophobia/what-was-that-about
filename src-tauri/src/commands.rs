@@ -1052,14 +1052,19 @@ pub fn segments_for_tag(state: State<'_, AppState>, tag: String) -> CmdResult<Ve
 #[tauri::command]
 pub async fn list_llm_models(state: State<'_, AppState>) -> CmdResult<Vec<LlmModelInfo>> {
     let mut cache = state.llm_models.lock().await;
-    if let Some(m) = cache.as_ref() {
-        return Ok(m.clone());
+    if cache.is_none() {
+        let models = wwta_core::llm::list_models()
+            .await
+            .map_err(|e| format!("couldn't load the model list (offline?): {e:#}"))?;
+        *cache = Some(models);
     }
-    let models = wwta_core::llm::list_models()
-        .await
-        .map_err(|e| format!("couldn't load the model list (offline?): {e:#}"))?;
-    *cache = Some(models.clone());
-    Ok(models)
+    // Ask and Docs are tool-using agents; the cache keeps every model for describing images
+    Ok(cache
+        .iter()
+        .flatten()
+        .filter(|m| m.tools)
+        .cloned()
+        .collect())
 }
 
 #[tauri::command]
@@ -1234,9 +1239,10 @@ pub async fn generate_doc(
     app: AppHandle,
     id: String,
     prompt: String,
+    skill: Option<String>,
     request_id: String,
 ) -> CmdResult<Doc> {
-    crate::ai::generate_doc(&app, id, prompt, request_id)
+    crate::ai::generate_doc(&app, id, prompt, skill, request_id)
         .await
         .map_err(anyhow_err)
 }

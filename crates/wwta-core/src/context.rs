@@ -1,6 +1,6 @@
 //! Fitting work into a model's context window: token estimates, splitting long transcripts
-//! into sections for condensing, picking verbatim excerpts, and deciding which chat messages
-//! to fold into a conversation summary.
+//! into sections for condensing, and deciding which chat messages to fold into a
+//! conversation summary.
 
 use std::ops::Range;
 
@@ -111,46 +111,6 @@ pub fn group_by_tokens(tokens: &[usize], max_tokens: usize, max_items: usize) ->
         out.push(start..tokens.len());
     }
     out
-}
-
-/// Pick transcript lines to quote verbatim: each hit (index into the transcript, best first)
-/// with `radius` neighbours on both sides, until `budget` tokens are used. Returns sorted
-/// indices.
-pub fn select_excerpts(
-    line_tokens: &[usize],
-    hits: &[usize],
-    radius: usize,
-    budget: usize,
-) -> Vec<usize> {
-    let n = line_tokens.len();
-    let mut taken = vec![false; n];
-    let mut used = 0usize;
-    'hits: for &h in hits {
-        if h >= n {
-            continue;
-        }
-        // the hit itself first, then its neighbours outwards
-        let mut order = vec![h];
-        for d in 1..=radius {
-            if h >= d {
-                order.push(h - d);
-            }
-            if h + d < n {
-                order.push(h + d);
-            }
-        }
-        for i in order {
-            if taken[i] {
-                continue;
-            }
-            if used + line_tokens[i] > budget {
-                break 'hits;
-            }
-            taken[i] = true;
-            used += line_tokens[i];
-        }
-    }
-    (0..n).filter(|&i| taken[i]).collect()
 }
 
 /// Number of tokens a message would cost in the prompt.
@@ -266,17 +226,6 @@ mod tests {
             vec![0..1, 1..2, 2..3]
         );
         assert!(group_by_tokens(&[], 100, 6).is_empty());
-    }
-
-    #[test]
-    fn excerpts_take_hits_with_neighbours_until_full() {
-        let toks = vec![10; 20];
-        assert_eq!(select_excerpts(&toks, &[5], 1, 1_000), vec![4, 5, 6]);
-        // the second hit only partly fits: its centre comes first
-        assert_eq!(select_excerpts(&toks, &[5, 15], 1, 40), vec![4, 5, 6, 15]);
-        // overlapping neighbourhoods aren't double counted; out-of-range hits are ignored
-        assert_eq!(select_excerpts(&toks, &[0, 1, 99], 1, 1_000), vec![0, 1, 2]);
-        assert!(select_excerpts(&toks, &[3], 2, 5).is_empty());
     }
 
     #[test]

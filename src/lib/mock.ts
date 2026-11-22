@@ -844,6 +844,15 @@ async function stream(requestId: string, chunks: string[], delay: number): Promi
   emit(EV.llm, { requestId, delta: null, done: true, error: null });
 }
 
+/** Mimic the agent's tool steps before the answer streams. */
+async function agentSteps(requestId: string, labels: string[]): Promise<void> {
+  for (const status of labels) {
+    if (cancelledRequests.has(requestId)) return;
+    emit(EV.llm, { requestId, delta: null, done: false, error: null, status });
+    await sleep(450);
+  }
+}
+
 function wordChunks(text: string): string[] {
   return text.match(/\S+\s*|\s+/g) ?? [text];
 }
@@ -1286,16 +1295,12 @@ export const handlers: Record<string, Handler> = {
         .join("\n");
       existing.thread.compactedCount = folded.length;
     }
-    const condensed = !!s && (model?.contextLength ?? 128_000) < 64_000;
-    if (condensed) {
-      for (let i = 1; i <= 3; i++) {
-        status(`Condensing the long transcript for the model (${i}/3)…`);
-        await sleep(350);
-      }
-    }
-
     const spoken = attachments.find((a) => a.kind === "audio")?.text ?? "";
     const query = question || spoken || "summary";
+    await agentSteps(
+      requestId,
+      recordingId ? ["Reading the overview…", `Searching for “${shorten(query, 4)}”…`] : [`Searching for “${shorten(query, 4)}”…`],
+    );
     let answer: string;
     if (s) {
       answer = composeAnswer(s.segments, query, (seg) => `[${seg.id}]`, tagSegments([s], query));
@@ -1326,7 +1331,7 @@ export const handlers: Record<string, Handler> = {
       createdAt: nowIso(),
       model: settings.llmModel,
       attachments: [],
-      contextNote: condensed ? "The transcript was condensed to fit this model's context." : null,
+      contextNote: null,
     };
     t.messages.push(q, msg);
     t.thread.updatedAt = msg.createdAt;
@@ -1422,7 +1427,12 @@ export const handlers: Record<string, Handler> = {
     if (!s.segments.length) throw new Error("Transcribe the recording first.");
     const kind = docKindFromPrompt(prompt);
     const html = mockDocHtml(kind, 200 + Math.floor(Math.random() * 120));
-    await sleep(600);
+    const skill = optStr(args, "skill");
+    await agentSteps(requestId, [
+      ...(skill ? [] : [`Loading the ${kind} guide…`]),
+      "Reading the overview…",
+      "Reading the transcript…",
+    ]);
     await stream(requestId, sizedChunks(html, 160), 18);
     const doc: Doc = {
       id: uid("doc"),

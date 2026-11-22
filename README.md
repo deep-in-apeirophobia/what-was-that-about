@@ -69,13 +69,17 @@ video is ignored.
 ### AI features (optional, OpenRouter)
 
 Paste an [OpenRouter](https://openrouter.ai/keys) API key in **Settings** and pick a model.
+Ask and Docs need a model that supports tool calling; the model list only shows those.
 Cheap defaults: `deepseek/deepseek-v4-flash`, `openai/gpt-6-luna`, `anthropic/claude-haiku-5.5`.
 A one-hour recording is roughly 40k tokens, a fraction of a cent with these models.
 
 - **Analyze:** title, summary, key points, chapters, topic tags with the segments that discuss
   them, action items and suggested questions.
-- **Ask:** chat about one recording or the whole library; answers cite segments like `[12]`,
-  and clicking a citation plays that moment. Keep as many separate conversations as you like
+- **Ask:** chat about one recording or the whole library. The model looks things up instead
+  of getting every transcript pasted in: it can list recordings, search transcripts and notes,
+  read a recording's overview, its whole transcript or a range of segments, the user's notes
+  and earlier docs. The chat shows what it is reading. Answers cite segments like `[12]`, and
+  clicking a citation plays that moment. Keep as many separate conversations as you like
   (switch, rename or delete them from the bar above the chat). Attach images (picker, drag and
   drop onto the chat, or paste) and voice messages (record with the mic button or attach an
   audio file):
@@ -84,20 +88,22 @@ A one-hour recording is roughly 40k tokens, a fraction of a cent with these mode
     image is described by the newest OpenAI Luna model on OpenRouter (`openai/gpt-6-luna` if
     the model list can't be loaded), and the chat model gets that text.
 - **Long conversations and long recordings:** the app sizes every request to the model's
-  context window. When a conversation gets long, older messages are summarized and the
-  summary is sent instead of them (a divider in the chat marks the spot). When a transcript
-  doesn't fit, it's condensed section by section into notes that keep segment ids, so
-  citations still work; questions also get the verbatim passages most relevant to them.
-  Condensed notes are cached per recording and redone only for edited sections. Analyze and
-  Docs use the same condensed transcript.
+  context window (at most ~256k tokens). When a conversation gets long, older messages are
+  summarized and the summary is sent instead of them (a divider in the chat marks the spot);
+  while the model works, tool output it no longer needs is dropped. Ask and Docs read long
+  transcripts in parts. For Analyze, a transcript that doesn't fit is condensed section by
+  section into notes that keep segment ids, so citations still work; the notes are cached per
+  recording and redone only for edited sections.
 - **Fix transcript:** the model corrects recognition errors (misheard words, half-spaces,
   spelling, punctuation) and keeps the spoken style. The recognized text is kept: corrected
   words are highlighted (toggle in the transcript toolbar), hovering one shows what was heard,
   and a sentence or the whole transcript can be restored. Search, AI answers and exports use
   the corrected text; JSON exports also include the recognized text.
-- **Docs:** the model writes a self-contained HTML/JS page (mind map, timeline, flashcards,
-  quiz, minutes…) shown inside the app. Docs run in a sandboxed iframe on their own origin with
-  a Content-Security-Policy that blocks all network access; they can only read the transcript
+- **Docs:** the model loads a design guide for the kind of doc (mind map, timeline, flashcards,
+  quiz, minutes, glossary or a general report; see `crates/wwta-core/src/agent/skills`),
+  gathers the content with the same tools, and writes a self-contained HTML/JS page shown
+  inside the app. Docs run in a sandboxed iframe on their own origin with a
+  Content-Security-Policy that blocks all network access; they can only read the transcript
   through a small `window.WWTA` bridge and ask the player to seek.
 - **Semantic search:** optional embeddings (default `baai/bge-m3`) for meaning-based search and
   related sections.
@@ -195,7 +201,8 @@ pnpm test                 # UI logic
 ```
 crates/wwta-core     audio decode/resample (Symphonia), Silero VAD + engines (sherpa-onnx, whisper.cpp),
                      safetensors→GGML converter, model catalog/downloads, SQLite library, search,
-                     OpenRouter client and prompts, exports
+                     OpenRouter client, the Ask/Docs agent (tools, context compaction, doc guides),
+                     exports
 crates/wwta-cli      headless CLI (also the CI smoke test)
 src-tauri            Tauri v2 app: commands, transcription queue, wwta-doc:// protocol for docs
 src                  React 19 + TypeScript UI (Vite, Tailwind, wavesurfer.js, zustand)

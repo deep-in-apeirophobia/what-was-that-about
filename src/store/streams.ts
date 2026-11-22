@@ -30,10 +30,11 @@ export const useStreams = create<StreamsState>((set) => ({
         streams: {
           ...s.streams,
           [e.requestId]: {
-            text: cur.text + (e.delta ?? ""),
+            text: (e.reset ? "" : cur.text) + (e.delta ?? ""),
             done: cur.done || e.done,
             error: e.error ?? cur.error,
-            status: e.status ?? cur.status,
+            // a status shows until the answer text starts (or the next status)
+            status: e.status ?? (e.delta ? null : cur.status),
           },
         },
       };

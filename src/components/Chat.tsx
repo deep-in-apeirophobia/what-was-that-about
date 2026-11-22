@@ -217,13 +217,17 @@ function AssistantMessage({
       {content ? (
         <Markdown content={content} onCite={onCite} renderCite={renderCite} className="font-fa" />
       ) : (
-        <div className="flex items-center gap-2 py-1" aria-label="Thinking">
+        <div className="flex items-center gap-2 py-1" role="status" aria-label={status ?? "Thinking"}>
           <div className="flex items-center gap-1">
             {[0, 1, 2].map((i) => (
               <span key={i} className="size-1.5 animate-pulse rounded-full bg-faint" style={{ animationDelay: `${i * 150}ms` }} />
             ))}
           </div>
-          {status && <span className="text-[12px] text-muted">{status}</span>}
+          {status && (
+            <span className="truncate text-[12px] text-muted" dir="auto">
+              {status}
+            </span>
+          )}
         </div>
       )}
       {streaming && content && <span className="ml-0.5 inline-block h-3.5 w-1.5 animate-pulse bg-accent align-middle" />}
