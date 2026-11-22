@@ -6,7 +6,11 @@ import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AnalysisPart,
+  AskResult,
+  AttachmentUpload,
+  ChatAttachment,
   ChatMessage,
+  ChatThread,
   Doc,
   ExportFormat,
   LlmModelInfo,
@@ -152,12 +156,34 @@ export const api = {
     invoke<Analysis>("analyze", { id, parts }),
   /** Build the embedding index for semantic search. */
   indexEmbeddings: (id: string) => invoke<void>("index_embeddings", { id }),
-  /** Ask a question. Streams tokens on `llm://stream` with the given requestId,
-   *  resolves with the stored assistant message. `recordingId` null = ask the whole library. */
-  ask: (recordingId: string | null, question: string, requestId: string) =>
-    invoke<ChatMessage>("ask", { recordingId, question, requestId }),
-  clearChat: (recordingId: string | null) => invoke<void>("clear_chat", { recordingId }),
-  listLibraryChat: () => invoke<ChatMessage[]>("list_library_chat"),
+  /** Ask a question in a thread (`threadId` null starts a new one). Streams tokens and status
+   *  on `llm://stream` with the given requestId; resolves with the thread and both stored
+   *  messages. `recordingId` null = ask the whole library. */
+  ask: (recordingId: string | null, threadId: string | null, question: string, attachmentIds: string[], requestId: string) =>
+    invoke<AskResult>("ask", { recordingId, threadId, question, attachmentIds, requestId }),
+  /** Conversations of a recording (or the library when null), most recent first. */
+  listChatThreads: (recordingId: string | null) => invoke<ChatThread[]>("list_chat_threads", { recordingId }),
+  listChatMessages: (threadId: string) => invoke<ChatMessage[]>("list_chat_messages", { threadId }),
+  renameChatThread: (threadId: string, title: string) => invoke<ChatThread>("rename_chat_thread", { threadId, title }),
+  deleteChatThread: (threadId: string) => invoke<void>("delete_chat_thread", { threadId }),
+  /** Attach an image or audio file from disk to the message being written. */
+  addChatAttachmentFile: (path: string) => invoke<AttachmentUpload>("add_chat_attachment_file", { path }),
+  /** Attach image bytes (PNG, JPEG, WebP or GIF). */
+  addChatImage: (bytes: Uint8Array, name: string) =>
+    isTauri()
+      ? tauriInvoke<ChatAttachment>("add_chat_attachment", bytes, {
+          headers: { "x-kind": "image", "x-name": encodeURIComponent(name) },
+        })
+      : invoke<ChatAttachment>("add_chat_attachment", { kind: "image", name, bytes }),
+  /** Attach a voice clip as mono float32 samples. */
+  addChatAudio: (samples: Float32Array, sampleRate: number, name: string) =>
+    isTauri()
+      ? tauriInvoke<ChatAttachment>("add_chat_attachment", new Uint8Array(samples.buffer, samples.byteOffset, samples.byteLength), {
+          headers: { "x-kind": "audio", "x-name": encodeURIComponent(name), "x-sample-rate": String(sampleRate) },
+        })
+      : invoke<ChatAttachment>("add_chat_attachment", { kind: "audio", name, samples, sampleRate }),
+  /** Drop an attachment that wasn't sent. */
+  discardChatAttachment: (id: string) => invoke<void>("discard_chat_attachment", { id }),
   /** Generate an interactive HTML doc. Streams on `llm://stream`. */
   generateDoc: (id: string, prompt: string, requestId: string) =>
     invoke<Doc>("generate_doc", { id, prompt, requestId }),

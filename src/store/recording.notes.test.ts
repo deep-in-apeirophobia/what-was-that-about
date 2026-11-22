@@ -39,7 +39,7 @@ const base: Note = {
 function open(notes: Note[] = [base]) {
   useRecording.setState({
     id: "r1",
-    detail: { notes, segments: [], docs: [], chat: [], analysis: null } as unknown as RecordingDetail,
+    detail: { notes, segments: [], docs: [], threads: [], analysis: null } as unknown as RecordingDetail,
     noteDraft: null,
     noteEditor: null,
   });

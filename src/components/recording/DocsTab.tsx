@@ -70,6 +70,7 @@ const TEMPLATES: { key: string; label: string; icon: ReactNode; prompt: string }
 
 function GeneratingCard({ requestId, prompt }: { requestId: string; prompt: string }) {
   const len = useStreams((s) => s.streams[requestId]?.text.length ?? 0);
+  const status = useStreams((s) => s.streams[requestId]?.status ?? null);
   return (
     <div className="rounded-xl border border-accent/25 bg-accent-soft/30 p-3">
       <div className="flex items-center gap-2 text-[13px] font-medium">
@@ -80,6 +81,7 @@ function GeneratingCard({ requestId, prompt }: { requestId: string; prompt: stri
       <p className="mt-1 line-clamp-2 text-[12px] text-muted" dir="auto">
         {prompt}
       </p>
+      {status && len === 0 && <p className="mt-1 text-[11.5px] text-faint">{status}</p>}
       <ProgressBar className="mt-2.5" label="Generating doc" />
       <div className="mt-2 flex justify-end">
         <Button size="sm" onClick={() => stopLlm(requestId)}>

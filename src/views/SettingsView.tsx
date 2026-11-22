@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import clsx from "clsx";
-import { Check, Eye, EyeOff, Loader2, RefreshCw, Search } from "lucide-react";
+import { AudioLines, Check, Eye, EyeOff, ImageIcon, Loader2, RefreshCw, Search } from "lucide-react";
 import { api } from "../lib/api";
 import { errorMessage } from "../lib/errors";
 import { formatPrice } from "../lib/format";
@@ -117,6 +117,15 @@ function ApiKeyField({ value, onSave }: { value: string; onSave: (v: string) => 
   );
 }
 
+/** How Ask treats images and voice messages with this model. */
+function attachmentHint(m: LlmModelInfo): string {
+  const image = m.inputModalities?.includes("image");
+  const audio = m.inputModalities?.includes("audio");
+  const img = image ? "sees attached images itself" : "gets descriptions of attached images (by the newest OpenAI Luna)";
+  const voice = audio ? "hears voice messages itself" : "gets voice messages transcribed by your speech model";
+  return `In Ask, ${m.name} ${img} and ${voice}.`;
+}
+
 function LlmPicker({ value, onChange }: { value: string; onChange: (id: string) => void }) {
   const [models, setModels] = useState<LlmModelInfo[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -168,6 +177,8 @@ function LlmPicker({ value, onChange }: { value: string; onChange: (id: string) 
         })}
       </div>
 
+      {byId(value) && <p className="text-[11.5px] text-faint">{attachmentHint(byId(value)!)}</p>}
+
       <div className="overflow-hidden rounded-lg border border-line">
         <div className="relative border-b border-line">
           <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-faint" />
@@ -208,7 +219,15 @@ function LlmPicker({ value, onChange }: { value: string; onChange: (id: string) 
               >
                 <Check className={clsx("size-3.5 shrink-0 text-accent", m.id !== value && "invisible")} />
                 <span className="min-w-0 flex-1">
-                  <span className="block truncate font-medium">{m.name}</span>
+                  <span className="flex items-center gap-1.5">
+                    <span className="truncate font-medium">{m.name}</span>
+                    {m.inputModalities?.includes("image") && (
+                      <ImageIcon className="size-3 shrink-0 text-faint" aria-label="Accepts images" />
+                    )}
+                    {m.inputModalities?.includes("audio") && (
+                      <AudioLines className="size-3 shrink-0 text-faint" aria-label="Accepts audio" />
+                    )}
+                  </span>
                   <span className="block truncate font-mono text-[11px] text-faint">{m.id}</span>
                 </span>
                 <span className="shrink-0 text-right text-[11.5px] text-muted tabular-nums">

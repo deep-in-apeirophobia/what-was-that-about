@@ -2,6 +2,7 @@
 
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { isTauri } from "./api";
+import { IMAGE_EXTENSIONS, VOICE_EXTENSIONS } from "./attachments";
 import type { ExportFormat } from "./types";
 
 export const AUDIO_EXTENSIONS = [
@@ -25,6 +26,21 @@ export function mediaUrl(path: string | null | undefined): string | null {
   return convertFileSrc(path);
 }
 
+/** WebKitGTK (Linux) can't load <audio> or <img> from Tauri's asset:// scheme (fetch works),
+ *  so there files are loaded into blob URLs instead. */
+export const ASSET_NEEDS_BLOB =
+  isTauri() && typeof navigator !== "undefined" && /Linux/i.test(navigator.userAgent) && !/Android/i.test(navigator.userAgent);
+
+/** URL an <audio> element can play for a file on disk. Blob URLs it returns must be revoked. */
+export async function playableUrl(path: string): Promise<string> {
+  const url = mediaUrl(path);
+  if (!url) throw new Error("No playable file was produced.");
+  if (!ASSET_NEEDS_BLOB || url.startsWith("blob:") || url.startsWith("data:")) return url;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Couldn't read the audio file (HTTP ${res.status}).`);
+  return URL.createObjectURL(await res.blob());
+}
+
 export function newRequestId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
   return `req-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
@@ -36,24 +52,51 @@ export function fileName(path: string): string {
 }
 
 /** Browser-only file picker for the mock. Must be called synchronously from a click. */
-function browserPick(accept: string, multiple: boolean, dir: string): Promise<string[]> {
+function browserPickFiles(accept: string, multiple: boolean): Promise<File[]> {
   return new Promise((resolve) => {
     const input = document.createElement("input");
     input.type = "file";
     input.multiple = multiple;
     if (accept) input.accept = accept;
     input.style.display = "none";
-    const done = (paths: string[]) => {
+    const done = (files: File[]) => {
       input.remove();
-      resolve(paths);
+      resolve(files);
     };
-    input.addEventListener("change", () => {
-      done(Array.from(input.files ?? []).map((f) => `${dir}/${f.name}`));
-    });
+    input.addEventListener("change", () => done(Array.from(input.files ?? [])));
     input.addEventListener("cancel", () => done([]));
     document.body.appendChild(input);
     input.click();
   });
+}
+
+function browserPick(accept: string, multiple: boolean, dir: string): Promise<string[]> {
+  return browserPickFiles(accept, multiple).then((files) => files.map((f) => `${dir}/${f.name}`));
+}
+
+/** Files picked for an Ask message: paths in the app, File objects in the browser mock. */
+export interface PickedFiles {
+  paths: string[];
+  files: File[];
+}
+
+/** Open the system picker for images and audio to attach to a question. */
+export async function pickChatFiles(): Promise<PickedFiles> {
+  if (!isTauri()) {
+    const files = await browserPickFiles("image/*,audio/*", true);
+    return { paths: [], files };
+  }
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const res = await open({
+    multiple: true,
+    title: "Attach images or audio",
+    filters: [
+      { name: "Images and audio", extensions: [...IMAGE_EXTENSIONS, ...VOICE_EXTENSIONS] },
+      { name: "Images", extensions: IMAGE_EXTENSIONS },
+      { name: "Audio", extensions: VOICE_EXTENSIONS },
+    ],
+  });
+  return { paths: res ?? [], files: [] };
 }
 
 /** Open the system picker for audio/video files. Returns absolute paths ([] on cancel). */
@@ -110,7 +153,11 @@ export async function openExternal(url: string): Promise<void> {
   await openUrl(url);
 }
 
-export type DropEvent = { type: "enter" | "leave" } | { type: "drop"; paths: string[] };
+/** Positions are CSS pixels in the window. `files` is only set in the browser mock. */
+export type DropEvent =
+  | { type: "enter" | "leave" }
+  | { type: "over"; x: number; y: number }
+  | { type: "drop"; paths: string[]; files: File[]; x: number; y: number };
 
 /**
  * Listen for files dragged onto the window. In Tauri this uses the webview's native
@@ -119,11 +166,14 @@ export type DropEvent = { type: "enter" | "leave" } | { type: "drop"; paths: str
 export async function listenFileDrop(cb: (e: DropEvent) => void): Promise<() => void> {
   if (isTauri()) {
     const { getCurrentWebview } = await import("@tauri-apps/api/webview");
+    const css = (v: number) => v / (window.devicePixelRatio || 1);
     return getCurrentWebview().onDragDropEvent((event) => {
       const p = event.payload;
       if (p.type === "enter") cb({ type: "enter" });
       else if (p.type === "leave") cb({ type: "leave" });
-      else if (p.type === "drop") cb({ type: "drop", paths: p.paths });
+      else if (p.type === "over") cb({ type: "over", x: css(p.position.x), y: css(p.position.y) });
+      else if (p.type === "drop")
+        cb({ type: "drop", paths: p.paths, files: [], x: css(p.position.x), y: css(p.position.y) });
     });
   }
   let depth = 0;
@@ -134,7 +184,9 @@ export async function listenFileDrop(cb: (e: DropEvent) => void): Promise<() => 
     if (depth++ === 0) cb({ type: "enter" });
   };
   const onOver = (e: DragEvent) => {
-    if (hasFiles(e)) e.preventDefault();
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    cb({ type: "over", x: e.clientX, y: e.clientY });
   };
   const onLeave = (e: DragEvent) => {
     if (!hasFiles(e)) return;
@@ -147,8 +199,9 @@ export async function listenFileDrop(cb: (e: DropEvent) => void): Promise<() => 
     if (!hasFiles(e)) return;
     e.preventDefault();
     depth = 0;
-    const paths = Array.from(e.dataTransfer?.files ?? []).map((f) => `/home/you/Recordings/${f.name}`);
-    cb({ type: "drop", paths });
+    const files = Array.from(e.dataTransfer?.files ?? []);
+    const paths = files.map((f) => `/home/you/Recordings/${f.name}`);
+    cb({ type: "drop", paths, files, x: e.clientX, y: e.clientY });
   };
   window.addEventListener("dragenter", onEnter);
   window.addEventListener("dragover", onOver);
