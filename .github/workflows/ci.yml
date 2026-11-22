@@ -74,6 +74,9 @@ jobs:
       GGML_NATIVE: "OFF"
       # Match bundle.macOS.minimumSystemVersion so the CLI and `tauri build` share one native build.
       MACOSX_DEPLOYMENT_TARGET: "11.0"
+      # Line tables for Sentry symbolication (split into .pdb / .dSYM on Windows / macOS).
+      CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+      CARGO_PROFILE_RELEASE_STRIP: none
     steps:
       - uses: actions/checkout@v7
 
@@ -109,6 +112,15 @@ jobs:
 
       - name: Build desktop app
         run: pnpm tauri build
+        env:
+          # Lets the Vite build upload source maps to Sentry (skipped when empty).
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+
+      - name: Upload debug symbols to Sentry
+        continue-on-error: true
+        uses: ./.github/actions/sentry-symbols
+        with:
+          auth-token: ${{ secrets.SENTRY_AUTH_TOKEN }}
 
       - name: Collect artifacts
         shell: bash

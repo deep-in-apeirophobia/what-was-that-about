@@ -5,7 +5,6 @@ import { PENDING_NOTE_PREFIX, compareNotes, notePreview, upsertNote } from "../l
 import { mergeSegments } from "../lib/segments";
 import type {
   Analysis,
-  ChatMessage,
   Doc,
   Note,
   NoteColor,
@@ -20,7 +19,16 @@ import { attempt, toast } from "./toasts";
 export type PanelTab = "overview" | "notes" | "topics" | "ask" | "docs" | "related";
 
 const LS_FONT = "wwta.transcriptFontSize";
+const LS_HIGHLIGHT_FIXES = "wwta.highlightFixes";
 export const FONT_SIZES = [15, 17, 19, 21, 24, 28] as const;
+
+function readHighlightFixes(): boolean {
+  try {
+    return localStorage.getItem(LS_HIGHLIGHT_FIXES) !== "0";
+  } catch {
+    return true;
+  }
+}
 
 function readFont(): number {
   try {
@@ -36,11 +44,6 @@ export interface RelatedState {
   text: string;
   hits: SearchHit[] | null;
   error: string | null;
-}
-
-export interface PendingAsk {
-  requestId: string;
-  question: string;
 }
 
 /** A note being written. */
@@ -77,7 +80,8 @@ interface RecordingState {
   related: RelatedState | null;
   findOpen: boolean;
   fontSize: number;
-  pendingAsk: PendingAsk | null;
+  /** Mark the words an AI fix changed in the transcript. */
+  highlightFixes: boolean;
   /** In-flight doc generation (new doc) for the Docs tab. */
   pendingDoc: { requestId: string; prompt: string } | null;
   /** Ask the transcript to scroll to (and briefly flash) a segment. */
@@ -95,18 +99,19 @@ interface RecordingState {
   applyRecording: (r: Recording) => void;
   appendSegments: (recordingId: string, segs: Segment[]) => void;
   replaceSegment: (seg: Segment) => void;
+  /** Replace sentences of the open recording that are already shown (AI fixes, reverts).
+   *  The backend drops the semantic index when that happens, so it's marked as gone. */
+  updateSegments: (recordingId: string, segs: Segment[]) => void;
   setAnalysis: (a: Analysis) => void;
   setEmbeddingsIndexed: (v: boolean) => void;
   upsertDoc: (doc: Doc) => void;
   removeDoc: (docId: string) => void;
-  appendChat: (...msgs: ChatMessage[]) => void;
-  clearChat: () => void;
   setTab: (tab: PanelTab) => void;
   selectTag: (tag: string | null) => void;
   findRelated: (seg: Segment) => Promise<void>;
   setFindOpen: (open: boolean) => void;
   setFontSize: (size: number) => void;
-  setPendingAsk: (p: PendingAsk | null) => void;
+  setHighlightFixes: (on: boolean) => void;
   setPendingDoc: (p: { requestId: string; prompt: string } | null) => void;
   revealSegment: (segmentId: number) => void;
 
@@ -127,6 +132,8 @@ interface RecordingState {
 }
 
 let revealNonce = 0;
+/** Bumped per `reload`, so a slower, older response can't overwrite a newer one. */
+let reloadSeq = 0;
 let pendingNoteSeq = 0;
 
 export const useRecording = create<RecordingState>((set, get) => ({
@@ -141,7 +148,7 @@ export const useRecording = create<RecordingState>((set, get) => ({
   related: null,
   findOpen: false,
   fontSize: readFont(),
-  pendingAsk: null,
+  highlightFixes: readHighlightFixes(),
   pendingDoc: null,
   reveal: null,
   noteDraft: null,
@@ -160,7 +167,6 @@ export const useRecording = create<RecordingState>((set, get) => ({
       selectedTag: null,
       related: null,
       findOpen: false,
-      pendingAsk: null,
       pendingDoc: null,
       reveal: null,
       noteDraft: null,
@@ -177,13 +183,15 @@ export const useRecording = create<RecordingState>((set, get) => ({
   reload: async () => {
     const id = get().id;
     if (!id) return;
+    const seq = ++reloadSeq;
+    const current = () => get().id === id && seq === reloadSeq;
     try {
       const detail = await api.getRecording(id);
-      if (get().id !== id) return;
+      if (!current()) return;
       const notes = [...(detail.notes ?? [])].sort(compareNotes);
       set({ detail: { ...detail, notes }, loading: false, error: null });
     } catch (e) {
-      if (get().id !== id) return;
+      if (!current()) return;
       set({ loading: false, error: errorMessage(e) });
     }
   },
@@ -232,6 +240,14 @@ export const useRecording = create<RecordingState>((set, get) => ({
     set({ detail: { ...detail, segments: detail.segments.map((s) => (s.id === seg.id ? seg : s)) } });
   },
 
+  updateSegments: (recordingId, segs) => {
+    const { id, detail } = get();
+    if (id !== recordingId || !detail || !segs.length) return;
+    const byId = new Map(segs.map((s) => [s.id, s]));
+    if (!detail.segments.some((s) => byId.has(s.id))) return;
+    set({ detail: { ...detail, segments: detail.segments.map((s) => byId.get(s.id) ?? s), embeddingsIndexed: false } });
+  },
+
   setAnalysis: (analysis) => {
     const { detail } = get();
     if (detail) set({ detail: { ...detail, analysis } });
@@ -254,16 +270,6 @@ export const useRecording = create<RecordingState>((set, get) => ({
   removeDoc: (docId) => {
     const { detail } = get();
     if (detail) set({ detail: { ...detail, docs: detail.docs.filter((d) => d.id !== docId) } });
-  },
-
-  appendChat: (...msgs) => {
-    const { detail } = get();
-    if (detail) set({ detail: { ...detail, chat: [...detail.chat, ...msgs] } });
-  },
-
-  clearChat: () => {
-    const { detail } = get();
-    if (detail) set({ detail: { ...detail, chat: [] } });
   },
 
   setTab: (tab) => set({ tab }),
@@ -291,7 +297,14 @@ export const useRecording = create<RecordingState>((set, get) => ({
     }
     set({ fontSize });
   },
-  setPendingAsk: (pendingAsk) => set({ pendingAsk }),
+  setHighlightFixes: (highlightFixes) => {
+    try {
+      localStorage.setItem(LS_HIGHLIGHT_FIXES, highlightFixes ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+    set({ highlightFixes });
+  },
   setPendingDoc: (pendingDoc) => set({ pendingDoc }),
   revealSegment: (segmentId) => set({ reveal: { segmentId, nonce: ++revealNonce } }),
 

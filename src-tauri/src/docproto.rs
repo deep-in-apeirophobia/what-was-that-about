@@ -70,6 +70,11 @@ fn respond(status: StatusCode, body: String) -> Response<Cow<'static, [u8]>> {
         .status(status)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .header("Content-Security-Policy", DOC_CSP)
+        // the app grants microphone access (voice messages); generated docs never get it
+        .header(
+            "Permissions-Policy",
+            "microphone=(), camera=(), geolocation=(), display-capture=()",
+        )
         .header("X-Content-Type-Options", "nosniff")
         .header("Cache-Control", "no-store")
         .body(Cow::Owned(body.into_bytes()))

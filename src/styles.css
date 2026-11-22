@@ -32,6 +32,7 @@
   --active-row: #eef0ff;
   --mark: #fde68a;
   --mark-current: #f59e0b;
+  --fix: #0e8a9a;
   --wave: #c9c8c2;
   --wave-progress: #5b5bd6;
   /* Note colors (markers, pins, card tints). */
@@ -69,6 +70,7 @@
   --active-row: #22233f;
   --mark: #6b5310;
   --mark-current: #b7791f;
+  --fix: #3cc4d4;
   --wave: #3c3c45;
   --wave-progress: #8080f2;
   --note-default: #74747f;
@@ -220,6 +222,36 @@ mark.find-hit {
 mark.find-hit[data-current="true"] {
   background: var(--mark-current);
   color: #fff;
+}
+
+/* Words changed by the AI transcript fix; hovering shows what was heard. */
+mark.fix-hit {
+  background: color-mix(in srgb, var(--fix) 13%, transparent);
+  box-shadow: inset 0 -1.5px 0 color-mix(in srgb, var(--fix) 75%, transparent);
+  color: inherit;
+  border-radius: 2px;
+}
+/* Punctuation-only fixes: underline only, with a little extra room to hover. */
+mark.fix-hit.fix-minor {
+  background: none;
+  padding-inline: 2px;
+  margin-inline: -2px;
+}
+/* Where the fix removed words: a thin bar with a wider hover area. */
+mark.fix-removed {
+  display: inline-block;
+  box-sizing: content-box;
+  width: 2px;
+  height: 1.1em;
+  padding-inline: 3px;
+  margin-inline: -1px;
+  vertical-align: -0.2em;
+  background: var(--fix);
+  background-clip: content-box;
+  opacity: 0.7;
+}
+mark.fix-removed.fix-minor {
+  opacity: 0.4;
 }
 
 @media (prefers-reduced-motion: reduce) {

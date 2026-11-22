@@ -6730,6 +6730,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dirs",
+ "futures-util",
+ "gtk",
  "log",
  "regex",
  "sentry",
@@ -6743,6 +6745,7 @@ dependencies = [
  "tauri-plugin-sentry",
  "tokio",
  "uuid",
+ "webkit2gtk",
  "wwta-core",
 ]
 
@@ -7195,6 +7198,7 @@ name = "wwta-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "futures-util",
  "half",

@@ -137,6 +137,7 @@ mod tests {
             end: 3.0,
             text: "سلام".into(),
             words: vec![],
+            original_text: None,
         }];
         let note = Note {
             id: "n".into(),
@@ -163,6 +164,7 @@ mod tests {
             end: 3725.25,
             text: "سلام".into(),
             words: vec![],
+            original_text: None,
         }];
         assert_eq!(srt(&segs), "1\n00:00:01,500 --> 01:02:05,250\nسلام\n\n");
         assert!(vtt(&segs).starts_with("WEBVTT\n\n00:00:01.500 --> 01:02:05.250"));

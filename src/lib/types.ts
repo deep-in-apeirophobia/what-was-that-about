@@ -107,6 +107,8 @@ export interface Segment {
   text: string;
   /** Word timings when the engine provides them. */
   words: Word[];
+  /** What speech recognition produced, when an AI fix changed `text`. */
+  originalText?: string | null;
 }
 
 export interface Chapter {
@@ -144,13 +146,60 @@ export interface ChatMessage {
   id: string;
   /** null = library-wide conversation */
   recordingId: string | null;
+  threadId: string;
   role: "user" | "assistant";
   /** Markdown. Citations look like [12] or [12-15] (segment ids), or
-   *  [rec:<recordingId>#12] in library-wide chats. */
+   *  [rec:<recordingId>#12] in library-wide chats. May be empty when only files were sent. */
   content: string;
   createdAt: string;
   model: string | null;
+  /** Images and voice clips sent with a user message. */
+  attachments: ChatAttachment[];
+  /** Set on answers whose context had to be reduced (e.g. a condensed transcript). */
+  contextNote: string | null;
 }
+
+/** An image or voice clip attached to a chat message (stored in the app's data dir). */
+export interface ChatAttachment {
+  id: string;
+  kind: "image" | "audio";
+  name: string;
+  mime: string;
+  sizeBytes: number;
+  durationSec: number | null;
+  path: string;
+  /** Text stand-in for models that can't take the file: a voice transcript or an image
+   *  description, made the first time such a model needs it. */
+  text: string | null;
+  /** Model that produced `text` (a speech model id or an OpenRouter model id). */
+  textModel: string | null;
+}
+
+/** One conversation in an Ask view. */
+export interface ChatThread {
+  id: string;
+  /** null = Ask your library */
+  recordingId: string | null;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  messageCount: number;
+  /** Summary of the first `compactedCount` messages, which the model gets instead of them. */
+  summary: string | null;
+  compactedCount: number;
+}
+
+export interface AskResult {
+  thread: ChatThread;
+  question: ChatMessage;
+  answer: ChatMessage;
+}
+
+/** Result of attaching a file from disk. "convert": the webview must decode the audio /
+ *  shrink the image itself and upload the result (the path is readable via mediaUrl). */
+export type AttachmentUpload =
+  | { status: "ready"; attachment: ChatAttachment }
+  | { status: "convert"; path: string; kind: "image" | "audio" };
 
 export interface Doc {
   id: string;
@@ -193,7 +242,8 @@ export interface RecordingDetail {
   notes: Note[];
   analysis: Analysis | null;
   docs: Doc[];
-  chat: ChatMessage[];
+  /** Ask conversations about this recording, most recent first. */
+  threads: ChatThread[];
   /** True when semantic (embedding) search is available for this recording. */
   embeddingsIndexed: boolean;
 }
@@ -224,6 +274,26 @@ export interface TranscriptionProgress {
   message: string | null;
   /** Newly finalized segments since the last event (live preview). */
   newSegments: Segment[];
+}
+
+/** Event `transcript://fix-progress` — one batch of an AI transcript fix finished. */
+export interface FixProgress {
+  recordingId: string;
+  /** Batches finished (including failed ones) out of `total`. */
+  done: number;
+  total: number;
+  /** Segments this batch changed, with `originalText` set. */
+  changed: Segment[];
+}
+
+export interface FixSummary {
+  /** Sentences whose text changed. */
+  changed: number;
+  batches: number;
+  /** Batches that failed; their sentences were left as they were. */
+  failed: number;
+  /** The first failure, when some batches failed. */
+  error: string | null;
 }
 
 export interface SearchHit {
@@ -306,6 +376,10 @@ export interface LlmModelInfo {
   /** USD per 1M tokens */
   promptPrice: number | null;
   completionPrice: number | null;
+  /** "text", "image", "audio", "file"… */
+  inputModalities: string[];
+  /** Unix seconds when OpenRouter added the model. */
+  created: number | null;
 }
 
 export type AnalysisPart = "summary" | "chapters" | "tags";
@@ -316,8 +390,9 @@ export interface LlmStreamEvent {
   delta: string | null;
   done: boolean;
   error: string | null;
-  /** What the agent is doing, e.g. "Reading the transcript". */
-  activity?: string | null;
+  /** What the request is doing before the answer streams ("Transcribing the voice message…",
+   *  "Reading the transcript…"). */
+  status?: string | null;
   /** Discard the text streamed so far: it was the model's preface to tool calls. */
   reset?: boolean;
 }

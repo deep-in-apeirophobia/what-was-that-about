@@ -141,6 +141,9 @@ pub struct Segment {
     pub text: String,
     #[serde(default)]
     pub words: Vec<Word>,
+    /// The speech recognizer's text, kept when an AI fix changed `text`; None otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -198,10 +201,76 @@ pub struct Analysis {
 pub struct ChatMessage {
     pub id: String,
     pub recording_id: Option<String>,
+    #[serde(default)]
+    pub thread_id: String,
     pub role: String,
     pub content: String,
     pub created_at: String,
     pub model: Option<String>,
+    /// Images and voice clips sent with a user message.
+    #[serde(default)]
+    pub attachments: Vec<ChatAttachment>,
+    /// Set on answers whose context had to be reduced, e.g. "condensed transcript".
+    #[serde(default)]
+    pub context_note: Option<String>,
+}
+
+/// An image or voice clip attached to a chat message. Files live in the app's data dir.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatAttachment {
+    pub id: String,
+    /// "image" | "audio"
+    pub kind: String,
+    pub name: String,
+    pub mime: String,
+    pub size_bytes: u64,
+    pub duration_sec: Option<f64>,
+    pub path: String,
+    /// Text stand-in for models that can't take this input: the transcript of a voice clip or a
+    /// description of an image. Filled the first time such a model needs it.
+    pub text: Option<String>,
+    /// Model that produced `text` (a speech model id or an OpenRouter model id).
+    pub text_model: Option<String>,
+}
+
+/// Result of attaching a file from disk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum AttachmentUpload {
+    Ready {
+        attachment: ChatAttachment,
+    },
+    /// The webview has to convert the file first (decode audio the native decoder can't
+    /// read, shrink a large image) and send the result as raw bytes.
+    Convert {
+        path: String,
+        kind: String,
+    },
+}
+
+/// One conversation in the Ask panel (per recording) or Ask your library (`recording_id` None).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatThread {
+    pub id: String,
+    pub recording_id: Option<String>,
+    pub title: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub message_count: u32,
+    /// Summary of the first `compacted_count` messages; the model gets it instead of them.
+    pub summary: Option<String>,
+    pub compacted_count: u32,
+}
+
+/// Result of a question: the (possibly new) thread and the two stored messages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AskResult {
+    pub thread: ChatThread,
+    pub question: ChatMessage,
+    pub answer: ChatMessage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,7 +321,8 @@ pub struct RecordingDetail {
     pub notes: Vec<Note>,
     pub analysis: Option<Analysis>,
     pub docs: Vec<Doc>,
-    pub chat: Vec<ChatMessage>,
+    /// Ask conversations about this recording, most recent first.
+    pub threads: Vec<ChatThread>,
     pub embeddings_indexed: bool,
 }
 
@@ -285,6 +355,31 @@ pub struct TranscriptionProgress {
     pub progress: f32,
     pub message: Option<String>,
     pub new_segments: Vec<Segment>,
+}
+
+/// Event `transcript://fix-progress`: one batch of an AI transcript fix finished.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FixProgress {
+    pub recording_id: String,
+    /// Batches finished (including failed ones) out of `total`.
+    pub done: u32,
+    pub total: u32,
+    /// Segments this batch changed, with `original_text` set.
+    pub changed: Vec<Segment>,
+}
+
+/// Outcome of an AI transcript fix.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FixSummary {
+    /// Sentences whose text changed.
+    pub changed: u32,
+    pub batches: u32,
+    /// Batches that failed; their sentences were left as they were.
+    pub failed: u32,
+    /// The first failure, when some batches failed.
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -409,6 +504,21 @@ pub struct LlmModelInfo {
     pub context_length: Option<u64>,
     pub prompt_price: Option<f64>,
     pub completion_price: Option<f64>,
+    /// "text", "image", "audio", "file"… as reported by OpenRouter.
+    #[serde(default)]
+    pub input_modalities: Vec<String>,
+    /// Unix seconds when OpenRouter added the model.
+    #[serde(default)]
+    pub created: Option<u64>,
+    /// Takes tool definitions, which Ask and Docs need.
+    #[serde(default)]
+    pub tools: bool,
+}
+
+impl LlmModelInfo {
+    pub fn accepts(&self, modality: &str) -> bool {
+        self.input_modalities.iter().any(|m| m == modality)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -418,9 +528,10 @@ pub struct LlmStreamEvent {
     pub delta: Option<String>,
     pub done: bool,
     pub error: Option<String>,
-    /// What the agent is doing, e.g. "Reading the transcript".
-    #[serde(default)]
-    pub activity: Option<String>,
+    /// What the request is doing before the answer streams ("Transcribing the voice message…",
+    /// "Reading the transcript").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
     /// Discard the text streamed so far: it was the model's preface to tool calls.
     #[serde(default)]
     pub reset: bool,

@@ -53,8 +53,14 @@ export async function decodeForTranscription(
   onStage("fetching");
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Could not read the file (HTTP ${res.status}).`);
-  const bytes = await res.arrayBuffer();
+  return decodeBytesForTranscription(await res.arrayBuffer(), onStage);
+}
 
+/** Decode file bytes with Web Audio, downmix to mono and resample to 16 kHz. */
+export async function decodeBytesForTranscription(
+  bytes: ArrayBuffer,
+  onStage: (stage: DecodeStage) => void = () => {},
+): Promise<Float32Array> {
   onStage("decoding");
   const Ctor = getAudioContextCtor();
   if (!Ctor) throw new Error("This webview has no Web Audio support.");
@@ -75,7 +81,7 @@ export async function decodeForTranscription(
   return resampleTo16k(mono, decoded.sampleRate);
 }
 
-async function resampleTo16k(mono: Float32Array, fromRate: number): Promise<Float32Array> {
+export async function resampleTo16k(mono: Float32Array, fromRate: number): Promise<Float32Array> {
   const target = TRANSCRIPTION_SAMPLE_RATE;
   if (fromRate === target) return mono;
   if (typeof OfflineAudioContext === "undefined") return resampleLinear(mono, fromRate, target);

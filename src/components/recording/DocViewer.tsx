@@ -80,6 +80,7 @@ export function DocFrame({ doc, title, onEscape }: { doc: Doc; title: string; on
       ref={frame}
       title={title}
       sandbox="allow-scripts"
+      allow="microphone 'none'; camera 'none'; geolocation 'none'; display-capture 'none'"
       referrerPolicy="no-referrer"
       {...(src ? { src } : { srcDoc: srcdoc })}
       // Inside an iframe, prefers-color-scheme follows the frame's color-scheme, so docs
@@ -108,7 +109,7 @@ export function DocViewer({ doc, onClose }: { doc: Doc; onClose: () => void }) {
   const [revising, setRevising] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const streamLen = useStreams((s) => (revising ? (s.streams[revising]?.text.length ?? 0) : 0));
-  const activity = useStreams((s) => (revising ? (s.streams[revising]?.activity ?? null) : null));
+  const status = useStreams((s) => (revising ? (s.streams[revising]?.status ?? null) : null));
 
   const revise = async () => {
     const text = instruction.trim();
@@ -196,9 +197,9 @@ export function DocViewer({ doc, onClose }: { doc: Doc; onClose: () => void }) {
                 {streamLen > 0 ? (
                   <span className="text-muted tabular-nums">{formatBytes(streamLen)}</span>
                 ) : (
-                  activity && (
+                  status && (
                     <span className="text-muted" dir="auto">
-                      {activity}
+                      {status}
                     </span>
                   )
                 )}

@@ -6,9 +6,15 @@ import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AnalysisPart,
+  AskResult,
+  AttachmentUpload,
+  ChatAttachment,
   ChatMessage,
+  ChatThread,
   Doc,
   ExportFormat,
+  FixProgress,
+  FixSummary,
   LlmModelInfo,
   LlmStreamEvent,
   ModelInfo,
@@ -61,6 +67,7 @@ export const EVENTS = {
   modelProgress: "model://progress",
   transcriptionProgress: "transcription://progress",
   llmStream: "llm://stream",
+  transcriptFix: "transcript://fix-progress",
   /** Payload: Recording — emitted whenever a recording row changes. */
   recordingUpdated: "library://recording-updated",
   /** Payload: string (recording id) */
@@ -71,6 +78,7 @@ export const onModelProgress = (cb: (p: ModelProgress) => void) => listen(EVENTS
 export const onTranscriptionProgress = (cb: (p: TranscriptionProgress) => void) =>
   listen(EVENTS.transcriptionProgress, cb);
 export const onLlmStream = (cb: (p: LlmStreamEvent) => void) => listen(EVENTS.llmStream, cb);
+export const onFixProgress = (cb: (p: FixProgress) => void) => listen(EVENTS.transcriptFix, cb);
 export const onRecordingUpdated = (cb: (r: Recording) => void) => listen(EVENTS.recordingUpdated, cb);
 export const onRecordingDeleted = (cb: (id: string) => void) => listen(EVENTS.recordingDeleted, cb);
 
@@ -150,14 +158,45 @@ export const api = {
   testApiKey: (apiKey: string) => invoke<string>("test_api_key", { apiKey }),
   analyze: (id: string, parts: AnalysisPart[] = ["summary", "chapters", "tags"]) =>
     invoke<Analysis>("analyze", { id, parts }),
+  /** Correct recognition errors with the AI model, keeping the recognized text in
+   *  `originalText`. Each finished batch arrives on `transcript://fix-progress`. */
+  fixTranscript: (id: string) => invoke<FixSummary>("fix_transcript", { id }),
+  /** Stop a running fix; corrections already saved are kept. */
+  cancelFixTranscript: (id: string) => invoke<void>("cancel_llm", { requestId: `fix:${id}` }),
+  /** Put back the recognized text of AI-fixed sentences (`segmentIds` null = all).
+   *  Returns the sentences that changed. */
+  revertTranscriptFixes: (id: string, segmentIds: number[] | null) =>
+    invoke<Segment[]>("revert_transcript_fixes", { id, segmentIds }),
   /** Build the embedding index for semantic search. */
   indexEmbeddings: (id: string) => invoke<void>("index_embeddings", { id }),
-  /** Ask a question. Streams tokens on `llm://stream` with the given requestId,
-   *  resolves with the stored assistant message. `recordingId` null = ask the whole library. */
-  ask: (recordingId: string | null, question: string, requestId: string) =>
-    invoke<ChatMessage>("ask", { recordingId, question, requestId }),
-  clearChat: (recordingId: string | null) => invoke<void>("clear_chat", { recordingId }),
-  listLibraryChat: () => invoke<ChatMessage[]>("list_library_chat"),
+  /** Ask a question in a thread (`threadId` null starts a new one). Streams tokens and status
+   *  on `llm://stream` with the given requestId; resolves with the thread and both stored
+   *  messages. `recordingId` null = ask the whole library. */
+  ask: (recordingId: string | null, threadId: string | null, question: string, attachmentIds: string[], requestId: string) =>
+    invoke<AskResult>("ask", { recordingId, threadId, question, attachmentIds, requestId }),
+  /** Conversations of a recording (or the library when null), most recent first. */
+  listChatThreads: (recordingId: string | null) => invoke<ChatThread[]>("list_chat_threads", { recordingId }),
+  listChatMessages: (threadId: string) => invoke<ChatMessage[]>("list_chat_messages", { threadId }),
+  renameChatThread: (threadId: string, title: string) => invoke<ChatThread>("rename_chat_thread", { threadId, title }),
+  deleteChatThread: (threadId: string) => invoke<void>("delete_chat_thread", { threadId }),
+  /** Attach an image or audio file from disk to the message being written. */
+  addChatAttachmentFile: (path: string) => invoke<AttachmentUpload>("add_chat_attachment_file", { path }),
+  /** Attach image bytes (PNG, JPEG, WebP or GIF). */
+  addChatImage: (bytes: Uint8Array, name: string) =>
+    isTauri()
+      ? tauriInvoke<ChatAttachment>("add_chat_attachment", bytes, {
+          headers: { "x-kind": "image", "x-name": encodeURIComponent(name) },
+        })
+      : invoke<ChatAttachment>("add_chat_attachment", { kind: "image", name, bytes }),
+  /** Attach a voice clip as mono float32 samples. */
+  addChatAudio: (samples: Float32Array, sampleRate: number, name: string) =>
+    isTauri()
+      ? tauriInvoke<ChatAttachment>("add_chat_attachment", new Uint8Array(samples.buffer, samples.byteOffset, samples.byteLength), {
+          headers: { "x-kind": "audio", "x-name": encodeURIComponent(name), "x-sample-rate": String(sampleRate) },
+        })
+      : invoke<ChatAttachment>("add_chat_attachment", { kind: "audio", name, samples, sampleRate }),
+  /** Drop an attachment that wasn't sent. */
+  discardChatAttachment: (id: string) => invoke<void>("discard_chat_attachment", { id }),
   /** Generate an interactive HTML doc. Streams on `llm://stream`. `skill` names the design
    *  guide of a template (e.g. "quiz") so the model gets it up front. */
   generateDoc: (id: string, prompt: string, skill: string | null, requestId: string) =>

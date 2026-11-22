@@ -684,6 +684,7 @@ mod tests {
             end: i as f64 * 10.0 + 9.0,
             text: t.into(),
             words: vec![],
+            original_text: None,
         }
     }
 

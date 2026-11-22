@@ -71,19 +71,22 @@ const TEMPLATES: { key: string; label: string; icon: ReactNode; prompt: string }
 
 function GeneratingCard({ requestId, prompt }: { requestId: string; prompt: string }) {
   const len = useStreams((s) => s.streams[requestId]?.text.length ?? 0);
-  const activity = useStreams((s) => s.streams[requestId]?.activity ?? null);
+  const status = useStreams((s) => s.streams[requestId]?.status ?? null);
   return (
     <div className="rounded-xl border border-accent/25 bg-accent-soft/30 p-3">
       <div className="flex items-center gap-2 text-[13px] font-medium">
         <Wand2 className="size-3.5 shrink-0 animate-pulse text-accent" />
         {len > 0 ? "Writing…" : "Generating…"}
-        <span className="ml-auto min-w-0 truncate text-[12px] font-normal text-muted tabular-nums" dir="auto">
-          {len > 0 ? formatBytes(len) : (activity ?? "thinking")}
-        </span>
+        <span className="ml-auto text-[12px] font-normal text-muted tabular-nums">{len > 0 ? formatBytes(len) : "thinking"}</span>
       </div>
       <p className="mt-1 line-clamp-2 text-[12px] text-muted" dir="auto">
         {prompt}
       </p>
+      {status && len === 0 && (
+        <p className="mt-1 text-[11.5px] text-faint" dir="auto">
+          {status}
+        </p>
+      )}
       <ProgressBar className="mt-2.5" label="Generating doc" />
       <div className="mt-2 flex justify-end">
         <Button size="sm" onClick={() => stopLlm(requestId)}>

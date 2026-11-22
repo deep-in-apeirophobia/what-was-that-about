@@ -2,10 +2,12 @@
 
 import { api } from "../../lib/api";
 import type { Citation } from "../../lib/citations";
+import { pluralize } from "../../lib/format";
 import type { ExportFormat, Note, Recording } from "../../lib/types";
 import { indexOfSegmentId } from "../../lib/segments";
 import { pickSavePath } from "../../lib/platform";
 import { useApp } from "../../store/app";
+import { isCancellation } from "../../store/chat";
 import { useLibrary } from "../../store/library";
 import { usePlayer } from "../../store/player";
 import { useRecording } from "../../store/recording";
@@ -86,6 +88,42 @@ export async function analyzeRecording(id: string): Promise<boolean> {
     void rec.reload();
   }
   toast.success("Analysis ready", "Summary, chapters and topics were added.");
+  return true;
+}
+
+/** Correct recognition errors with the AI model. Sentences update as batches finish. */
+export async function fixTranscript(id: string): Promise<void> {
+  const lib = useLibrary.getState();
+  if (lib.fixing[id]) return;
+  lib.setFixing(id, { done: 0, total: 0 });
+  try {
+    const s = await api.fixTranscript(id);
+    if (s.changed) {
+      toast.success("Transcript fixed", `${pluralize(s.changed, "sentence")} corrected. Hover a highlighted word to see what was heard.`);
+    } else if (!s.failed) {
+      toast.info("Nothing to fix", "The model didn't find recognition errors.");
+    }
+    if (s.failed) toast.error(`${s.failed} of ${s.batches} parts couldn't be fixed`, s.error ?? undefined);
+  } catch (e) {
+    if (isCancellation(e)) toast.info("Stopped fixing", "Corrections made so far were kept.");
+    else toast.error("Couldn't fix the transcript", e);
+  } finally {
+    useLibrary.getState().setFixing(id, null);
+    // Progress events can race a (re)load of the recording; settle on what was saved.
+    if (useRecording.getState().id === id) void useRecording.getState().reload();
+  }
+}
+
+export async function cancelFixTranscript(id: string): Promise<void> {
+  await attempt("Couldn't stop fixing", () => api.cancelFixTranscript(id));
+}
+
+/** Put back the recognized text of AI-fixed sentences (`segmentIds` null = all). */
+export async function revertTranscriptFixes(id: string, segmentIds: number[] | null): Promise<boolean> {
+  const reverted = await attempt("Couldn't restore the original text", () => api.revertTranscriptFixes(id, segmentIds));
+  if (!reverted) return false;
+  useRecording.getState().updateSegments(id, reverted);
+  toast.success(segmentIds ? "Original text restored" : `Original text restored in ${pluralize(reverted.length, "sentence")}`);
   return true;
 }
 

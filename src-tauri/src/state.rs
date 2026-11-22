@@ -9,12 +9,14 @@ use anyhow::Result;
 use wwta_core::db::Db;
 use wwta_core::types::{ModelStatus, Settings};
 
-use crate::worker::Worker;
+use crate::worker::{CachedEngine, Worker};
 
 pub struct Paths {
     pub data: PathBuf,
     pub models: PathBuf,
     pub library: PathBuf,
+    /// Images and voice clips sent in Ask conversations.
+    pub attachments: PathBuf,
     pub settings: PathBuf,
     pub vad_model: PathBuf,
 }
@@ -23,14 +25,17 @@ impl Paths {
     pub fn new(data: PathBuf) -> Result<Self> {
         let models = data.join("models");
         let library = data.join("library");
+        let attachments = data.join("attachments");
         std::fs::create_dir_all(&models)?;
         std::fs::create_dir_all(&library)?;
+        std::fs::create_dir_all(&attachments)?;
         let vad_model = wwta_core::asr::ensure_vad_model(&data.join("vad"))?;
         Ok(Self {
             settings: data.join("settings.json"),
             data,
             models,
             library,
+            attachments,
             vad_model,
         })
     }
@@ -84,6 +89,9 @@ pub struct AppState {
     pub db: Mutex<Db>,
     pub settings: RwLock<Settings>,
     pub worker: Worker,
+    /// Loaded speech engine, shared by the transcription worker (which holds the lock for a
+    /// whole job) and voice-message transcription.
+    pub engine: Mutex<CachedEngine>,
     /// Running model installs: id -> cancel flag
     pub model_jobs: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// Transient model status (downloading/converting/error) overriding the on-disk state.

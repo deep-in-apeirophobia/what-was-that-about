@@ -79,9 +79,26 @@ A one-hour recording is roughly 40k tokens, a fraction of a cent with these mode
   of getting every transcript pasted in: it can list recordings, search transcripts and notes,
   read a recording's overview, its whole transcript or a range of segments, the user's notes
   and earlier docs. The chat shows what it is reading. Answers cite segments like `[12]`, and
-  clicking a citation plays that moment. When a conversation gets large (over ~256k tokens, or
-  less if the model's context is smaller) old tool output is dropped and earlier messages are
-  summarized, so long chats keep working.
+  clicking a citation plays that moment. Keep as many separate conversations as you like
+  (switch, rename or delete them from the bar above the chat). Attach images (picker, drag and
+  drop onto the chat, or paste) and voice messages (record with the mic button or attach an
+  audio file):
+  - models that accept images or audio get the files themselves;
+  - otherwise a voice message is transcribed first with your installed speech model, and an
+    image is described by the newest OpenAI Luna model on OpenRouter (`openai/gpt-6-luna` if
+    the model list can't be loaded), and the chat model gets that text.
+- **Long conversations and long recordings:** the app sizes every request to the model's
+  context window (at most ~256k tokens). When a conversation gets long, older messages are
+  summarized and the summary is sent instead of them (a divider in the chat marks the spot);
+  while the model works, tool output it no longer needs is dropped. Ask and Docs read long
+  transcripts in parts. For Analyze, a transcript that doesn't fit is condensed section by
+  section into notes that keep segment ids, so citations still work; the notes are cached per
+  recording and redone only for edited sections.
+- **Fix transcript:** the model corrects recognition errors (misheard words, half-spaces,
+  spelling, punctuation) and keeps the spoken style. The recognized text is kept: corrected
+  words are highlighted (toggle in the transcript toolbar), hovering one shows what was heard,
+  and a sentence or the whole transcript can be restored. Search, AI answers and exports use
+  the corrected text; JSON exports also include the recognized text.
 - **Docs:** the model loads a design guide for the kind of doc (mind map, timeline, flashcards,
   quiz, minutes, glossary or a general report; see `crates/wwta-core/src/agent/skills`),
   gathers the content with the same tools, and writes a self-contained HTML/JS page shown
@@ -91,8 +108,10 @@ A one-hour recording is roughly 40k tokens, a fraction of a cent with these mode
 - **Semantic search:** optional embeddings (default `baai/bge-m3`) for meaning-based search and
   related sections.
 
-Only transcript text is sent to OpenRouter, and only when you use these features. Audio never
-leaves your computer.
+Only what a feature needs is sent to OpenRouter, and only when you use it: transcript text,
+your notes and chat, plus images and voice messages you attach to a question. Voice messages
+go to OpenRouter only when the chosen model accepts audio (otherwise they're transcribed on
+your computer). Your recordings' audio never leaves your computer.
 
 ## Privacy and telemetry
 
@@ -101,9 +120,10 @@ are on by default and can be turned off in **Settings → Privacy** (or on the f
 
 - **Sent:** a random install id, app version, OS, CPU/RAM/GPU model, app opens, which speech
   and AI models are used, file formats, recording lengths (bucketed), transcription speed,
-  AI request latency/token counts/cost, and counts (searches, notes, exports).
-- **Never sent:** audio, transcripts, notes, chat, generated docs, recording titles, file names
-  or paths, search text, or API keys. Crash reports are scrubbed of paths and tokens.
+  AI request latency/token counts/cost, and counts (searches, notes, exports, images and voice
+  messages attached to questions).
+- **Never sent:** audio, transcripts, notes, chat, attachments, generated docs, recording titles,
+  file names or paths, search text, or API keys. Crash reports are scrubbed of paths and tokens.
 - Events queue on disk while offline and are sent later; turning statistics off deletes the queue.
 - Builds without `POSTHOG_KEY` / `SENTRY_DSN` (e.g. your own, see `.env.example`) contain no
   telemetry at all.

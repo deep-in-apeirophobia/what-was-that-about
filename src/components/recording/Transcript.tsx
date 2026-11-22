@@ -1,5 +1,6 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, ChevronUp, Crosshair, Search, StickyNote, Tag as TagIcon, X } from "lucide-react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { ChevronDown, ChevronUp, Crosshair, Highlighter, Search, StickyNote, Tag as TagIcon, WandSparkles, X } from "lucide-react";
 import { api } from "../../lib/api";
 import { formatTime, pluralize } from "../../lib/format";
 import { layoutNotes, spanOfSegments } from "../../lib/notes";
@@ -8,14 +9,17 @@ import { segmentIdsInRange } from "../../lib/selection";
 import { detectDirection, findMatches } from "../../lib/text";
 import type { Chapter, Note, Segment } from "../../lib/types";
 import { MOD } from "../../lib/platform";
+import { useLibrary } from "../../store/library";
 import { usePlayer } from "../../store/player";
 import { FONT_SIZES, useRecording } from "../../store/recording";
+import { hasApiKey, useSettings } from "../../store/settings";
 import { attempt, toast } from "../../store/toasts";
-import { IconButton } from "../ui/Button";
+import { Button, IconButton } from "../ui/Button";
+import { Spinner } from "../ui/misc";
 import { NoteComposer } from "../notes/NoteComposer";
 import { NoteCard } from "../notes/NoteCard";
 import { NO_RANGES, SegmentRow, type SegmentHandlers } from "./SegmentRow";
-import { copyMomentLink, goToNote, seekToSegment } from "./actions";
+import { cancelFixTranscript, copyMomentLink, fixTranscript, goToNote, revertTranscriptFixes, seekToSegment } from "./actions";
 import { DecodePanel, TranscribeCta, TranscriptionErrorCard, TranscriptionProgressCard } from "./StatusPanels";
 
 function FindBar({
@@ -132,6 +136,114 @@ function ChapterHeading({ chapter }: { chapter: Chapter }) {
   );
 }
 
+interface FixHover {
+  original: string;
+  removed: boolean;
+  x: number;
+  top: number;
+  bottom: number;
+}
+
+/** What speech recognition heard, shown while hovering an AI-fixed word inside `container`. */
+function FixTooltip({ container }: { container: React.RefObject<HTMLElement | null> }) {
+  const [hover, setHover] = useState<FixHover | null>(null);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const el = container.current;
+    if (!el) return;
+    let current: HTMLElement | null = null;
+    const show = (mark: HTMLElement | null) => {
+      if (mark === current) return;
+      current = mark;
+      if (!mark) return setHover(null);
+      const r = mark.getBoundingClientRect();
+      setHover({
+        original: mark.dataset.fixOriginal ?? "",
+        removed: mark.classList.contains("fix-removed"),
+        x: r.left + r.width / 2,
+        top: r.top,
+        bottom: r.bottom,
+      });
+    };
+    const over = (e: MouseEvent) => show((e.target as Element).closest<HTMLElement>("[data-fix-original]"));
+    const hide = () => show(null);
+    el.addEventListener("mouseover", over);
+    el.addEventListener("mouseleave", hide);
+    el.addEventListener("scroll", hide, { passive: true });
+    return () => {
+      el.removeEventListener("mouseover", over);
+      el.removeEventListener("mouseleave", hide);
+      el.removeEventListener("scroll", hide);
+    };
+  }, [container]);
+
+  // Center on the word, kept inside the window.
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el || !hover) return;
+    const w = el.offsetWidth;
+    el.style.left = `${Math.min(Math.max(hover.x - w / 2, 8), window.innerWidth - w - 8)}px`;
+  }, [hover]);
+
+  if (!hover) return null;
+  const above = hover.top > 80;
+  const label = hover.removed
+    ? "Removed by the AI fix"
+    : hover.original
+      ? "Speech recognition heard"
+      : "Added by the AI fix";
+  return createPortal(
+    <div
+      ref={ref}
+      role="tooltip"
+      className="pointer-events-none fixed z-50 max-w-sm rounded-lg border border-line bg-surface px-2.5 py-1.5 shadow-pop"
+      style={{ top: above ? hover.top - 6 : hover.bottom + 6, transform: above ? "translateY(-100%)" : undefined }}
+    >
+      <div className="text-[11px] font-medium text-faint">{label}</div>
+      {hover.original && (
+        <div dir="auto" className="font-fa text-[14px] leading-relaxed text-fg">
+          {hover.original}
+        </div>
+      )}
+    </div>,
+    document.body,
+  );
+}
+
+/** Run the AI fix, or show its progress with a stop button. */
+function FixControls({ recordingId, canFix }: { recordingId: string; canFix: boolean }) {
+  const fixing = useLibrary((s) => s.fixing[recordingId]);
+  const keyOk = useSettings((s) => hasApiKey(s.settings));
+  if (fixing) {
+    return (
+      <span className="flex items-center gap-1 text-[12px] text-muted" aria-live="polite">
+        <Spinner className="size-3.5" />
+        <span className="tabular-nums">Fixing{fixing.total ? ` ${fixing.done}/${fixing.total}` : "…"}</span>
+        <IconButton label="Stop fixing (keeps the corrections made so far)" size="xs" onClick={() => void cancelFixTranscript(recordingId)}>
+          <X className="size-3.5" />
+        </IconButton>
+      </span>
+    );
+  }
+  return (
+    <Button
+      size="sm"
+      variant="ghost"
+      icon={<WandSparkles className="size-3.5" />}
+      disabled={!canFix || !keyOk}
+      title={
+        keyOk
+          ? "Correct speech recognition errors with the AI model. The recognized text is kept: hover a fix to see it."
+          : "Add an OpenRouter key in Settings first"
+      }
+      onClick={() => void fixTranscript(recordingId)}
+    >
+      Fix with AI
+    </Button>
+  );
+}
+
 /** Scroll so the span from `top` to `bottom` is visible: centered when it fits, else its start near the top. */
 function scrollSpanIntoView(container: HTMLElement, top: Element, bottom: Element): void {
   const cr = container.getBoundingClientRect();
@@ -165,6 +277,8 @@ export function Transcript() {
   const noteDraft = useRecording((s) => s.noteDraft);
   const noteEditor = useRecording((s) => s.noteEditor);
   const noteReveal = useRecording((s) => s.noteReveal);
+  const highlightFixes = useRecording((s) => s.highlightFixes);
+  const setHighlightFixes = useRecording((s) => s.setHighlightFixes);
   const follow = usePlayer((s) => s.follow);
   const playing = usePlayer((s) => s.playing);
 
@@ -193,6 +307,7 @@ export function Transcript() {
   composing.current = (noteDraft != null && noteDraft.anchorSegmentId != null) || noteEditor?.where === "transcript";
 
   const hasText = segments.length > 0;
+  const fixedCount = useMemo(() => segments.filter((s) => s.originalText != null).length, [segments]);
   const dir = useMemo(
     () => (hasText ? detectDirection(segments.slice(0, 8).map((s) => s.text).join(" ")) : "ltr"),
     // Direction only needs to be computed once, when text first appears.
@@ -364,6 +479,10 @@ export function Transcript() {
         if (id) copyMomentLink(id, seg.id);
       },
       showNote: (note: Note) => useRecording.getState().revealNote(note.id),
+      restoreOriginal: (seg: Segment) => {
+        const id = useRecording.getState().id;
+        if (id) void revertTranscriptFixes(id, [seg.id]);
+      },
     }),
     [],
   );
@@ -419,7 +538,24 @@ export function Transcript() {
       <div className="flex h-10 shrink-0 items-center gap-2 border-b border-line px-4">
         <span className="text-[12.5px] font-medium">Transcript</span>
         {hasText && <span className="text-[12px] text-faint">{pluralize(segments.length, "sentence")}</span>}
+        {fixedCount > 0 && (
+          <span className="text-[12px] text-faint" title="Sentences corrected by the AI fix">
+            · {fixedCount} fixed
+          </span>
+        )}
         <div className="ml-auto flex items-center gap-0.5">
+          {hasText && <FixControls recordingId={recording.id} canFix={recording.status === "ready"} />}
+          {fixedCount > 0 && (
+            <IconButton
+              label={highlightFixes ? "Hide AI fix highlights" : "Highlight AI fixes"}
+              size="sm"
+              active={highlightFixes}
+              onClick={() => setHighlightFixes(!highlightFixes)}
+            >
+              <Highlighter className="size-3.5" />
+            </IconButton>
+          )}
+          {hasText && <div className="mx-1 h-4 w-px bg-line" />}
           <IconButton
             label={`Find in transcript (${MOD}+F)`}
             size="sm"
@@ -503,6 +639,7 @@ export function Transcript() {
                     handlers={handlers}
                     notes={noteLayout.bySegment.get(seg.id)}
                     noteBadge={noteLayout.badgeAt.has(seg.id)}
+                    highlightFixes={highlightFixes}
                   />
                   {noteLayout.after.get(seg.id)?.map(renderNote)}
                   {noteDraft?.anchorSegmentId === seg.id && draftComposer}
@@ -537,6 +674,7 @@ export function Transcript() {
           <Crosshair className="size-3.5 text-accent" /> Back to the current sentence
         </button>
       )}
+      {fixedCount > 0 && highlightFixes && <FixTooltip container={scrollRef} />}
     </div>
   );
 }

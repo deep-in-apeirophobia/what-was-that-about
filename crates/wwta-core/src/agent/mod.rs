@@ -13,7 +13,7 @@ use anyhow::{anyhow, bail, Result};
 use regex::Regex;
 use serde_json::Value;
 
-use crate::llm::{language_instruction, ChatRequest, Client, Msg, ToolCall, Usage};
+use crate::llm::{language_instruction, ChatRequest, Client, Content, Msg, Part, ToolCall, Usage};
 use crate::text::fmt_time;
 
 /// Compact the context once it is estimated to be larger than this many tokens.
@@ -27,7 +27,7 @@ const MAX_TOOL_CHARS: usize = 200_000;
 /// Tokens per character before the first reply tells us better (Persian runs ~2.5 chars/token).
 const DEFAULT_RATIO: f64 = 0.4;
 /// The budget never shrinks below this after context-length errors.
-const MIN_BUDGET: usize = 8_000;
+pub const MIN_BUDGET: usize = 8_000;
 /// Output tokens allowed for one summary (reasoning models spend some of it thinking).
 const SUMMARY_TOKENS: u32 = 6_000;
 
@@ -67,6 +67,28 @@ pub struct Context {
     ratio: f64,
 }
 
+fn content_chars(c: &Content) -> usize {
+    match c {
+        Content::Text(t) => t.chars().count(),
+        Content::Parts(parts) => parts
+            .iter()
+            .map(|p| match p {
+                Part::Text { text } => text.chars().count(),
+                // images and audio cost tokens by their size, not by their base64 length
+                media => (media.tokens() as f64 / DEFAULT_RATIO) as usize,
+            })
+            .sum(),
+    }
+}
+
+/// Length of a tool result (always plain text).
+fn text_len(c: &Content) -> usize {
+    match c {
+        Content::Text(t) => t.len(),
+        Content::Parts(_) => 0,
+    }
+}
+
 fn msg_chars(m: &Msg) -> usize {
     let calls: usize = m
         .tool_calls
@@ -78,7 +100,7 @@ fn msg_chars(m: &Msg) -> usize {
         .iter()
         .map(|r| r.to_string().len())
         .sum();
-    m.content.chars().count() + calls + reasoning + 8
+    content_chars(&m.content) + calls + reasoning + 8
 }
 
 impl Context {
@@ -146,7 +168,7 @@ impl Context {
             return;
         };
         for i in 0..latest {
-            if self.turn[i].role != "tool" || self.turn[i].content.len() <= 400 {
+            if self.turn[i].role != "tool" || text_len(&self.turn[i].content) <= 400 {
                 continue;
             }
             let id = self.turn[i].tool_call_id.clone().unwrap_or_default();
@@ -156,9 +178,9 @@ impl Context {
                 .find(|c| c.id == id)
                 .map(|c| format!("{}({})", c.name, clip(&c.arguments, 120)))
                 .unwrap_or_else(|| "a tool".into());
-            self.turn[i].content = format!(
+            self.turn[i].content = Content::Text(format!(
                 "[The output of {what} was removed to save space. Call the tool again if you still need it.]"
-            );
+            ));
         }
     }
 
@@ -169,17 +191,20 @@ impl Context {
                 .turn
                 .iter_mut()
                 .filter(|m| m.role == "tool")
-                .max_by_key(|m| m.content.len())
+                .max_by_key(|m| text_len(&m.content))
             else {
                 break;
             };
-            if m.content.len() < 4_000 {
+            let Content::Text(text) = &m.content else {
+                break;
+            };
+            if text.len() < 4_000 {
                 break;
             }
-            m.content = format!(
+            m.content = Content::Text(format!(
                 "{}\n[…the rest was cut to fit the context; ask for a smaller part.]",
-                clip(&m.content, m.content.len() / 2)
-            );
+                clip(text, text.len() / 2)
+            ));
         }
     }
 }
@@ -356,7 +381,8 @@ impl<'a> Agent<'a> {
             }
             let mut take = 0;
             for m in &self.ctx.history[..left] {
-                let body = m.content.trim();
+                let content = m.content.text();
+                let body = content.trim();
                 if take > 0 && text.len() + body.len() + 16 > batch {
                     break;
                 }
@@ -500,6 +526,7 @@ pub fn recording_chat_system(rec: &RecordingFacts, ai_language: &str) -> String 
          something is said; read_transcript_section reads around it; read_transcript reads everything \
          (fine for recordings up to about an hour); get_notes shows the user's own notes.\n\
          - {analysis}{notes}\n\
+         - The user may attach images or voice messages; use them together with the transcript.\n\
          - Don't guess. If the recording doesn't say, tell the user.\n\n\
          How to answer:\n\
          - After each claim, cite the segments it comes from in square brackets, like [12] or [12-15]. \
@@ -522,6 +549,7 @@ pub fn library_chat_system(recordings: usize, ai_language: &str) -> String {
          - Recordings have short ids like R3. Transcript lines look like [R3#14] (recording R3, segment 14).\n\
          - Search before you answer, and read around the best results when you need more context. \
          If a search finds nothing useful, try other words.\n\
+         - The user may attach images or voice messages; use them together with what you find.\n\
          - Don't guess. If the library doesn't say, tell the user and suggest what to search for.\n\n\
          How to answer:\n\
          - After each claim, cite the lines it comes from in exactly this form: [R3#14] or [R3#14-16]. \
@@ -723,6 +751,7 @@ mod tests {
                 end: i as f64 * 10.0 + 9.0,
                 text: t.to_string(),
                 words: vec![],
+                original_text: None,
             })
             .collect();
         db.replace_segments("uuid-a", "m", &segs).unwrap();
@@ -950,6 +979,20 @@ mod tests {
     }
 
     #[test]
+    fn counts_attachments_by_their_cost_not_their_base64() {
+        let image = Msg::user_parts(vec![
+            Part::text("what is this?"),
+            Part::image("image/png", &vec![0u8; 3_000_000]),
+        ]);
+        let ctx = Context::new("s", None, vec![image], Msg::user("q"));
+        let tokens = ctx.tokens();
+        assert!(
+            (crate::llm::IMAGE_TOKENS..crate::llm::IMAGE_TOKENS + 100).contains(&tokens),
+            "{tokens}"
+        );
+    }
+
+    #[test]
     fn drops_all_but_the_latest_tool_output() {
         let call = |id: &str, name: &str| ToolCall {
             id: id.into(),
@@ -965,10 +1008,10 @@ mod tests {
         ctx.turn.push(Msg::tool_result("b", "y".repeat(5_000)));
         ctx.drop_old_tool_output();
         assert_eq!(
-            ctx.turn[2].content,
+            ctx.turn[2].content.text(),
             "[The output of read_transcript({}) was removed to save space. Call the tool again if you still need it.]"
         );
-        assert_eq!(ctx.turn[4].content.len(), 5_000);
+        assert_eq!(ctx.turn[4].content.text().len(), 5_000);
     }
 
     #[tokio::test]

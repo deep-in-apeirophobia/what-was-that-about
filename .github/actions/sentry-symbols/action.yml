@@ -1,0 +1,23 @@
+name: Upload debug symbols to Sentry
+description: Uploads the desktop app's native debug files so Sentry can symbolicate crashes. Skips without a token.
+inputs:
+  auth-token:
+    description: Sentry org auth token (org:ci scope)
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        SENTRY_AUTH_TOKEN: ${{ inputs.auth-token }}
+      run: |
+        set -euo pipefail
+        if [ -z "$SENTRY_AUTH_TOKEN" ]; then echo "No SENTRY_AUTH_TOKEN; skipping symbol upload."; exit 0; fi
+        # Linux: the binary carries its line tables. Windows: .pdb. macOS: .dSYM (split-debuginfo).
+        files=()
+        for f in target/release/what-was-that-about target/release/what-was-that-about.exe \
+                 target/release/what_was_that_about.pdb target/release/what-was-that-about.dSYM; do
+          [ -e "$f" ] && files+=("$f")
+        done
+        npx --yes @sentry/cli@2 debug-files upload --org cactus-66 --project what-was-that-about --include-sources "${files[@]}"

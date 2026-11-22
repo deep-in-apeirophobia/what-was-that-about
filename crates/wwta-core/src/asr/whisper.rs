@@ -348,6 +348,7 @@ impl Engine for Whisper {
                     end: t1.max(t0),
                     text,
                     words,
+                    original_text: None,
                 });
             }
             // If the model ended the window early (last aligned word well before the window
