@@ -1,7 +1,7 @@
 // In-memory backend used when the UI runs in a plain browser (`pnpm dev`).
 // Mirrors the Tauri commands in api.ts closely enough to exercise every screen:
 // model installs, transcription with live segments, AI analysis, streaming chat,
-// interactive docs, notes, search, tags and related segments.
+// interactive docs, notes, search, tags, related segments and AI transcript fixes.
 
 import type {
   Analysis,
@@ -12,6 +12,8 @@ import type {
   ChatThread,
   Doc,
   ExportFormat,
+  FixProgress,
+  FixSummary,
   ModelInfo,
   ModelProgress,
   Note,
@@ -51,6 +53,7 @@ const EV = {
   model: "model://progress",
   transcription: "transcription://progress",
   llm: "llm://stream",
+  fix: "transcript://fix-progress",
   updated: "library://recording-updated",
   deleted: "library://recording-deleted",
 };
@@ -189,6 +192,7 @@ let settings: Settings = {
 const models: ModelInfo[] = initialModels(MOCK_SYSTEM.dataDir);
 const installs = new Map<string, { cancelled: boolean }>();
 const cancelledRequests = new Set<string>();
+const fixJobs = new Set<string>();
 const recs = new Map<string, RecState>();
 interface MockThread {
   thread: ChatThread;
@@ -785,6 +789,46 @@ function findNote(id: string): { s: RecState; note: Note } {
   throw new Error("Note not found. It may have been deleted.");
 }
 
+// ---- AI transcript fix --------------------------------------------------------------
+
+/** The mock "fixes" a sentence by remembering how a recognizer without punctuation or
+ *  half-spaces would have written it; the shown text stays the same. */
+function asRecognized(seg: Segment): string {
+  let n = seg.id;
+  let out = seg.text
+    .replace(/[،.؟!?,:]/g, "")
+    .replace(/\u200c/g, () => (n++ % 2 ? " " : ""))
+    .replace(/\s+/g, " ")
+    .trim();
+  if (seg.id % 4 === 0) out = out.replace(/ی(?=\s|$)/, "ي");
+  return out;
+}
+
+async function runFix(s: RecState): Promise<FixSummary> {
+  const id = s.rec.id;
+  const size = 12;
+  const total = Math.ceil(s.segments.length / size);
+  let changed = 0;
+  for (let b = 0; b < total; b++) {
+    await sleep(600);
+    if (cancelledRequests.delete(`fix:${id}`)) throw new Error("cancelled");
+    const ids = new Set(s.segments.slice(b * size, (b + 1) * size).map((x) => x.id));
+    const fixed: Segment[] = [];
+    s.segments = s.segments.map((seg) => {
+      const heard = asRecognized(seg);
+      if (!ids.has(seg.id) || seg.id % 2 || seg.originalText != null || heard === seg.text) return seg;
+      const out = { ...seg, originalText: heard };
+      fixed.push(out);
+      return out;
+    });
+    changed += fixed.length;
+    if (fixed.length) s.embeddingsIndexed = false;
+    const p: FixProgress = { recordingId: id, done: b + 1, total, changed: fixed.map((x) => ({ ...x })) };
+    emit(EV.fix, p);
+  }
+  return { changed, batches: total, failed: 0, error: null };
+}
+
 // ---- LLM streaming ------------------------------------------------------------------
 
 async function stream(requestId: string, chunks: string[], delay: number): Promise<void> {
@@ -1034,6 +1078,7 @@ export const handlers: Record<string, Handler> = {
       ...seg,
       text,
       words: sameCount ? seg.words.map((w, i) => ({ ...w, text: text.split(/\s+/)[i] })) : [],
+      originalText: seg.originalText === text ? null : seg.originalText,
     };
     s.segments = s.segments.map((x) => (x.id === segmentId ? updated : x));
     touch(s);
@@ -1158,6 +1203,33 @@ export const handlers: Record<string, Handler> = {
     s.analysis.model = settings.llmModel;
     touch(s);
     return s.analysis;
+  },
+  fix_transcript: async (args) => {
+    requireKey();
+    const s = getRec(str(args, "id"));
+    if (!s.segments.length) throw new Error("Transcribe the recording before fixing it.");
+    if (fixJobs.has(s.rec.id)) throw new Error("This transcript is already being fixed.");
+    fixJobs.add(s.rec.id);
+    cancelledRequests.delete(`fix:${s.rec.id}`);
+    try {
+      return await runFix(s);
+    } finally {
+      fixJobs.delete(s.rec.id);
+    }
+  },
+  revert_transcript_fixes: async (args) => {
+    const s = getRec(str(args, "id"));
+    const only = Array.isArray(args.segmentIds) ? (args.segmentIds as number[]) : null;
+    const reverted: Segment[] = [];
+    s.segments = s.segments.map((seg) => {
+      if (seg.originalText == null || (only && !only.includes(seg.id))) return seg;
+      const out = { ...seg, text: seg.originalText, originalText: null };
+      reverted.push(out);
+      return out;
+    });
+    if (reverted.length) s.embeddingsIndexed = false;
+    await sleep(150);
+    return reverted.map((x) => ({ ...x }));
   },
   index_embeddings: async (args) => {
     requireKey();

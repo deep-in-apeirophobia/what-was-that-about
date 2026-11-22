@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronRight, Download, Ellipsis, Sparkles, Trash2, X } from "lucide-react";
+import { ChevronRight, Download, Ellipsis, Sparkles, Trash2, Undo2, X } from "lucide-react";
 import { api } from "../../lib/api";
-import { formatDate, formatDuration } from "../../lib/format";
+import { formatDate, formatDuration, pluralize } from "../../lib/format";
 import { fileName } from "../../lib/platform";
 import type { ExportFormat, RecordingDetail } from "../../lib/types";
 import { useApp } from "../../store/app";
@@ -14,7 +14,7 @@ import { Button, IconButton } from "../ui/Button";
 import { ConfirmDialog } from "../ui/Dialog";
 import { Menu } from "../ui/Menu";
 import { StatusBadge, isRunning } from "../RecordingStatus";
-import { analyzeRecording, cancelTranscription, enableSemanticSearch, exportTranscript } from "./actions";
+import { analyzeRecording, cancelTranscription, enableSemanticSearch, exportTranscript, revertTranscriptFixes } from "./actions";
 import { TranscribeButton } from "./TranscribeControls";
 
 const EXPORTS: { format: ExportFormat; label: string; hint: string }[] = [
@@ -91,11 +91,15 @@ export function RecordingHeader({ detail }: { detail: RecordingDetail }) {
   const { recording, analysis } = detail;
   const navigate = useApp((s) => s.navigate);
   const progress = useLibrary((s) => s.progress[recording.id]);
+  const fixing = useLibrary((s) => !!s.fixing[recording.id]);
   const models = useModels((s) => s.models);
   const settings = useSettings((s) => s.settings);
   const [analyzing, setAnalyzing] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [confirmRestore, setConfirmRestore] = useState(false);
+  const [restoring, setRestoring] = useState(false);
+  const fixedCount = detail.segments.filter((s) => s.originalText != null).length;
   const running = isRunning(recording);
   const ready = recording.status === "ready" && detail.segments.length > 0;
   const keyOk = hasApiKey(settings);
@@ -205,6 +209,13 @@ export function RecordingHeader({ detail }: { detail: RecordingDetail }) {
                 disabled: detail.embeddingsIndexed || !ready || !keyOk,
                 onSelect: () => void enableSemanticSearch(recording.id),
               },
+              {
+                key: "restore",
+                label: "Restore original transcript…",
+                icon: <Undo2 />,
+                disabled: !fixedCount || fixing,
+                onSelect: () => setConfirmRestore(true),
+              },
               "separator",
               {
                 key: "delete",
@@ -236,6 +247,20 @@ export function RecordingHeader({ detail }: { detail: RecordingDetail }) {
         busy={deleting}
         onCancel={() => setConfirmDelete(false)}
         onConfirm={() => void onDelete()}
+      />
+      <ConfirmDialog
+        open={confirmRestore}
+        title="Restore the original transcript?"
+        message={`The AI fixes in ${pluralize(fixedCount, "sentence")} are undone and the text speech recognition produced comes back, including where you edited a fixed sentence afterwards.`}
+        confirmLabel="Restore"
+        busy={restoring}
+        onCancel={() => setConfirmRestore(false)}
+        onConfirm={async () => {
+          setRestoring(true);
+          await revertTranscriptFixes(recording.id, null);
+          setRestoring(false);
+          setConfirmRestore(false);
+        }}
       />
     </header>
   );

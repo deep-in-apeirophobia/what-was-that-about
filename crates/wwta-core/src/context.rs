@@ -210,6 +210,7 @@ mod tests {
             end: start + 5.0,
             text: text.into(),
             words: vec![],
+            original_text: None,
         }
     }
 

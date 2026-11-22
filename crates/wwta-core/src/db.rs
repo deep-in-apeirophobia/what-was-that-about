@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS segments (
     text TEXT NOT NULL,
     norm TEXT NOT NULL,
     words TEXT NOT NULL DEFAULT '[]',
+    original_text TEXT,
     PRIMARY KEY (recording_id, idx)
 );
 CREATE TABLE IF NOT EXISTS analyses (
@@ -171,6 +172,10 @@ const RECORDING_SELECT: &str = "SELECT r.*, \
     EXISTS(SELECT 1 FROM analyses a WHERE a.recording_id = r.id) AS has_analysis \
     FROM recordings r";
 
+/// Drops the condensed-transcript notes covering one segment (`?1` recording, `?2` segment).
+const DELETE_SEGMENT_DIGESTS: &str =
+    "DELETE FROM transcript_digests WHERE recording_id = ?1 AND start_seg <= ?2 AND end_seg >= ?2";
+
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -194,6 +199,12 @@ impl Db {
             conn.execute_batch(
                 "ALTER TABLE recordings ADD COLUMN title_custom INTEGER NOT NULL DEFAULT 0",
             )?;
+        }
+        let has_original_text: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('segments') WHERE name = 'original_text'")?
+            .exists([])?;
+        if !has_original_text {
+            conn.execute_batch("ALTER TABLE segments ADD COLUMN original_text TEXT")?;
         }
         let has_thread_id: bool = conn
             .prepare("SELECT 1 FROM pragma_table_info('chat_messages') WHERE name = 'thread_id'")?
@@ -396,7 +407,7 @@ impl Db {
 
     pub fn segments(&self, id: &str) -> Result<Vec<Segment>> {
         let mut st = self.conn.prepare(
-            "SELECT idx, start, end, text, words FROM segments WHERE recording_id = ?1 ORDER BY idx",
+            "SELECT idx, start, end, text, words, original_text FROM segments WHERE recording_id = ?1 ORDER BY idx",
         )?;
         let rows = st.query_map([id], |r| {
             let words: String = r.get(4)?;
@@ -406,29 +417,107 @@ impl Db {
                 end: r.get(2)?,
                 text: r.get(3)?,
                 words: serde_json::from_str::<Vec<Word>>(&words).unwrap_or_default(),
+                original_text: r.get(5)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    fn segments_with_ids(&self, id: &str, ids: &[u32]) -> Result<Vec<Segment>> {
+        Ok(self
+            .segments(id)?
+            .into_iter()
+            .filter(|s| ids.contains(&s.id))
+            .collect())
+    }
+
     pub fn update_segment_text(&self, id: &str, seg: u32, text: &str) -> Result<Segment> {
-        // Edited text invalidates word timings; keep the segment's overall span.
+        // Edited text invalidates word timings; keep the segment's overall span. The AI-fix
+        // original is kept, unless the edit restores it.
         self.conn.execute(
-            "UPDATE segments SET text = ?3, norm = ?4, words = '[]' WHERE recording_id = ?1 AND idx = ?2",
+            "UPDATE segments SET text = ?3, norm = ?4, words = '[]', \
+             original_text = NULLIF(original_text, ?3) WHERE recording_id = ?1 AND idx = ?2",
             params![id, seg, text, normalize_for_search(text)],
         )?;
         self.conn.execute(
             "DELETE FROM embeddings WHERE recording_id = ?1 AND start_seg <= ?2 AND end_seg >= ?2",
             params![id, seg],
         )?;
-        self.conn.execute(
-            "DELETE FROM transcript_digests WHERE recording_id = ?1 AND start_seg <= ?2 AND end_seg >= ?2",
-            params![id, seg],
-        )?;
+        self.conn
+            .execute(DELETE_SEGMENT_DIGESTS, params![id, seg])?;
         self.segments(id)?
             .into_iter()
             .find(|s| s.id == seg)
             .ok_or_else(|| anyhow::anyhow!("segment not found"))
+    }
+
+    /// Apply AI corrections as `(segment, text it was corrected from, corrected text)`. A
+    /// segment whose text changed in the meantime (edited by the user) is skipped. The
+    /// recognizer's text is kept in `original_text`, and word timings stay so the karaoke
+    /// highlight still finds the unchanged words. Returns the segments that changed.
+    ///
+    /// A fix touches much of a transcript, so the recording's semantic index is dropped as
+    /// a whole (like after re-transcribing) rather than left with holes; the UI then offers
+    /// to build it again.
+    pub fn apply_fixes(
+        &mut self,
+        id: &str,
+        fixes: &[(u32, String, String)],
+    ) -> Result<Vec<Segment>> {
+        let tx = self.conn.transaction()?;
+        let mut changed = Vec::new();
+        for (seg, old, new) in fixes {
+            if old == new {
+                continue;
+            }
+            let n = tx.execute(
+                "UPDATE segments SET original_text = NULLIF(COALESCE(original_text, text), ?4), \
+                 text = ?4, norm = ?5 WHERE recording_id = ?1 AND idx = ?2 AND text = ?3",
+                params![id, seg, old, new, normalize_for_search(new)],
+            )?;
+            if n > 0 {
+                tx.execute(DELETE_SEGMENT_DIGESTS, params![id, seg])?;
+                changed.push(*seg);
+            }
+        }
+        if !changed.is_empty() {
+            tx.execute("DELETE FROM embeddings WHERE recording_id = ?1", [id])?;
+        }
+        tx.commit()?;
+        if changed.is_empty() {
+            return Ok(vec![]);
+        }
+        self.segments_with_ids(id, &changed)
+    }
+
+    /// Put back the recognizer's text for AI-fixed segments (`only` = these ids, else all).
+    /// Drops the semantic index like [`Db::apply_fixes`]. Returns the segments that changed.
+    pub fn revert_fixes(&mut self, id: &str, only: Option<&[u32]>) -> Result<Vec<Segment>> {
+        let fixed: Vec<(u32, String)> = {
+            let mut st = self.conn.prepare(
+                "SELECT idx, original_text FROM segments WHERE recording_id = ?1 AND original_text IS NOT NULL",
+            )?;
+            let rows = st.query_map([id], |r| Ok((r.get::<_, i64>(0)? as u32, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|(seg, _)| only.is_none_or(|ids| ids.contains(seg)))
+                .collect()
+        };
+        if fixed.is_empty() {
+            return Ok(vec![]);
+        }
+        let tx = self.conn.transaction()?;
+        for (seg, original) in &fixed {
+            tx.execute(
+                "UPDATE segments SET text = ?3, norm = ?4, original_text = NULL WHERE recording_id = ?1 AND idx = ?2",
+                params![id, seg, original, normalize_for_search(original)],
+            )?;
+            tx.execute(DELETE_SEGMENT_DIGESTS, params![id, seg])?;
+        }
+        tx.execute("DELETE FROM embeddings WHERE recording_id = ?1", [id])?;
+        tx.commit()?;
+        let ids: Vec<u32> = fixed.iter().map(|(seg, _)| *seg).collect();
+        self.segments_with_ids(id, &ids)
     }
 
     // ---- analysis
@@ -1102,6 +1191,7 @@ mod tests {
                 end: 1.0,
                 text: "سلام".into(),
                 words: vec![],
+                original_text: None,
             },
             Segment {
                 id: 1,
@@ -1109,6 +1199,7 @@ mod tests {
                 end: 2.0,
                 text: "خداحافظ".into(),
                 words: vec![],
+                original_text: None,
             },
         ];
         db.replace_segments("r1", "shenava-koochik", &segs).unwrap();
@@ -1152,6 +1243,110 @@ mod tests {
         db.delete_recording("r1").unwrap();
         assert!(db.get_recording("r1").unwrap().is_none());
         assert!(db.segments("r1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn ai_fixes_keep_the_original() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.insert_recording(&sample_recording("r1")).unwrap();
+        let word = |t: &str| Word {
+            start: 0.0,
+            end: 1.0,
+            text: t.into(),
+        };
+        let seg = |id: u32, text: &str| Segment {
+            id,
+            start: id as f64,
+            end: id as f64 + 1.0,
+            text: text.into(),
+            words: vec![word(text)],
+            original_text: None,
+        };
+        db.replace_segments(
+            "r1",
+            "m",
+            &[seg(0, "سلام"), seg(1, "خداحافز"), seg(2, "متن")],
+        )
+        .unwrap();
+        let index = |db: &mut Db| {
+            let rows: Vec<EmbeddingRow> = [(0, 0, 0), (1, 1, 2)]
+                .map(|(chunk, start_seg, end_seg)| EmbeddingRow {
+                    recording_id: "r1".into(),
+                    chunk,
+                    start_seg,
+                    end_seg,
+                    vector: vec![1.0],
+                })
+                .into();
+            db.replace_embeddings("r1", "e", &rows).unwrap();
+        };
+        index(&mut db);
+        db.apply_fixes("r1", &[(2, "edited meanwhile".into(), "x".into())])
+            .unwrap();
+        assert!(db.has_embeddings("r1", "e").unwrap());
+        let changed = db
+            .apply_fixes(
+                "r1",
+                &[
+                    (1, "خداحافز".into(), "خداحافظ".into()),
+                    (2, "edited meanwhile".into(), "x".into()),
+                    (0, "سلام".into(), "سلام".into()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].text, "خداحافظ");
+        assert_eq!(changed[0].original_text.as_deref(), Some("خداحافز"));
+        assert_eq!(changed[0].words.len(), 1);
+        // the whole semantic index goes, not just the chunk with segment 1
+        assert!(!db.has_embeddings("r1", "e").unwrap());
+        // search sees the fixed text
+        let hits = crate::search::lexical(&db, "خداحافظ", Some("r1"), 10).unwrap();
+        assert_eq!(hits.len(), 1);
+
+        // a second fix keeps the recognizer's text, not the first fix
+        db.apply_fixes("r1", &[(1, "خداحافظ".into(), "خداحافظ!".into())])
+            .unwrap();
+        let s = &db.segments("r1").unwrap()[1];
+        assert_eq!(s.original_text.as_deref(), Some("خداحافز"));
+        // a manual edit keeps it too, and restoring the original text drops it
+        let s = db.update_segment_text("r1", 1, "خدانگهدار").unwrap();
+        assert_eq!(s.original_text.as_deref(), Some("خداحافز"));
+        let s = db.update_segment_text("r1", 1, "خداحافز").unwrap();
+        assert_eq!(s.original_text, None);
+
+        db.apply_fixes(
+            "r1",
+            &[
+                (0, "سلام".into(), "سلام،".into()),
+                (1, "خداحافز".into(), "خداحافظ".into()),
+            ],
+        )
+        .unwrap();
+        index(&mut db);
+        let reverted = db.revert_fixes("r1", Some(&[0])).unwrap();
+        assert!(!db.has_embeddings("r1", "e").unwrap());
+        assert_eq!(reverted.len(), 1);
+        assert_eq!(
+            (
+                reverted[0].text.as_str(),
+                reverted[0].original_text.as_deref()
+            ),
+            ("سلام", None)
+        );
+        assert_eq!(db.revert_fixes("r1", None).unwrap().len(), 1);
+        assert!(db
+            .segments("r1")
+            .unwrap()
+            .iter()
+            .all(|s| s.original_text.is_none()));
+        assert_eq!(db.segments("r1").unwrap()[1].text, "خداحافز");
+
+        // re-transcribing starts over
+        db.apply_fixes("r1", &[(2, "متن".into(), "متن.".into())])
+            .unwrap();
+        db.replace_segments("r1", "m", &[seg(0, "سلام")]).unwrap();
+        assert_eq!(db.segments("r1").unwrap()[0].original_text, None);
     }
 
     #[test]
@@ -1342,6 +1537,7 @@ mod tests {
                 end: i as f64 + 1.0,
                 text: format!("s{i}"),
                 words: vec![],
+                original_text: None,
             })
             .collect();
         db.replace_segments("r1", "m", &segs).unwrap();
@@ -1355,6 +1551,18 @@ mod tests {
         );
         assert!(db.digest("r1", 0, 0, 1, "other").unwrap().is_none());
         db.update_segment_text("r1", 1, "edited").unwrap();
+        assert!(db.digest("r1", 0, 0, 1, "fp").unwrap().is_none());
+        assert!(db.digest("r1", 0, 2, 2, "fp2").unwrap().is_some());
+        // AI fixes and restoring the recognized text are edits too
+        db.save_digest("r1", 0, 0, 1, "fp", "notes [0]", "model")
+            .unwrap();
+        db.apply_fixes("r1", &[(0, "s0".into(), "fixed".into())])
+            .unwrap();
+        assert!(db.digest("r1", 0, 0, 1, "fp").unwrap().is_none());
+        assert!(db.digest("r1", 0, 2, 2, "fp2").unwrap().is_some());
+        db.save_digest("r1", 0, 0, 1, "fp", "notes [0]", "model")
+            .unwrap();
+        db.revert_fixes("r1", None).unwrap();
         assert!(db.digest("r1", 0, 0, 1, "fp").unwrap().is_none());
         assert!(db.digest("r1", 0, 2, 2, "fp2").unwrap().is_some());
         db.replace_segments("r1", "m", &segs).unwrap();

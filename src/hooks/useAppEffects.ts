@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
+  onFixProgress,
   onLlmStream,
   onModelProgress,
   onRecordingDeleted,
@@ -63,6 +64,10 @@ export function useBackendEvents(): void {
     onTranscriptionProgress((p) => {
       useLibrary.getState().applyProgress(p);
       if (p.newSegments?.length) useRecording.getState().appendSegments(p.recordingId, p.newSegments);
+    }),
+    onFixProgress((p) => {
+      useLibrary.getState().applyFixProgress(p);
+      useRecording.getState().updateSegments(p.recordingId, p.changed);
     }),
     onModelProgress((p) => useModels.getState().applyProgress(p)),
     onLlmStream((e) => useStreams.getState().apply(e)),

@@ -141,6 +141,9 @@ pub struct Segment {
     pub text: String,
     #[serde(default)]
     pub words: Vec<Word>,
+    /// The speech recognizer's text, kept when an AI fix changed `text`; None otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -352,6 +355,31 @@ pub struct TranscriptionProgress {
     pub progress: f32,
     pub message: Option<String>,
     pub new_segments: Vec<Segment>,
+}
+
+/// Event `transcript://fix-progress`: one batch of an AI transcript fix finished.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FixProgress {
+    pub recording_id: String,
+    /// Batches finished (including failed ones) out of `total`.
+    pub done: u32,
+    pub total: u32,
+    /// Segments this batch changed, with `original_text` set.
+    pub changed: Vec<Segment>,
+}
+
+/// Outcome of an AI transcript fix.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FixSummary {
+    /// Sentences whose text changed.
+    pub changed: u32,
+    pub batches: u32,
+    /// Batches that failed; their sentences were left as they were.
+    pub failed: u32,
+    /// The first failure, when some batches failed.
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

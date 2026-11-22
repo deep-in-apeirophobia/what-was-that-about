@@ -633,6 +633,15 @@ pub async fn import_link(app: AppHandle, url: String) -> CmdResult<Recording> {
 
 fn queue_transcription(app: &AppHandle, id: &str, model_id: String) -> anyhow::Result<()> {
     let state = app.state::<AppState>();
+    // A fix still running would write corrections meant for the old transcript.
+    if let Some(c) = state
+        .llm_jobs
+        .lock()
+        .unwrap()
+        .get(&crate::ai::fix_job_id(id))
+    {
+        c.store(true, Ordering::Relaxed);
+    }
     {
         let db = state.db.lock().unwrap();
         db.set_status(id, RecordingStatus::Queued, None)?;
@@ -787,6 +796,38 @@ pub fn update_segment_text(
         .unwrap()
         .update_segment_text(&id, segment_id, text.trim())
         .map_err(anyhow_err)
+}
+
+/// Correct recognition errors with the OpenRouter model. Progress (and the changed
+/// segments) arrive on `transcript://fix-progress`; `cancel_llm("fix:<id>")` stops it.
+#[tauri::command]
+pub async fn fix_transcript(app: AppHandle, id: String) -> CmdResult<FixSummary> {
+    crate::ai::fix_transcript(&app, &id)
+        .await
+        .map_err(anyhow_err)
+}
+
+/// Put back the recognizer's text of AI-fixed segments (`segment_ids` null = all).
+#[tauri::command]
+pub fn revert_transcript_fixes(
+    state: State<'_, AppState>,
+    id: String,
+    segment_ids: Option<Vec<u32>>,
+) -> CmdResult<Vec<Segment>> {
+    let reverted = state
+        .db
+        .lock()
+        .unwrap()
+        .revert_fixes(&id, segment_ids.as_deref())
+        .map_err(anyhow_err)?;
+    state.analytics.capture(
+        "transcript fixes reverted",
+        serde_json::json!({
+            "scope": if segment_ids.is_some() { "segments" } else { "all" },
+            "segments": reverted.len(),
+        }),
+    );
+    Ok(reverted)
 }
 
 #[tauri::command]
