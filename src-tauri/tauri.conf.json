@@ -28,7 +28,8 @@
         "enable": true,
         "scope": {
           "allow": [
-            "$APPDATA/library/**"
+            "$APPDATA/library/**",
+            "$APPDATA/attachments/**"
           ],
           "requireLiteralLeadingDot": false
         }

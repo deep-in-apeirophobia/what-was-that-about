@@ -333,7 +333,7 @@ pub fn get_recording(state: State<'_, AppState>, id: String) -> CmdResult<Record
         notes: db.notes(&id).map_err(anyhow_err)?,
         analysis: db.analysis(&id).map_err(anyhow_err)?,
         docs: db.docs(&id).map_err(anyhow_err)?,
-        chat: db.chat(Some(&id)).map_err(anyhow_err)?,
+        threads: db.threads(Some(&id)).map_err(anyhow_err)?,
         embeddings_indexed: db
             .has_embeddings(&id, &settings.embedding_model)
             .unwrap_or(false),
@@ -725,12 +725,13 @@ pub fn rename_recording(
 #[tauri::command]
 pub fn delete_recording(app: AppHandle, state: State<'_, AppState>, id: String) -> CmdResult<()> {
     state.worker.cancel(&id);
-    state
-        .db
-        .lock()
-        .unwrap()
-        .delete_recording(&id)
-        .map_err(anyhow_err)?;
+    let attachments = {
+        let db = state.db.lock().unwrap();
+        let paths = db.recording_attachment_paths(&id).unwrap_or_default();
+        db.delete_recording(&id).map_err(anyhow_err)?;
+        paths
+    };
+    crate::attachments::remove_files(&attachments);
     let dir = state.paths.recording_dir(&id);
     if dir.starts_with(&state.paths.library) && dir.exists() {
         let _ = std::fs::remove_dir_all(dir);
@@ -1091,27 +1092,141 @@ pub async fn index_embeddings(app: AppHandle, id: String) -> CmdResult<()> {
 pub async fn ask(
     app: AppHandle,
     recording_id: Option<String>,
+    thread_id: Option<String>,
     question: String,
+    attachment_ids: Option<Vec<String>>,
     request_id: String,
-) -> CmdResult<ChatMessage> {
-    crate::ai::ask(&app, recording_id, question, request_id)
-        .await
-        .map_err(anyhow_err)
+) -> CmdResult<AskResult> {
+    crate::ai::ask(
+        &app,
+        recording_id,
+        thread_id,
+        question,
+        attachment_ids.unwrap_or_default(),
+        request_id,
+    )
+    .await
+    .map_err(anyhow_err)
 }
 
 #[tauri::command]
-pub fn clear_chat(state: State<'_, AppState>, recording_id: Option<String>) -> CmdResult<()> {
+pub fn list_chat_threads(
+    state: State<'_, AppState>,
+    recording_id: Option<String>,
+) -> CmdResult<Vec<ChatThread>> {
     state
         .db
         .lock()
         .unwrap()
-        .clear_chat(recording_id.as_deref())
+        .threads(recording_id.as_deref())
         .map_err(anyhow_err)
 }
 
 #[tauri::command]
-pub fn list_library_chat(state: State<'_, AppState>) -> CmdResult<Vec<ChatMessage>> {
-    state.db.lock().unwrap().chat(None).map_err(anyhow_err)
+pub fn list_chat_messages(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> CmdResult<Vec<ChatMessage>> {
+    state
+        .db
+        .lock()
+        .unwrap()
+        .thread_messages(&thread_id)
+        .map_err(anyhow_err)
+}
+
+#[tauri::command]
+pub fn rename_chat_thread(
+    state: State<'_, AppState>,
+    thread_id: String,
+    title: String,
+) -> CmdResult<ChatThread> {
+    state
+        .db
+        .lock()
+        .unwrap()
+        .rename_thread(&thread_id, &title)
+        .map_err(anyhow_err)
+}
+
+#[tauri::command]
+pub fn delete_chat_thread(state: State<'_, AppState>, thread_id: String) -> CmdResult<()> {
+    let files = state
+        .db
+        .lock()
+        .unwrap()
+        .delete_thread(&thread_id)
+        .map_err(anyhow_err)?;
+    crate::attachments::remove_files(&files);
+    Ok(())
+}
+
+/// Attach a file from disk (picked or dropped) to the message being written.
+#[tauri::command]
+pub async fn add_chat_attachment_file(app: AppHandle, path: String) -> CmdResult<AttachmentUpload> {
+    crate::attachments::from_path(&app, &path)
+        .await
+        .map_err(anyhow_err)
+}
+
+/// Attach raw bytes: an image (`x-kind: image`), or a voice clip as little-endian f32 mono
+/// samples at `x-sample-rate` (`x-kind: audio`). `x-name` is the URI-encoded display name.
+#[tauri::command]
+pub async fn add_chat_attachment(
+    app: AppHandle,
+    request: tauri::ipc::Request<'_>,
+) -> CmdResult<ChatAttachment> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("expected a raw body".into());
+    };
+    let header = |k: &str| {
+        request
+            .headers()
+            .get(k)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+    };
+    let name = crate::attachments::percent_decode(&header("x-name").unwrap_or_default());
+    let kind = header("x-kind");
+    let rate: Option<u32> = header("x-sample-rate").and_then(|r| r.parse().ok());
+    let bytes = bytes.clone();
+    // converting and writing long clips takes a moment; keep it off the main thread
+    tokio::task::spawn_blocking(move || match kind.as_deref() {
+        Some("image") => crate::attachments::save_image(&app, &name, &bytes).map_err(anyhow_err),
+        Some("audio") => {
+            let rate = rate.ok_or("missing x-sample-rate")?;
+            let samples: Vec<f32> = bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect();
+            let samples = if rate == audio::TARGET_RATE {
+                samples
+            } else {
+                audio::resample(&samples, rate, audio::TARGET_RATE)
+            };
+            crate::attachments::save_audio(&app, &name, &samples).map_err(anyhow_err)
+        }
+        _ => Err("x-kind must be image or audio".into()),
+    })
+    .await
+    .map_err(err)?
+}
+
+/// Remove an attachment the user took off the message before sending it.
+#[tauri::command]
+pub fn discard_chat_attachment(state: State<'_, AppState>, id: String) -> CmdResult<()> {
+    let path = state
+        .db
+        .lock()
+        .unwrap()
+        .discard_attachment(&id)
+        .map_err(anyhow_err)?;
+    if let Some(p) = path {
+        crate::attachments::remove_files(&[p]);
+    }
+    Ok(())
 }
 
 #[tauri::command]

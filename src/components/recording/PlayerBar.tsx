@@ -13,10 +13,10 @@ import {
   Volume2,
   VolumeX,
 } from "lucide-react";
-import { api, isTauri } from "../../lib/api";
+import { api } from "../../lib/api";
 import { errorMessage } from "../../lib/errors";
 import { formatTime } from "../../lib/format";
-import { mediaUrl } from "../../lib/platform";
+import { ASSET_NEEDS_BLOB, mediaUrl, playableUrl } from "../../lib/platform";
 import { nextSegmentTime, previousSegmentTime } from "../../lib/segments";
 import type { Chapter, Note, Recording, Segment, Waveform as WaveformData } from "../../lib/types";
 import { RATES, usePlayer } from "../../store/player";
@@ -27,28 +27,15 @@ import { Waveform } from "./Waveform";
 
 type Source = { url: string | null; kind: "original" | "fallback"; error: string | null; preparing: boolean };
 
-/** WebKitGTK (Linux) can't stream <audio> from Tauri's asset:// scheme (fetch works), so
- *  there the file is loaded into a blob URL instead. */
-const NEEDS_BLOB = isTauri() && typeof navigator !== "undefined" && /Linux/i.test(navigator.userAgent) && !/Android/i.test(navigator.userAgent);
-
-async function playableUrl(path: string): Promise<string> {
-  const url = mediaUrl(path);
-  if (!url) throw new Error("No playable file was produced.");
-  if (!NEEDS_BLOB || url.startsWith("blob:") || url.startsWith("data:")) return url;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Couldn't read the audio file (HTTP ${res.status}).`);
-  return URL.createObjectURL(await res.blob());
-}
-
 /** Owns the single <audio> element and keeps the player store in sync with it. */
 function useAudioElement(recording: Recording) {
   const ref = useRef<HTMLAudioElement>(null);
   const [el, setEl] = useState<HTMLAudioElement | null>(null);
   const [source, setSource] = useState<Source>(() => ({
-    url: NEEDS_BLOB ? null : mediaUrl(recording.audioPath),
+    url: ASSET_NEEDS_BLOB ? null : mediaUrl(recording.audioPath),
     kind: "original",
     error: null,
-    preparing: NEEDS_BLOB,
+    preparing: ASSET_NEEDS_BLOB,
   }));
   const resumeAt = useRef<number | null>(null);
   const sourceRef = useRef(source);
@@ -73,7 +60,7 @@ function useAudioElement(recording: Recording) {
   // New file (e.g. after in-browser decoding) → start over with the original source.
   useEffect(() => {
     let cancelled = false;
-    if (!NEEDS_BLOB) {
+    if (!ASSET_NEEDS_BLOB) {
       const url = mediaUrl(recording.audioPath);
       setSource({ url, kind: "original", error: null, preparing: false });
       if (!url) void tryFallback();

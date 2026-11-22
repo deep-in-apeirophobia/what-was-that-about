@@ -5,7 +5,11 @@
 
 import type {
   Analysis,
+  AskResult,
+  AttachmentUpload,
+  ChatAttachment,
   ChatMessage,
+  ChatThread,
   Doc,
   ExportFormat,
   FixProgress,
@@ -139,7 +143,6 @@ interface RecState {
   segments: Segment[];
   analysis: Analysis | null;
   docs: Doc[];
-  chat: ChatMessage[];
   notes: Note[];
   embeddingsIndexed: boolean;
   job: { cancelled: boolean } | null;
@@ -191,7 +194,76 @@ const installs = new Map<string, { cancelled: boolean }>();
 const cancelledRequests = new Set<string>();
 const fixJobs = new Set<string>();
 const recs = new Map<string, RecState>();
-let libraryChat: ChatMessage[] = [];
+interface MockThread {
+  thread: ChatThread;
+  messages: ChatMessage[];
+}
+const threads = new Map<string, MockThread>();
+const pendingAttachments = new Map<string, ChatAttachment>();
+
+function addMockThread(recordingId: string | null, title: string, messages: Omit<ChatMessage, "threadId" | "attachments" | "contextNote">[]): void {
+  const id = uid("thread");
+  const msgs = messages.map((m) => ({ ...m, threadId: id, attachments: [], contextNote: null }));
+  threads.set(id, {
+    thread: {
+      id,
+      recordingId,
+      title,
+      createdAt: msgs[0]?.createdAt ?? nowIso(),
+      updatedAt: msgs[msgs.length - 1]?.createdAt ?? nowIso(),
+      messageCount: msgs.length,
+      summary: null,
+      compactedCount: 0,
+    },
+    messages: msgs,
+  });
+}
+
+function threadsOf(recordingId: string | null): ChatThread[] {
+  return [...threads.values()]
+    .filter((t) => t.thread.recordingId === recordingId)
+    .map((t) => ({ ...t.thread, messageCount: t.messages.length }))
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
+function getThread(id: string): MockThread {
+  const t = threads.get(id);
+  if (!t) throw new Error("This conversation no longer exists.");
+  return t;
+}
+
+/** 16-bit mono WAV of float samples, for playing back mock voice messages. */
+function wavOf(samples: Float32Array, rate: number): Blob {
+  const buf = new ArrayBuffer(44 + samples.length * 2);
+  const v = new DataView(buf);
+  const ascii = (o: number, t: string) => [...t].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+  ascii(0, "RIFF");
+  v.setUint32(4, 36 + samples.length * 2, true);
+  ascii(8, "WAVE");
+  ascii(12, "fmt ");
+  v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true);
+  v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true);
+  v.setUint32(28, rate * 2, true);
+  v.setUint16(32, 2, true);
+  v.setUint16(34, 16, true);
+  ascii(36, "data");
+  v.setUint32(40, samples.length * 2, true);
+  samples.forEach((x, i) => v.setInt16(44 + i * 2, Math.max(-1, Math.min(1, x)) * 0x7fff, true));
+  return new Blob([buf], { type: "audio/wav" });
+}
+
+function sniffImage(bytes: Uint8Array): string {
+  const b = (i: number) => bytes[i] ?? 0;
+  if (b(0) === 0x89 && b(1) === 0x50) return "image/png";
+  if (b(0) === 0xff && b(1) === 0xd8) return "image/jpeg";
+  if (b(0) === 0x47 && b(1) === 0x49) return "image/gif";
+  if (b(8) === 0x57 && b(9) === 0x45) return "image/webp";
+  return "image/jpeg";
+}
+
+const MOCK_LUNA = "openai/gpt-6-luna";
 
 function makeRecording(partial: Partial<Recording> & Pick<Recording, "id" | "title" | "sourcePath">): Recording {
   return {
@@ -258,7 +330,6 @@ function seed(): void {
     segments: meetingFull,
     analysis: meetingAnalysis(meetingFull, ago(60 * 49)),
     docs: [],
-    chat: [],
     notes: [],
     embeddingsIndexed: true,
     job: null,
@@ -274,7 +345,7 @@ function seed(): void {
     createdAt: ago(60 * 48),
     updatedAt: ago(60 * 48),
   });
-  meeting.chat.push(
+  addMockThread(meeting.rec.id, "What were the main findings from the user interviews?", [
     {
       id: "msg-1",
       recordingId: meeting.rec.id,
@@ -296,7 +367,7 @@ function seed(): void {
       createdAt: ago(60 * 47),
       model: settings.llmModel,
     },
-  );
+  ]);
 
   // Notes: one with a URL, one linking to a moment in the lecture, one range note.
   const span = (from: number, to: number) => ({ start: meetingFull[from].start, end: meetingFull[to].end });
@@ -351,7 +422,6 @@ function seed(): void {
     segments: hafezFull,
     analysis: hafezAnalysis(hafezFull, ago(60 * 24 * 5)),
     docs: [],
-    chat: [],
     notes: [
       {
         id: "note-goethe",
@@ -386,7 +456,6 @@ function seed(): void {
     segments: [],
     analysis: null,
     docs: [],
-    chat: [],
     notes: [],
     embeddingsIndexed: false,
     job: null,
@@ -408,7 +477,6 @@ function seed(): void {
     segments: [],
     analysis: null,
     docs: [],
-    chat: [],
     notes: [],
     embeddingsIndexed: false,
     job: null,
@@ -420,7 +488,7 @@ function seed(): void {
     recs.set(s.rec.id, s);
   }
 
-  libraryChat = [
+  addMockThread(null, "Which recordings talk about privacy or cost?", [
     {
       id: "lmsg-1",
       recordingId: null,
@@ -441,7 +509,7 @@ function seed(): void {
       createdAt: ago(60 * 20),
       model: settings.llmModel,
     },
-  ];
+  ]);
 }
 
 seed();
@@ -896,7 +964,7 @@ export const handlers: Record<string, Handler> = {
       notes: s.notes.map((n) => ({ ...n })).sort(compareNotes),
       analysis: s.analysis,
       docs: [...s.docs],
-      chat: [...s.chat],
+      threads: threadsOf(s.rec.id),
       embeddingsIndexed: s.embeddingsIndexed,
     };
   },
@@ -936,7 +1004,6 @@ export const handlers: Record<string, Handler> = {
         segments: [],
         analysis: null,
         docs: [],
-        chat: [],
         notes: [],
         embeddingsIndexed: false,
         job: null,
@@ -972,6 +1039,7 @@ export const handlers: Record<string, Handler> = {
     const s = getRec(id);
     if (s.job) s.job.cancelled = true;
     recs.delete(id);
+    for (const [tid, t] of threads) if (t.thread.recordingId === id) threads.delete(tid);
     if (s.audioUrl) URL.revokeObjectURL(s.audioUrl);
     emit(EV.deleted, id);
   },
@@ -1174,44 +1242,177 @@ export const handlers: Record<string, Handler> = {
   ask: async (args) => {
     requireKey();
     const recordingId = optStr(args, "recordingId");
+    const threadId = optStr(args, "threadId");
     const question = str(args, "question").trim();
     const requestId = str(args, "requestId");
-    if (!question) throw new Error("Type a question first.");
-    const userMsg: ChatMessage = { id: uid("msg"), recordingId, role: "user", content: question, createdAt: nowIso(), model: null };
-    let answer: string;
-    if (recordingId) {
-      const s = getRec(recordingId);
-      if (!s.segments.length) throw new Error("This recording has no transcript yet.");
-      s.chat.push(userMsg);
-      answer = composeAnswer(s.segments, question, (seg) => `[${seg.id}]`, tagSegments([s], question));
-    } else {
-      libraryChat.push(userMsg);
-      const all = [...recs.values()].flatMap((s) => s.segments.map((seg) => ({ seg, s })));
-      const preferred = tagSegments([...recs.values()], question);
-      const picks = preferred.length ? preferred : bestSegments(all.map((x) => x.seg), question, 3);
-      const owner = (seg: Segment) => all.find((x) => x.seg === seg)!.s;
-      answer = composeAnswer(picks, question, (seg) => `[rec:${owner(seg).rec.id}#${seg.id}]`, picks);
+    const attachmentIds = Array.isArray(args.attachmentIds) ? (args.attachmentIds as string[]) : [];
+    const attachments = attachmentIds.map((id) => {
+      const a = pendingAttachments.get(id);
+      if (!a) throw new Error("The attachment is gone; attach the file again.");
+      return { ...a };
+    });
+    if (!question && !attachments.length) throw new Error("Type a question first.");
+    const existing = threadId ? getThread(threadId) : null;
+    if (existing && existing.thread.recordingId !== recordingId) throw new Error("This conversation belongs to another recording.");
+    const s = recordingId ? getRec(recordingId) : null;
+    if (s && !s.segments.length) throw new Error("This recording has no transcript yet.");
+    const model = MOCK_LLM_MODELS.find((m) => m.id === settings.llmModel);
+    const status = (text: string) => emit(EV.llm, { requestId, delta: null, done: false, error: null, status: text });
+    const askedAt = nowIso();
+    await sleep(300);
+
+    // files the model can't take become text first, like the real backend
+    for (const a of attachments) {
+      if (a.kind === "image" && !model?.inputModalities.includes("image")) {
+        status(`Describing the image with ${MOCK_LUNA}…`);
+        await sleep(900);
+        a.text = `A screenshot of a slide titled “Roadmap”, with three bullet points and a bar chart (mock description of ${a.name}).`;
+        a.textModel = MOCK_LUNA;
+      } else if (a.kind === "audio" && !model?.inputModalities.includes("audio")) {
+        status("Transcribing the voice message…");
+        await sleep(900);
+        a.text = "در این جلسه دربارهٔ چه چیزهایی تصمیم گرفته شد؟";
+        a.textModel = "shenava-koochik";
+      }
     }
-    await sleep(500);
+    // fold older turns into a summary once the thread gets long
+    if (existing && existing.messages.length - existing.thread.compactedCount >= 8) {
+      status("Summarizing earlier messages to fit the model's context…");
+      await sleep(700);
+      const folded = existing.messages.slice(0, existing.messages.length - 2);
+      existing.thread.summary = folded
+        .filter((m) => m.role === "user")
+        .map((m) => `- The user asked: ${shorten(m.content || "(voice message)", 14)}`)
+        .join("\n");
+      existing.thread.compactedCount = folded.length;
+    }
+    const condensed = !!s && (model?.contextLength ?? 128_000) < 64_000;
+    if (condensed) {
+      for (let i = 1; i <= 3; i++) {
+        status(`Condensing the long transcript for the model (${i}/3)…`);
+        await sleep(350);
+      }
+    }
+
+    const spoken = attachments.find((a) => a.kind === "audio")?.text ?? "";
+    const query = question || spoken || "summary";
+    let answer: string;
+    if (s) {
+      answer = composeAnswer(s.segments, query, (seg) => `[${seg.id}]`, tagSegments([s], query));
+    } else {
+      const all = [...recs.values()].flatMap((r) => r.segments.map((seg) => ({ seg, r })));
+      const preferred = tagSegments([...recs.values()], query);
+      const picks = preferred.length ? preferred : bestSegments(all.map((x) => x.seg), query, 3);
+      const owner = (seg: Segment) => all.find((x) => x.seg === seg)!.r;
+      answer = composeAnswer(picks, query, (seg) => `[rec:${owner(seg).rec.id}#${seg.id}]`, picks);
+    }
+    if (attachments.some((a) => a.kind === "image")) answer = `Looking at the image you attached as well:\n\n${answer}`;
     await stream(requestId, wordChunks(answer), 35);
+
+    const t =
+      existing ??
+      (() => {
+        addMockThread(recordingId, (question || spoken).split("\n")[0].slice(0, 60) || (attachments[0]?.kind === "image" ? "Image" : "Voice message"), []);
+        return [...threads.values()].pop()!;
+      })();
+    for (const a of attachments) pendingAttachments.delete(a.id);
+    const q: ChatMessage = { id: uid("msg"), recordingId, threadId: t.thread.id, role: "user", content: question, createdAt: askedAt, model: null, attachments, contextNote: null };
     const msg: ChatMessage = {
       id: uid("msg"),
       recordingId,
+      threadId: t.thread.id,
       role: "assistant",
       content: answer,
       createdAt: nowIso(),
       model: settings.llmModel,
+      attachments: [],
+      contextNote: condensed ? "The transcript was condensed to fit this model's context." : null,
     };
-    if (recordingId) recs.get(recordingId)?.chat.push(msg);
-    else libraryChat.push(msg);
-    return msg;
+    t.messages.push(q, msg);
+    t.thread.updatedAt = msg.createdAt;
+    const result: AskResult = { thread: { ...t.thread, messageCount: t.messages.length }, question: q, answer: msg };
+    return result;
   },
-  clear_chat: async (args) => {
-    const recordingId = optStr(args, "recordingId");
-    if (recordingId) getRec(recordingId).chat = [];
-    else libraryChat = [];
+  list_chat_threads: async (args) => {
+    await sleep(60);
+    return threadsOf(optStr(args, "recordingId"));
   },
-  list_library_chat: async () => [...libraryChat],
+  list_chat_messages: async (args) => {
+    await sleep(80);
+    return getThread(str(args, "threadId")).messages.map((m) => ({ ...m, attachments: [...m.attachments] }));
+  },
+  rename_chat_thread: async (args) => {
+    const t = getThread(str(args, "threadId"));
+    const title = str(args, "title").trim();
+    if (!title) throw new Error("A conversation needs a name.");
+    t.thread.title = title.slice(0, 120);
+    return { ...t.thread, messageCount: t.messages.length };
+  },
+  delete_chat_thread: async (args) => {
+    threads.delete(str(args, "threadId"));
+  },
+  add_chat_attachment_file: async (args) => {
+    const path = str(args, "path");
+    const name = path.split(/[\\/]/).pop() ?? path;
+    const image = /\.(png|jpe?g|gif|webp|bmp|avif|heic|heif|tiff?)$/i.test(name);
+    await sleep(250);
+    const attachment: ChatAttachment = {
+      id: uid("att"),
+      kind: image ? "image" : "audio",
+      name,
+      mime: image ? "image/png" : "audio/wav",
+      sizeBytes: 120_000,
+      durationSec: image ? null : 12,
+      path: "",
+      text: null,
+      textModel: null,
+    };
+    pendingAttachments.set(attachment.id, attachment);
+    const up: AttachmentUpload = { status: "ready", attachment };
+    return up;
+  },
+  add_chat_attachment: async (args) => {
+    const kind = str(args, "kind");
+    const name = str(args, "name");
+    if (name.includes("[fail]")) throw new Error("Simulated failure (mock): the file name contains [fail].");
+    await sleep(200);
+    let attachment: ChatAttachment;
+    if (kind === "image") {
+      const bytes = args.bytes as Uint8Array;
+      const mime = sniffImage(bytes);
+      attachment = {
+        id: uid("att"),
+        kind: "image",
+        name,
+        mime,
+        sizeBytes: bytes.length,
+        durationSec: null,
+        path: URL.createObjectURL(new Blob([bytes as Uint8Array<ArrayBuffer>], { type: mime })),
+        text: null,
+        textModel: null,
+      };
+    } else {
+      const samples = args.samples as Float32Array;
+      const rate = num(args, "sampleRate");
+      if (samples.length < rate * 0.3) throw new Error("The voice message is empty.");
+      attachment = {
+        id: uid("att"),
+        kind: "audio",
+        name,
+        mime: "audio/wav",
+        sizeBytes: samples.length * 2 + 44,
+        durationSec: Math.round((samples.length / rate) * 10) / 10,
+        path: URL.createObjectURL(wavOf(samples, rate)),
+        text: null,
+        textModel: null,
+      };
+    }
+    pendingAttachments.set(attachment.id, attachment);
+    return attachment;
+  },
+  discard_chat_attachment: async (args) => {
+    pendingAttachments.delete(str(args, "id"));
+  },
   generate_doc: async (args) => {
     requireKey();
     const s = getRec(str(args, "id"));

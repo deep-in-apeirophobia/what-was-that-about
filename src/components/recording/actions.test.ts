@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { FixSummary, RecordingDetail, Segment } from "../../lib/types";
 
-vi.mock("../../lib/api", () => ({
+vi.mock("../../lib/api", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../lib/api")>()),
   api: {
     fixTranscript: vi.fn(),
     revertTranscriptFixes: vi.fn(),

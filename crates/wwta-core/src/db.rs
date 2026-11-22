@@ -1,4 +1,5 @@
-//! SQLite-backed library: recordings, transcripts, AI analysis, chats, docs and embeddings.
+//! SQLite-backed library: recordings, transcripts, AI analysis, chat threads, docs, notes,
+//! embeddings and condensed-transcript digests.
 
 use std::path::Path;
 
@@ -7,8 +8,8 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::text::normalize_for_search;
 use crate::types::{
-    now_iso, Analysis, ChatMessage, Doc, Note, NoteWithRecording, Recording, RecordingStatus,
-    Segment, Word, NOTE_COLORS,
+    now_iso, Analysis, ChatAttachment, ChatMessage, ChatThread, Doc, Note, NoteWithRecording,
+    Recording, RecordingStatus, Segment, Word, NOTE_COLORS,
 };
 
 /// (recording_id, title, tag, segment ids), as returned by [`Db::all_tags`].
@@ -58,13 +59,50 @@ CREATE TABLE IF NOT EXISTS analysis_tags (
     segments TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS analysis_tags_norm ON analysis_tags(norm);
+CREATE TABLE IF NOT EXISTS chat_threads (
+    id TEXT PRIMARY KEY,
+    recording_id TEXT REFERENCES recordings(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    summary TEXT,
+    compacted_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS chat_threads_recording ON chat_threads(recording_id, updated_at);
 CREATE TABLE IF NOT EXISTS chat_messages (
     id TEXT PRIMARY KEY,
     recording_id TEXT REFERENCES recordings(id) ON DELETE CASCADE,
     role TEXT NOT NULL,
     content TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    model TEXT
+    model TEXT,
+    thread_id TEXT REFERENCES chat_threads(id) ON DELETE CASCADE,
+    context_note TEXT
+);
+CREATE TABLE IF NOT EXISTS chat_attachments (
+    id TEXT PRIMARY KEY,
+    message_id TEXT REFERENCES chat_messages(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL,
+    mime TEXT NOT NULL,
+    path TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    duration_sec REAL,
+    text TEXT,
+    text_model TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS chat_attachments_message ON chat_attachments(message_id);
+CREATE TABLE IF NOT EXISTS transcript_digests (
+    recording_id TEXT NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
+    level INTEGER NOT NULL,
+    start_seg INTEGER NOT NULL,
+    end_seg INTEGER NOT NULL,
+    fingerprint TEXT NOT NULL,
+    text TEXT NOT NULL,
+    model TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (recording_id, level, start_seg, end_seg)
 );
 CREATE TABLE IF NOT EXISTS docs (
     id TEXT PRIMARY KEY,
@@ -134,6 +172,10 @@ const RECORDING_SELECT: &str = "SELECT r.*, \
     EXISTS(SELECT 1 FROM analyses a WHERE a.recording_id = r.id) AS has_analysis \
     FROM recordings r";
 
+/// Drops the condensed-transcript notes covering one segment (`?1` recording, `?2` segment).
+const DELETE_SEGMENT_DIGESTS: &str =
+    "DELETE FROM transcript_digests WHERE recording_id = ?1 AND start_seg <= ?2 AND end_seg >= ?2";
+
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -164,7 +206,56 @@ impl Db {
         if !has_original_text {
             conn.execute_batch("ALTER TABLE segments ADD COLUMN original_text TEXT")?;
         }
-        Ok(Self { conn })
+        let has_thread_id: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('chat_messages') WHERE name = 'thread_id'")?
+            .exists([])?;
+        if !has_thread_id {
+            conn.execute_batch(
+                "ALTER TABLE chat_messages ADD COLUMN thread_id TEXT REFERENCES chat_threads(id) ON DELETE CASCADE; \
+                 ALTER TABLE chat_messages ADD COLUMN context_note TEXT;",
+            )?;
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS chat_messages_thread ON chat_messages(thread_id, created_at)",
+        )?;
+        let db = Self { conn };
+        db.adopt_threadless_messages()?;
+        Ok(db)
+    }
+
+    /// Chats from builds without threads become one thread per recording (and one for the
+    /// library), titled after their first question.
+    fn adopt_threadless_messages(&self) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let scopes: Vec<Option<String>> = {
+            let mut st = tx.prepare(
+                "SELECT DISTINCT recording_id FROM chat_messages WHERE thread_id IS NULL",
+            )?;
+            let v = st
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            v
+        };
+        for rid in scopes {
+            let (first, created, updated): (Option<String>, String, String) = tx.query_row(
+                "SELECT (SELECT content FROM chat_messages WHERE thread_id IS NULL AND recording_id IS ?1 \
+                 AND role = 'user' ORDER BY created_at, rowid LIMIT 1), MIN(created_at), MAX(created_at) \
+                 FROM chat_messages WHERE thread_id IS NULL AND recording_id IS ?1",
+                [&rid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            let id = uuid::Uuid::new_v4().to_string();
+            tx.execute(
+                "INSERT INTO chat_threads (id, recording_id, title, created_at, updated_at) VALUES (?1,?2,?3,?4,?5)",
+                params![id, rid, thread_title(first.as_deref().unwrap_or(""), &[]), created, updated],
+            )?;
+            tx.execute(
+                "UPDATE chat_messages SET thread_id = ?1 WHERE thread_id IS NULL AND recording_id IS ?2",
+                params![id, rid],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// After a crash/quit mid-job, put queued/transcribing recordings back to a resting state.
@@ -278,6 +369,10 @@ impl Db {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM segments WHERE recording_id = ?1", [id])?;
         tx.execute("DELETE FROM embeddings WHERE recording_id = ?1", [id])?;
+        tx.execute(
+            "DELETE FROM transcript_digests WHERE recording_id = ?1",
+            [id],
+        )?;
         // A new transcript renumbers segments, so the old analysis (chapters/tags point at
         // segment ids) no longer fits; docs and chat history are kept.
         tx.execute("DELETE FROM analyses WHERE recording_id = ?1", [id])?;
@@ -348,6 +443,8 @@ impl Db {
             "DELETE FROM embeddings WHERE recording_id = ?1 AND start_seg <= ?2 AND end_seg >= ?2",
             params![id, seg],
         )?;
+        self.conn
+            .execute(DELETE_SEGMENT_DIGESTS, params![id, seg])?;
         self.segments(id)?
             .into_iter()
             .find(|s| s.id == seg)
@@ -379,6 +476,7 @@ impl Db {
                 params![id, seg, old, new, normalize_for_search(new)],
             )?;
             if n > 0 {
+                tx.execute(DELETE_SEGMENT_DIGESTS, params![id, seg])?;
                 changed.push(*seg);
             }
         }
@@ -414,6 +512,7 @@ impl Db {
                 "UPDATE segments SET text = ?3, norm = ?4, original_text = NULL WHERE recording_id = ?1 AND idx = ?2",
                 params![id, seg, original, normalize_for_search(original)],
             )?;
+            tx.execute(DELETE_SEGMENT_DIGESTS, params![id, seg])?;
         }
         tx.execute("DELETE FROM embeddings WHERE recording_id = ?1", [id])?;
         tx.commit()?;
@@ -489,18 +588,151 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    // ---- chat
+    // ---- chat threads
 
-    pub fn add_chat(&self, m: &ChatMessage) -> Result<()> {
+    fn thread_from_row(r: &Row) -> rusqlite::Result<ChatThread> {
+        Ok(ChatThread {
+            id: r.get("id")?,
+            recording_id: r.get("recording_id")?,
+            title: r.get("title")?,
+            created_at: r.get("created_at")?,
+            updated_at: r.get("updated_at")?,
+            message_count: r.get::<_, i64>("message_count")? as u32,
+            summary: r.get("summary")?,
+            compacted_count: r.get::<_, i64>("compacted_count")? as u32,
+        })
+    }
+
+    const THREAD_SELECT: &'static str = "SELECT t.*, \
+        (SELECT COUNT(*) FROM chat_messages m WHERE m.thread_id = t.id) AS message_count \
+        FROM chat_threads t";
+
+    pub fn create_thread(&self, recording_id: Option<&str>, title: &str) -> Result<ChatThread> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = now_iso();
         self.conn.execute(
-            "INSERT INTO chat_messages (id, recording_id, role, content, created_at, model) VALUES (?1,?2,?3,?4,?5,?6)",
-            params![m.id, m.recording_id, m.role, m.content, m.created_at, m.model],
+            "INSERT INTO chat_threads (id, recording_id, title, created_at, updated_at) VALUES (?1,?2,?3,?4,?4)",
+            params![id, recording_id, title, now],
+        )?;
+        self.thread(&id)
+    }
+
+    pub fn thread(&self, id: &str) -> Result<ChatThread> {
+        self.conn
+            .query_row(
+                &format!("{} WHERE t.id = ?1", Self::THREAD_SELECT),
+                [id],
+                Self::thread_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("this conversation no longer exists"))
+    }
+
+    /// Threads of one recording (or the library when `None`), most recently active first.
+    pub fn threads(&self, recording_id: Option<&str>) -> Result<Vec<ChatThread>> {
+        let mut st = self.conn.prepare(&format!(
+            "{} WHERE t.recording_id IS ?1 ORDER BY t.updated_at DESC, t.rowid DESC",
+            Self::THREAD_SELECT
+        ))?;
+        let rows = st.query_map([recording_id], Self::thread_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn rename_thread(&self, id: &str, title: &str) -> Result<ChatThread> {
+        let title = title.trim();
+        if title.is_empty() {
+            anyhow::bail!("a conversation needs a name");
+        }
+        let title: String = title.chars().take(120).collect();
+        self.conn.execute(
+            "UPDATE chat_threads SET title = ?2 WHERE id = ?1",
+            params![id, title],
+        )?;
+        self.thread(id)
+    }
+
+    /// Deletes a thread with its messages; returns the attachment files to remove.
+    pub fn delete_thread(&self, id: &str) -> Result<Vec<String>> {
+        let paths = self.thread_attachment_paths("m.thread_id = ?1", id)?;
+        self.conn
+            .execute("DELETE FROM chat_threads WHERE id = ?1", [id])?;
+        Ok(paths)
+    }
+
+    /// Attachment files of every conversation about a recording (to delete with it).
+    pub fn recording_attachment_paths(&self, recording_id: &str) -> Result<Vec<String>> {
+        self.thread_attachment_paths("m.recording_id = ?1", recording_id)
+    }
+
+    fn thread_attachment_paths(&self, cond: &str, arg: &str) -> Result<Vec<String>> {
+        let mut st = self.conn.prepare(&format!(
+            "SELECT a.path FROM chat_attachments a JOIN chat_messages m ON m.id = a.message_id WHERE {cond}"
+        ))?;
+        let v = st
+            .query_map([arg], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(v)
+    }
+
+    pub fn set_thread_summary(&self, id: &str, summary: &str, compacted_count: u32) -> Result<()> {
+        self.conn.execute(
+            "UPDATE chat_threads SET summary = ?2, compacted_count = ?3 WHERE id = ?1",
+            params![id, summary, compacted_count],
         )?;
         Ok(())
     }
 
-    pub fn chat(&self, recording_id: Option<&str>) -> Result<Vec<ChatMessage>> {
-        let map = |r: &Row| -> rusqlite::Result<ChatMessage> {
+    /// Store a message (linking its attachments) and mark the thread as active.
+    pub fn add_chat(&self, m: &ChatMessage) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO chat_messages (id, recording_id, role, content, created_at, model, thread_id, context_note) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                m.id,
+                m.recording_id,
+                m.role,
+                m.content,
+                m.created_at,
+                m.model,
+                m.thread_id,
+                m.context_note
+            ],
+        )?;
+        for a in &m.attachments {
+            self.conn.execute(
+                "UPDATE chat_attachments SET message_id = ?2 WHERE id = ?1",
+                params![a.id, m.id],
+            )?;
+        }
+        self.conn.execute(
+            "UPDATE chat_threads SET updated_at = ?2 WHERE id = ?1",
+            params![m.thread_id, now_iso()],
+        )?;
+        Ok(())
+    }
+
+    /// Messages of a thread in order, with their attachments.
+    pub fn thread_messages(&self, thread_id: &str) -> Result<Vec<ChatMessage>> {
+        let mut atts: std::collections::HashMap<String, Vec<ChatAttachment>> =
+            std::collections::HashMap::new();
+        {
+            let mut st = self.conn.prepare(
+                "SELECT a.*, a.message_id AS mid FROM chat_attachments a JOIN chat_messages m ON m.id = a.message_id \
+                 WHERE m.thread_id = ?1 ORDER BY a.created_at, a.rowid",
+            )?;
+            let rows = st.query_map([thread_id], |r| {
+                Ok((r.get::<_, String>("mid")?, Self::attachment_from_row(r)?))
+            })?;
+            for row in rows {
+                let (mid, a) = row?;
+                atts.entry(mid).or_default().push(a);
+            }
+        }
+        let mut st = self.conn.prepare(
+            "SELECT id, recording_id, role, content, created_at, model, thread_id, context_note \
+             FROM chat_messages WHERE thread_id = ?1 ORDER BY created_at, rowid",
+        )?;
+        let rows = st.query_map([thread_id], |r| {
             Ok(ChatMessage {
                 id: r.get(0)?,
                 recording_id: r.get(1)?,
@@ -508,37 +740,153 @@ impl Db {
                 content: r.get(3)?,
                 created_at: r.get(4)?,
                 model: r.get(5)?,
+                thread_id: r.get(6)?,
+                context_note: r.get(7)?,
+                attachments: vec![],
             })
-        };
-        let sql = "SELECT id, recording_id, role, content, created_at, model FROM chat_messages";
-        let rows: Vec<ChatMessage> = match recording_id {
-            Some(id) => {
-                let mut st = self.conn.prepare(&format!(
-                    "{sql} WHERE recording_id = ?1 ORDER BY created_at, rowid"
-                ))?;
-                let v = st.query_map([id], map)?.collect::<rusqlite::Result<_>>()?;
-                v
+        })?;
+        let mut out: Vec<ChatMessage> = rows.collect::<rusqlite::Result<_>>()?;
+        for m in &mut out {
+            if let Some(a) = atts.remove(&m.id) {
+                m.attachments = a;
             }
-            None => {
-                let mut st = self.conn.prepare(&format!(
-                    "{sql} WHERE recording_id IS NULL ORDER BY created_at, rowid"
-                ))?;
-                let v = st.query_map([], map)?.collect::<rusqlite::Result<_>>()?;
-                v
-            }
-        };
-        Ok(rows)
+        }
+        Ok(out)
     }
 
-    pub fn clear_chat(&self, recording_id: Option<&str>) -> Result<()> {
-        match recording_id {
-            Some(id) => self
-                .conn
-                .execute("DELETE FROM chat_messages WHERE recording_id = ?1", [id])?,
-            None => self
-                .conn
-                .execute("DELETE FROM chat_messages WHERE recording_id IS NULL", [])?,
-        };
+    /// Deletes every thread of a recording (or of the library); returns attachment files.
+    pub fn clear_chat(&self, recording_id: Option<&str>) -> Result<Vec<String>> {
+        let mut paths = Vec::new();
+        for t in self.threads(recording_id)? {
+            paths.extend(self.delete_thread(&t.id)?);
+        }
+        Ok(paths)
+    }
+
+    // ---- chat attachments
+
+    fn attachment_from_row(r: &Row) -> rusqlite::Result<ChatAttachment> {
+        Ok(ChatAttachment {
+            id: r.get("id")?,
+            kind: r.get("kind")?,
+            name: r.get("name")?,
+            mime: r.get("mime")?,
+            size_bytes: r.get::<_, i64>("size_bytes")? as u64,
+            duration_sec: r.get("duration_sec")?,
+            path: r.get("path")?,
+            text: r.get("text")?,
+            text_model: r.get("text_model")?,
+        })
+    }
+
+    /// Register an uploaded attachment; it stays pending until a message links it.
+    pub fn add_attachment(&self, a: &ChatAttachment) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO chat_attachments (id, message_id, kind, name, mime, path, size_bytes, duration_sec, text, \
+             text_model, created_at) VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                a.id,
+                a.kind,
+                a.name,
+                a.mime,
+                a.path,
+                a.size_bytes as i64,
+                a.duration_sec,
+                a.text,
+                a.text_model,
+                now_iso()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// A pending attachment (not yet sent with a message).
+    pub fn pending_attachment(&self, id: &str) -> Result<ChatAttachment> {
+        self.conn
+            .query_row(
+                "SELECT * FROM chat_attachments WHERE id = ?1 AND message_id IS NULL",
+                [id],
+                Self::attachment_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("the attachment is gone; attach the file again"))
+    }
+
+    pub fn set_attachment_text(&self, id: &str, text: &str, model: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE chat_attachments SET text = ?2, text_model = ?3 WHERE id = ?1",
+            params![id, text, model],
+        )?;
+        Ok(())
+    }
+
+    /// Removes a pending attachment; returns its file path.
+    pub fn discard_attachment(&self, id: &str) -> Result<Option<String>> {
+        let path: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT path FROM chat_attachments WHERE id = ?1 AND message_id IS NULL",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        self.conn.execute(
+            "DELETE FROM chat_attachments WHERE id = ?1 AND message_id IS NULL",
+            [id],
+        )?;
+        Ok(path)
+    }
+
+    /// Forget attachments never sent (pending ones don't survive a restart) and return the
+    /// files that are still referenced.
+    pub fn prune_attachments(&self) -> Result<std::collections::HashSet<String>> {
+        self.conn
+            .execute("DELETE FROM chat_attachments WHERE message_id IS NULL", [])?;
+        let mut st = self.conn.prepare("SELECT path FROM chat_attachments")?;
+        let v = st
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(v)
+    }
+
+    // ---- condensed transcript digests
+
+    /// Cached digest of a transcript stretch, if it was made from the same input.
+    pub fn digest(
+        &self,
+        recording_id: &str,
+        level: u32,
+        start_seg: u32,
+        end_seg: u32,
+        fingerprint: &str,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT text FROM transcript_digests WHERE recording_id = ?1 AND level = ?2 AND start_seg = ?3 \
+                 AND end_seg = ?4 AND fingerprint = ?5",
+                params![recording_id, level, start_seg, end_seg, fingerprint],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_digest(
+        &self,
+        recording_id: &str,
+        level: u32,
+        start_seg: u32,
+        end_seg: u32,
+        fingerprint: &str,
+        text: &str,
+        model: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO transcript_digests (recording_id, level, start_seg, end_seg, fingerprint, text, \
+             model, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![recording_id, level, start_seg, end_seg, fingerprint, text, model, now_iso()],
+        )?;
         Ok(())
     }
 
@@ -788,6 +1136,25 @@ impl Db {
     }
 }
 
+/// Title for a new thread: the first line of the question, or what was attached.
+pub fn thread_title(question: &str, attachments: &[ChatAttachment]) -> String {
+    let line = question.lines().map(str::trim).find(|l| !l.is_empty());
+    match line {
+        Some(l) => {
+            let mut t: String = l.chars().take(60).collect();
+            if l.chars().count() > 60 {
+                t.push('…');
+            }
+            t
+        }
+        None => match attachments.first().map(|a| a.kind.as_str()) {
+            Some("audio") => "Voice message".into(),
+            Some("image") => "Image".into(),
+            _ => "Conversation".into(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1019,25 +1386,202 @@ mod tests {
         assert!(db.all_notes().unwrap().is_empty());
     }
 
+    fn msg(thread: &ChatThread, role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            recording_id: thread.recording_id.clone(),
+            thread_id: thread.id.clone(),
+            role: role.into(),
+            content: content.into(),
+            created_at: now_iso(),
+            model: None,
+            attachments: vec![],
+            context_note: None,
+        }
+    }
+
+    fn attachment(id: &str, kind: &str) -> ChatAttachment {
+        ChatAttachment {
+            id: id.into(),
+            kind: kind.into(),
+            name: format!("{id}.bin"),
+            mime: "application/octet-stream".into(),
+            size_bytes: 3,
+            duration_sec: None,
+            path: format!("/tmp/{id}.bin"),
+            text: None,
+            text_model: None,
+        }
+    }
+
     #[test]
-    fn chat_scopes() {
+    fn threads_scope_messages_and_attachments() {
         let db = Db::open_in_memory().unwrap();
         db.insert_recording(&sample_recording("r1")).unwrap();
-        for (rid, content) in [(Some("r1"), "a"), (None, "b")] {
-            db.add_chat(&ChatMessage {
-                id: uuid::Uuid::new_v4().to_string(),
-                recording_id: rid.map(String::from),
-                role: "user".into(),
-                content: content.into(),
-                created_at: now_iso(),
-                model: None,
-            })
+        let t1 = db.create_thread(Some("r1"), "first").unwrap();
+        let t2 = db.create_thread(Some("r1"), "second").unwrap();
+        let lib = db.create_thread(None, "library").unwrap();
+        db.add_attachment(&attachment("img", "image")).unwrap();
+        let mut q = msg(&t1, "user", "what is this?");
+        q.attachments = vec![db.pending_attachment("img").unwrap()];
+        db.add_chat(&q).unwrap();
+        db.add_chat(&msg(&t1, "assistant", "a chart")).unwrap();
+        db.add_chat(&msg(&lib, "user", "b")).unwrap();
+        // the attachment is linked now, so it's no longer pending
+        assert!(db.pending_attachment("img").is_err());
+        db.set_attachment_text("img", "a bar chart", "openai/gpt-6-luna")
+            .unwrap();
+
+        let m = db.thread_messages(&t1.id).unwrap();
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0].attachments.len(), 1);
+        assert_eq!(m[0].attachments[0].text.as_deref(), Some("a bar chart"));
+        assert!(m[1].attachments.is_empty());
+        let threads = db.threads(Some("r1")).unwrap();
+        assert_eq!(threads.len(), 2);
+        assert_eq!(
+            threads
+                .iter()
+                .find(|t| t.id == t1.id)
+                .unwrap()
+                .message_count,
+            2
+        );
+        assert_eq!(db.threads(None).unwrap().len(), 1);
+
+        db.set_thread_summary(&t1.id, "- asked about a chart", 2)
+            .unwrap();
+        let t = db.thread(&t1.id).unwrap();
+        assert_eq!(
+            (t.summary.as_deref(), t.compacted_count),
+            (Some("- asked about a chart"), 2)
+        );
+        assert_eq!(
+            db.rename_thread(&t2.id, "  renamed ").unwrap().title,
+            "renamed"
+        );
+        assert!(db.rename_thread(&t2.id, " ").is_err());
+
+        assert_eq!(
+            db.delete_thread(&t1.id).unwrap(),
+            vec!["/tmp/img.bin".to_string()]
+        );
+        assert!(db.thread(&t1.id).is_err());
+        assert!(db.prune_attachments().unwrap().is_empty());
+        db.clear_chat(None).unwrap();
+        assert!(db.threads(None).unwrap().is_empty());
+        // deleting the recording takes its threads with it
+        db.delete_recording("r1").unwrap();
+        assert!(db.threads(Some("r1")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pending_attachments_can_be_discarded_and_are_pruned() {
+        let db = Db::open_in_memory().unwrap();
+        db.add_attachment(&attachment("a", "audio")).unwrap();
+        db.add_attachment(&attachment("b", "image")).unwrap();
+        assert_eq!(
+            db.discard_attachment("a").unwrap().as_deref(),
+            Some("/tmp/a.bin")
+        );
+        assert!(db.pending_attachment("a").is_err());
+        assert!(db.prune_attachments().unwrap().is_empty());
+        assert!(db.pending_attachment("b").is_err());
+    }
+
+    #[test]
+    fn migrates_threadless_chats_into_threads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.sqlite");
+        {
+            // a library from a build before threads existed
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE recordings (id TEXT PRIMARY KEY, title TEXT NOT NULL, source_path TEXT NOT NULL, \
+                 audio_path TEXT NOT NULL, playback_wav_path TEXT, duration_sec REAL, created_at TEXT NOT NULL, \
+                 updated_at TEXT NOT NULL, status TEXT NOT NULL, model_id TEXT, error TEXT, \
+                 tags_json TEXT NOT NULL DEFAULT '[]', blurb TEXT, title_custom INTEGER NOT NULL DEFAULT 0); \
+                 CREATE TABLE chat_messages (id TEXT PRIMARY KEY, recording_id TEXT REFERENCES recordings(id) \
+                 ON DELETE CASCADE, role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL, model TEXT); \
+                 INSERT INTO recordings (id, title, source_path, audio_path, created_at, updated_at, status) \
+                 VALUES ('r1', 't', '', '', '2026-01-01', '2026-01-01', 'ready'); \
+                 INSERT INTO chat_messages VALUES ('m1', 'r1', 'user', 'چه گفت؟', '2026-01-01T10:00:00Z', NULL); \
+                 INSERT INTO chat_messages VALUES ('m2', 'r1', 'assistant', 'این [3]', '2026-01-01T10:00:05Z', 'x'); \
+                 INSERT INTO chat_messages VALUES ('m3', NULL, 'user', 'library?', '2026-01-02T10:00:00Z', NULL);",
+            )
             .unwrap();
         }
-        assert_eq!(db.chat(Some("r1")).unwrap().len(), 1);
-        assert_eq!(db.chat(None).unwrap()[0].content, "b");
-        db.clear_chat(None).unwrap();
-        assert!(db.chat(None).unwrap().is_empty());
-        assert_eq!(db.chat(Some("r1")).unwrap().len(), 1);
+        let db = Db::open(&path).unwrap();
+        let threads = db.threads(Some("r1")).unwrap();
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].title, "چه گفت؟");
+        assert_eq!(threads[0].message_count, 2);
+        assert_eq!(threads[0].updated_at, "2026-01-01T10:00:05Z");
+        let msgs = db.thread_messages(&threads[0].id).unwrap();
+        assert_eq!(msgs[1].content, "این [3]");
+        assert_eq!(db.threads(None).unwrap()[0].title, "library?");
+        drop(db);
+        // opening again doesn't duplicate anything
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.threads(Some("r1")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn digests_are_keyed_by_input_and_dropped_on_edits() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.insert_recording(&sample_recording("r1")).unwrap();
+        let segs: Vec<Segment> = (0..3)
+            .map(|i| Segment {
+                id: i,
+                start: i as f64,
+                end: i as f64 + 1.0,
+                text: format!("s{i}"),
+                words: vec![],
+                original_text: None,
+            })
+            .collect();
+        db.replace_segments("r1", "m", &segs).unwrap();
+        db.save_digest("r1", 0, 0, 1, "fp", "notes [0]", "model")
+            .unwrap();
+        db.save_digest("r1", 0, 2, 2, "fp2", "notes [2]", "model")
+            .unwrap();
+        assert_eq!(
+            db.digest("r1", 0, 0, 1, "fp").unwrap().as_deref(),
+            Some("notes [0]")
+        );
+        assert!(db.digest("r1", 0, 0, 1, "other").unwrap().is_none());
+        db.update_segment_text("r1", 1, "edited").unwrap();
+        assert!(db.digest("r1", 0, 0, 1, "fp").unwrap().is_none());
+        assert!(db.digest("r1", 0, 2, 2, "fp2").unwrap().is_some());
+        // AI fixes and restoring the recognized text are edits too
+        db.save_digest("r1", 0, 0, 1, "fp", "notes [0]", "model")
+            .unwrap();
+        db.apply_fixes("r1", &[(0, "s0".into(), "fixed".into())])
+            .unwrap();
+        assert!(db.digest("r1", 0, 0, 1, "fp").unwrap().is_none());
+        assert!(db.digest("r1", 0, 2, 2, "fp2").unwrap().is_some());
+        db.save_digest("r1", 0, 0, 1, "fp", "notes [0]", "model")
+            .unwrap();
+        db.revert_fixes("r1", None).unwrap();
+        assert!(db.digest("r1", 0, 0, 1, "fp").unwrap().is_none());
+        assert!(db.digest("r1", 0, 2, 2, "fp2").unwrap().is_some());
+        db.replace_segments("r1", "m", &segs).unwrap();
+        assert!(db.digest("r1", 0, 2, 2, "fp2").unwrap().is_none());
+    }
+
+    #[test]
+    fn titles_threads_from_questions_or_attachments() {
+        assert_eq!(
+            thread_title("\n  What was decided?\nmore", &[]),
+            "What was decided?"
+        );
+        assert_eq!(
+            thread_title("", &[attachment("a", "audio")]),
+            "Voice message"
+        );
+        assert_eq!(thread_title(" ", &[attachment("a", "image")]), "Image");
+        assert_eq!(thread_title("", &[]), "Conversation");
+        let long = "x".repeat(80);
+        assert_eq!(thread_title(&long, &[]).chars().count(), 61);
     }
 }

@@ -49,6 +49,8 @@ interface AppState {
   /** Seek to apply once the target recording's view is ready. */
   pendingSeek: SeekRequest | null;
   dragging: boolean;
+  /** Files dragged over an Ask chat get attached instead of imported. */
+  dragOverChat: boolean;
   /** Resolved theme (settings.theme with "system" applied). */
   dark: boolean;
 
@@ -62,6 +64,7 @@ interface AppState {
   dismissOnboarding: () => void;
   reopenOnboarding: () => void;
   setDragging: (v: boolean) => void;
+  setDragOverChat: (v: boolean) => void;
   setDark: (v: boolean) => void;
 }
 
@@ -76,6 +79,7 @@ export const useApp = create<AppState>((set, get) => ({
   onboardingDismissed: readBool(LS.onboarding),
   pendingSeek: null,
   dragging: false,
+  dragOverChat: false,
   dark: false,
 
   navigate: (route) => set({ route }),
@@ -106,6 +110,9 @@ export const useApp = create<AppState>((set, get) => ({
     writeBool(LS.onboarding, false);
     set({ onboardingDismissed: false });
   },
-  setDragging: (dragging) => set({ dragging }),
+  setDragging: (dragging) => set(dragging ? { dragging } : { dragging, dragOverChat: false }),
+  setDragOverChat: (dragOverChat) => {
+    if (useApp.getState().dragOverChat !== dragOverChat) set({ dragOverChat });
+  },
   setDark: (dark) => set({ dark }),
 }));

@@ -27,6 +27,7 @@ log.workspace = true
 uuid = { version = "1", features = ["v4"] }
 regex = "1"
 dirs = "7"
+futures-util = "0.3"
 # Crash reporting (only active when SENTRY_DSN is set at build time). No TLS feature here:
 # it uses the workspace's reqwest/rustls (ring) build instead of pulling in aws-lc.
 sentry = { version = "0.49", default-features = false, features = ["backtrace", "contexts", "debug-images", "panic", "reqwest", "release-health"] }
@@ -37,3 +38,9 @@ tauri-plugin-sentry = "0.9"
 wwta-core = { path = "../crates/wwta-core", features = ["metal"] }
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 wwta-core = { path = "../crates/wwta-core", features = ["vulkan"] }
+
+# Linux: GDK font-DPI guard before the first webview (see linux_dpi.rs), and media
+# streams (microphone for voice messages) in the WebKitGTK webview.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+webkit2gtk = "2.0"

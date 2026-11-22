@@ -38,6 +38,9 @@
             # /run/opengl-driver/lib: NixOS GPU drivers (NVIDIA's Vulkan ICD is found by soname)
             export LD_LIBRARY_PATH=/run/opengl-driver/lib:${pkgs.lib.makeLibraryPath [ pkgs.vulkan-loader pkgs.libGL ]}:''${LD_LIBRARY_PATH:-}
             export WEBKIT_DISABLE_DMABUF_RENDERER=1
+            # GSettings schemas, as wrapGAppsHook would provide: GTK's file chooser aborts
+            # without them, and GDK reads the desktop's font scaling from them.
+            export XDG_DATA_DIRS=${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}:${pkgs.gtk3}/share/gsettings-schemas/${pkgs.gtk3.name}:''${XDG_DATA_DIRS:-/usr/local/share:/usr/share}
           '';
         };
       });

@@ -6,6 +6,8 @@ export interface StreamState {
   text: string;
   done: boolean;
   error: string | null;
+  /** Latest progress note before the text streams ("Describing the image…"). */
+  status: string | null;
 }
 
 interface StreamsState {
@@ -18,7 +20,7 @@ interface StreamsState {
 export const useStreams = create<StreamsState>((set) => ({
   streams: {},
   start: (requestId) =>
-    set((s) => ({ streams: { ...s.streams, [requestId]: { text: "", done: false, error: null } } })),
+    set((s) => ({ streams: { ...s.streams, [requestId]: { text: "", done: false, error: null, status: null } } })),
   apply: (e) =>
     set((s) => {
       const cur = s.streams[e.requestId];
@@ -31,6 +33,7 @@ export const useStreams = create<StreamsState>((set) => ({
             text: cur.text + (e.delta ?? ""),
             done: cur.done || e.done,
             error: e.error ?? cur.error,
+            status: e.status ?? cur.status,
           },
         },
       };

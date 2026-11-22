@@ -10,6 +10,7 @@ import {
 } from "../lib/api";
 import { listenFileDrop, isTypingTarget } from "../lib/platform";
 import { useApp } from "../store/app";
+import { useChats } from "../store/chat";
 import { useLibrary } from "../store/library";
 import { useModels } from "../store/models";
 import { useRecording } from "../store/recording";
@@ -17,6 +18,7 @@ import { useSettings } from "../store/settings";
 import { useStreams } from "../store/streams";
 import { toast } from "../store/toasts";
 import { isOverlayOpen } from "../components/ui/Dialog";
+import { chatScopeAt } from "../components/Chat";
 
 /** Collect async unlisten functions and dispose them safely on unmount. */
 function useSubscriptions(setup: () => Promise<UnlistenFn>[]): void {
@@ -98,15 +100,20 @@ export function useTheme(): void {
   }, [theme]);
 }
 
-/** Whole-window file drag & drop → import. */
+/** Whole-window file drag & drop → import, or attach when dropped on an Ask chat. */
 export function useFileDrop(): void {
   useSubscriptions(() => [
     listenFileDrop((e) => {
-      if (e.type === "enter") useApp.getState().setDragging(true);
-      else if (e.type === "leave") useApp.getState().setDragging(false);
+      const app = useApp.getState();
+      if (e.type === "enter") app.setDragging(true);
+      else if (e.type === "leave") app.setDragging(false);
+      else if (e.type === "over") app.setDragOverChat(chatScopeAt(e.x, e.y) !== undefined);
       else if (e.type === "drop") {
-        useApp.getState().setDragging(false);
-        void useLibrary.getState().importPaths(e.paths);
+        app.setDragging(false);
+        const scope = chatScopeAt(e.x, e.y);
+        if (scope === undefined) void useLibrary.getState().importPaths(e.paths);
+        else if (e.files.length) void useChats.getState().attachFiles(scope, e.files);
+        else void useChats.getState().attachPaths(scope, e.paths);
       }
     }),
   ]);

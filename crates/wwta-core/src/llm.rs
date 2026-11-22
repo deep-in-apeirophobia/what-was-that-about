@@ -1,15 +1,17 @@
 //! OpenRouter client (chat completions with streaming, embeddings, model list) and the
-//! prompts behind analysis, Q&A and interactive doc generation.
+//! prompts behind analysis, Q&A, interactive docs, transcript condensing and chat compaction.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use base64::Engine as _;
 use futures_util::StreamExt;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::context::estimate_tokens;
 use crate::text::fmt_time;
 use crate::types::{Analysis, Chapter, LlmModelInfo, Segment, Tag};
 
@@ -18,27 +20,117 @@ pub const BASE_URL: &str = "https://openrouter.ai/api/v1";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Msg {
     pub role: String,
-    pub content: String,
+    pub content: Content,
+}
+
+/// Message content: plain text, or parts mixing text with images and audio.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Content {
+    Text(String),
+    Parts(Vec<Part>),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Part {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrl },
+    InputAudio { input_audio: InputAudio },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageUrl {
+    pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InputAudio {
+    /// Base64 audio bytes.
+    pub data: String,
+    pub format: String,
+}
+
+/// Rough prompt cost of one image; providers bill 500–1,600 tokens for typical sizes.
+pub const IMAGE_TOKENS: usize = 1_200;
+
+impl Part {
+    pub fn text(s: impl Into<String>) -> Self {
+        Part::Text { text: s.into() }
+    }
+
+    pub fn image(mime: &str, bytes: &[u8]) -> Self {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+        Part::ImageUrl {
+            image_url: ImageUrl {
+                url: format!("data:{mime};base64,{b64}"),
+            },
+        }
+    }
+
+    pub fn wav(bytes: &[u8]) -> Self {
+        Part::InputAudio {
+            input_audio: InputAudio {
+                data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                format: "wav".into(),
+            },
+        }
+    }
+
+    pub fn tokens(&self) -> usize {
+        match self {
+            Part::Text { text } => estimate_tokens(text),
+            Part::ImageUrl { .. } => IMAGE_TOKENS,
+            // 16 kHz 16-bit WAV is 32 kB/s and models bill ~32 tokens per second of audio
+            Part::InputAudio { input_audio } => input_audio.data.len() * 3 / 4 / 1_000 + 16,
+        }
+    }
+}
+
+impl Content {
+    pub fn tokens(&self) -> usize {
+        match self {
+            Content::Text(t) => estimate_tokens(t),
+            Content::Parts(p) => p.iter().map(Part::tokens).sum(),
+        }
+    }
 }
 
 impl Msg {
     pub fn system(c: impl Into<String>) -> Self {
         Self {
             role: "system".into(),
-            content: c.into(),
+            content: Content::Text(c.into()),
         }
     }
     pub fn user(c: impl Into<String>) -> Self {
         Self {
             role: "user".into(),
-            content: c.into(),
+            content: Content::Text(c.into()),
         }
     }
     pub fn assistant(c: impl Into<String>) -> Self {
         Self {
             role: "assistant".into(),
-            content: c.into(),
+            content: Content::Text(c.into()),
         }
+    }
+    /// A user message with images/audio; a single text part collapses to plain text.
+    pub fn user_parts(mut parts: Vec<Part>) -> Self {
+        let content = match parts.as_slice() {
+            [Part::Text { .. }] => match parts.remove(0) {
+                Part::Text { text } => Content::Text(text),
+                _ => unreachable!(),
+            },
+            _ => Content::Parts(parts),
+        };
+        Self {
+            role: "user".into(),
+            content,
+        }
+    }
+    pub fn tokens(&self) -> usize {
+        self.content.tokens() + 4
     }
 }
 
@@ -288,8 +380,9 @@ pub async fn list_models() -> Result<Vec<LlmModelInfo>> {
         .user_agent(concat!("what-was-that-about/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(30))
         .build()?;
+    let base = std::env::var("WWTA_OPENROUTER_BASE").unwrap_or_else(|_| BASE_URL.into());
     let v: Value = http
-        .get(format!("{BASE_URL}/models"))
+        .get(format!("{base}/models"))
         .send()
         .await?
         .error_for_status()?
@@ -315,11 +408,61 @@ pub async fn list_models() -> Result<Vec<LlmModelInfo>> {
             context_length: m["context_length"].as_u64(),
             prompt_price: price(&m["pricing"]["prompt"]),
             completion_price: price(&m["pricing"]["completion"]),
+            input_modalities: m["architecture"]["input_modalities"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            created: m["created"].as_u64(),
         })
         .filter(|m| !m.id.is_empty())
         .collect();
     models.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(models)
+}
+
+/// Describes images for chat models that can't see them, when the model list is unavailable.
+pub const LUNA_FALLBACK: &str = "openai/gpt-6-luna";
+
+/// Numeric parts of a model id ("openai/gpt-6.1-luna" -> [6, 1]), for ordering versions.
+fn version_key(id: &str) -> Vec<u32> {
+    id.split(|c: char| !c.is_ascii_digit())
+        .filter_map(|p| p.parse().ok())
+        .collect()
+}
+
+/// The newest OpenAI Luna model that accepts images: highest version among plain
+/// `openai/gpt-<version>-luna` ids (other Luna variants only if there are none), newest
+/// first on ties. Falls back to [`LUNA_FALLBACK`].
+pub fn latest_luna(models: &[LlmModelInfo]) -> String {
+    let plain = Regex::new(r"^openai/gpt-[0-9][0-9.]*-luna$").unwrap();
+    let lunas: Vec<&LlmModelInfo> = models
+        .iter()
+        .filter(|m| {
+            m.id.starts_with("openai/")
+                && m.id.contains("luna")
+                && !m.id.contains(':')
+                && m.accepts("image")
+        })
+        .collect();
+    let pool: Vec<&LlmModelInfo> = if lunas.iter().any(|m| plain.is_match(&m.id)) {
+        lunas
+            .into_iter()
+            .filter(|m| plain.is_match(&m.id))
+            .collect()
+    } else {
+        lunas
+    };
+    pool.into_iter()
+        .max_by(|a, b| {
+            (version_key(&a.id), a.created.unwrap_or(0))
+                .cmp(&(version_key(&b.id), b.created.unwrap_or(0)))
+        })
+        .map(|m| m.id.clone())
+        .unwrap_or_else(|| LUNA_FALLBACK.into())
 }
 
 // ------------------------------------------------------------------ prompts
@@ -332,11 +475,16 @@ pub fn language_instruction(ai_language: &str) -> &'static str {
     }
 }
 
+/// One transcript line with its stable id: `[12] (03:21) text`.
+pub fn transcript_line(s: &Segment) -> String {
+    format!("[{}] ({}) {}\n", s.id, fmt_time(s.start), s.text.trim())
+}
+
 /// Transcript lines with stable ids: `[12] (03:21) text`.
 pub fn transcript_lines(segs: &[Segment], max_chars: usize) -> String {
     let mut out = String::new();
     for s in segs {
-        let line = format!("[{}] ({}) {}\n", s.id, fmt_time(s.start), s.text.trim());
+        let line = transcript_line(s);
         if out.len() + line.len() > max_chars {
             out.push_str("[…transcript truncated…]\n");
             break;
@@ -346,9 +494,42 @@ pub fn transcript_lines(segs: &[Segment], max_chars: usize) -> String {
     out
 }
 
-const MAX_TRANSCRIPT_CHARS: usize = 900_000;
+/// Transcript prepared for a prompt: every line, or — when that doesn't fit the model's
+/// context — condensed notes per section (plus verbatim excerpts for questions).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranscriptText {
+    pub text: String,
+    pub condensed: bool,
+}
 
-pub fn analysis_messages(title: &str, segs: &[Segment], ai_language: &str) -> Vec<Msg> {
+impl TranscriptText {
+    pub fn full(segs: &[Segment]) -> Self {
+        Self {
+            text: transcript_lines(segs, usize::MAX),
+            condensed: false,
+        }
+    }
+}
+
+/// Heading of one condensed section: `### [120–185] 10:00–19:58`.
+pub fn section_heading(first_id: u32, last_id: u32, start: f64, end: f64) -> String {
+    format!(
+        "### [{first_id}–{last_id}] {}–{}\n",
+        fmt_time(start),
+        fmt_time(end)
+    )
+}
+
+const CONDENSED_NOTE: &str = "The transcript is too long to include in full, so it was condensed: under each \
+\"### [first–last] time\" heading are notes on that stretch of segments, each line ending with the segment ids it \
+comes from in square brackets.";
+
+pub fn analysis_messages(
+    title: &str,
+    segs: &[Segment],
+    transcript: &TranscriptText,
+    ai_language: &str,
+) -> Vec<Msg> {
     let last = segs.last().map(|s| s.id).unwrap_or(0);
     let system = format!(
         "You are an expert editor who turns raw speech-recognition transcripts into navigable notes. \
@@ -368,16 +549,20 @@ pub fn analysis_messages(title: &str, segs: &[Segment], ai_language: &str) -> Ve
            \"questions\": array of 3-5 questions a listener might want to ask about this recording\n\
          }}\n\
          Segment ids are the numbers in square brackets. Use only ids that exist. Tag names should be short (1-3 words) \
-         and reusable across recordings (prefer general topics over one-off phrases).",
-        lang = language_instruction(ai_language)
+         and reusable across recordings (prefer general topics over one-off phrases).{condensed}",
+        lang = language_instruction(ai_language),
+        condensed = if transcript.condensed {
+            format!("\n\n{CONDENSED_NOTE} Use those ids for chapters and tags.")
+        } else {
+            String::new()
+        },
     );
     let user = format!(
         "Recording: {title}\nSegments: 0..{last}\n\nTranscript:\n{}",
-        transcript_lines(segs, MAX_TRANSCRIPT_CHARS)
+        transcript.text
     );
     vec![Msg::system(system), Msg::user(user)]
 }
-
 /// Extract the first top-level JSON object from a model response.
 pub fn extract_json(s: &str) -> Result<Value> {
     let trimmed = s.trim();
@@ -510,7 +695,7 @@ pub fn parse_analysis(v: &Value, segs: &[Segment], model: &str, language: &str) 
 
 pub fn qa_system(
     title: &str,
-    segs: &[Segment],
+    transcript: &TranscriptText,
     analysis: Option<&Analysis>,
     notes: &[crate::types::Note],
     ai_language: &str,
@@ -529,6 +714,18 @@ pub fn qa_system(
             ));
         }
     }
+    let (label, condensed_rule) = if transcript.condensed {
+        (
+            "Transcript (condensed notes, then verbatim excerpts)",
+            format!(
+                "- {CONDENSED_NOTE} After the notes come verbatim excerpts (\"[id] (time) text\") picked for the \
+                 latest question. Cite segment ids from either. If a detail isn't there, say the answer may be in \
+                 parts of the recording you can't see in full.\n"
+            ),
+        )
+    } else {
+        ("Transcript (\"[id] (time) text\")", String::new())
+    };
     format!(
         "You answer questions about one audio recording using its automatic transcript. {lang}\n\
          Rules:\n\
@@ -536,9 +733,11 @@ pub fn qa_system(
          e.g. [12] or a range [12-15]. Cite precisely; these become clickable links to the audio.\n\
          - If the transcript does not contain the answer, say so plainly instead of guessing.\n\
          - The transcript comes from speech recognition and may contain misrecognized words; interpret sensibly.\n\
+         - The user may attach images or voice messages; use them together with the transcript.\n\
+         {condensed_rule}\
          - Be concise and use markdown (short paragraphs or bullets).\n\
-         Recording: {title}\n{summary}\nTranscript (\"[id] (time) text\"):\n{}",
-        transcript_lines(segs, MAX_TRANSCRIPT_CHARS),
+         Recording: {title}\n{summary}\n{label}:\n{}",
+        transcript.text,
         lang = language_instruction(ai_language),
     )
 }
@@ -551,18 +750,31 @@ pub struct LibraryContextItem {
 
 /// Library-wide Q&A uses short aliases (R1, R2…) for recordings; answers are rewritten to
 /// `[rec:<uuid>#<seg>]` citations by [`CitationRewriter`].
-pub fn library_qa_system(items: &[LibraryContextItem], ai_language: &str) -> String {
+pub fn library_qa_system(
+    items: &[LibraryContextItem],
+    ai_language: &str,
+    max_tokens: usize,
+) -> String {
     let mut ctx = String::new();
-    for (i, it) in items.iter().enumerate() {
-        ctx.push_str(&format!("\n## R{} — {}\n", i + 1, it.recording_title));
+    let mut used = 0usize;
+    'items: for (i, it) in items.iter().enumerate() {
+        let heading = format!("\n## R{} — {}\n", i + 1, it.recording_title);
+        used += estimate_tokens(&heading);
+        ctx.push_str(&heading);
         for s in &it.segments {
-            ctx.push_str(&format!(
+            let line = format!(
                 "[R{}#{}] ({}) {}\n",
                 i + 1,
                 s.id,
                 fmt_time(s.start),
                 s.text.trim()
-            ));
+            );
+            used += estimate_tokens(&line);
+            if used > max_tokens {
+                ctx.push_str("[…more excerpts omitted…]\n");
+                break 'items;
+            }
+            ctx.push_str(&line);
         }
     }
     format!(
@@ -572,6 +784,7 @@ pub fn library_qa_system(items: &[LibraryContextItem], ai_language: &str) -> Str
          Rules:\n\
          - Ground every claim in the excerpts and cite the keys you used in square brackets exactly as written, e.g. [R2#14].\n\
          - Mention which recording a point comes from when it helps.\n\
+         - The user may attach images or voice messages; use them together with the excerpts.\n\
          - If the excerpts don't answer the question, say so and suggest what to search for.\n\
          - Transcripts come from speech recognition and may contain errors. Be concise; use markdown.\n\
          Excerpts:{ctx}",
@@ -665,17 +878,95 @@ pub fn doc_system(ai_language: &str) -> String {
 pub fn doc_user(
     prompt: &str,
     title: &str,
-    segs: &[Segment],
+    transcript: &TranscriptText,
     analysis: Option<&Analysis>,
 ) -> String {
     let analysis_json = analysis
         .map(|a| serde_json::to_string(a).unwrap_or_default())
         .unwrap_or_else(|| "null".into());
+    let label = if transcript.condensed {
+        format!(
+            "Transcript, condensed for this request (the full transcript is still available as WWTA.segments). \
+             {CONDENSED_NOTE}"
+        )
+    } else {
+        "Transcript (also available as WWTA.segments; \"[id] (time) text\")".into()
+    };
     format!(
         "Request: {prompt}\n\nRecording: {title}\n\nAnalysis JSON (also available as WWTA.analysis):\n{analysis_json}\n\n\
-         Transcript (also available as WWTA.segments; \"[id] (time) text\"):\n{}",
-        transcript_lines(segs, 400_000)
+         {label}:\n{}",
+        transcript.text
     )
+}
+
+// ------------------------------------------------------------------ condensing & compaction
+
+/// Ask the model to condense one transcript section (`level` 0) or a group of section
+/// notes (`level` ≥ 1) into shorter notes that keep segment ids.
+pub fn condense_messages(title: &str, input: &str, level: u32) -> Vec<Msg> {
+    let system = "You condense automatic speech-recognition transcripts of Persian audio into dense notes. The \
+                  notes stand in for the transcript later, when someone asks questions about the recording or \
+                  wants a summary, so nothing important may be lost.";
+    let user = if level == 0 {
+        format!(
+            "Condense this part of the transcript of \"{title}\". Keep every fact, name, number, date, claim, \
+             argument, example, decision, task and question; drop filler, repetition and small talk. Write short \
+             lines and end each with the segment ids it comes from in square brackets, e.g. [12] or [12-15]. Write \
+             in the transcript's language. Aim for about one fifth of the original length. Output only the notes.\n\n\
+             Transcript (\"[id] (time) text\"):\n{input}"
+        )
+    } else {
+        format!(
+            "These notes were condensed from consecutive parts of the transcript of \"{title}\"; each line cites \
+             segment ids. Condense them to about one third of their length: merge related points, keep the important \
+             facts, names, numbers and decisions, and end every line with the segment ids it covers in square \
+             brackets. Keep the language. Output only the notes.\n\n{input}"
+        )
+    };
+    vec![Msg::system(system), Msg::user(user)]
+}
+
+/// Ask the model to merge older chat messages into the running conversation summary.
+pub fn summary_messages(previous: Option<&str>, conversation: &str, about: &str) -> Vec<Msg> {
+    let system = format!(
+        "You keep the memory of a conversation between a user and an assistant about {about}. The assistant will \
+         continue the conversation with only your summary instead of these messages."
+    );
+    let previous = previous
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| format!("Summary so far:\n{p}\n\n"))
+        .unwrap_or_default();
+    let user = format!(
+        "{previous}Messages to add:\n{conversation}\n\n\
+         Write one updated summary that merges both. Keep what the user asked and wants, the key facts and conclusions \
+         of the answers with their citations exactly as written (e.g. [12], [12-15], [rec:…#12]), what attached images \
+         and voice messages contained, the user's preferences and open questions. Drop pleasantries. Use compact bullet \
+         points, at most about 400 words, in the conversation's language. Output only the summary."
+    );
+    vec![Msg::system(system), Msg::user(user)]
+}
+
+/// Ask a vision model to describe an image for a chat model that can't see it.
+pub fn describe_image_messages(image: Part, question: &str) -> Vec<Msg> {
+    let ask = if question.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" Their message: \"{}\".", question.trim())
+    };
+    vec![
+        Msg::system(
+            "You describe images for an assistant that cannot see them. Be precise and complete but concise, and \
+             don't speculate.",
+        ),
+        Msg::user_parts(vec![
+            Part::text(format!(
+                "The user attached this image to a question about a transcribed audio recording.{ask} Describe \
+                 everything in it that could matter: all visible text verbatim (in its original language), numbers, \
+                 tables, charts, diagrams, people, objects and layout. Output only the description."
+            )),
+            image,
+        ]),
+    ]
 }
 
 /// Pull the HTML document out of a model response.
@@ -913,6 +1204,81 @@ mod tests {
         assert!(Usage::from_json(&serde_json::json!({"choices": []})).is_none());
     }
 
+    fn model(id: &str, modalities: &[&str], created: u64) -> LlmModelInfo {
+        LlmModelInfo {
+            id: id.into(),
+            name: id.into(),
+            context_length: Some(128_000),
+            prompt_price: None,
+            completion_price: None,
+            input_modalities: modalities.iter().map(|m| m.to_string()).collect(),
+            created: Some(created),
+        }
+    }
+
+    #[test]
+    fn picks_the_latest_luna_that_sees_images() {
+        assert_eq!(latest_luna(&[]), LUNA_FALLBACK);
+        let models = vec![
+            model("openai/gpt-5.5-luna", &["text", "image"], 300),
+            model("openai/gpt-6-luna", &["text", "image"], 200),
+            model("openai/gpt-6.1-luna", &["text"], 400), // can't see images
+            model("openai/gpt-6-luna-mini", &["text", "image"], 500),
+            model("openai/gpt-7-luna:free", &["text", "image"], 600),
+            model("someone/luna-7", &["text", "image"], 700),
+        ];
+        assert_eq!(latest_luna(&models), "openai/gpt-6-luna");
+        // only variants available: newest version wins
+        let variants = vec![
+            model("openai/gpt-6-luna-mini", &["image"], 100),
+            model("openai/gpt-6.2-luna-mini", &["image"], 50),
+        ];
+        assert_eq!(latest_luna(&variants), "openai/gpt-6.2-luna-mini");
+        let none = vec![model("openai/gpt-6", &["text", "image"], 1)];
+        assert_eq!(latest_luna(&none), LUNA_FALLBACK);
+    }
+
+    #[test]
+    fn serializes_multimodal_messages_for_openrouter() {
+        let m = Msg::user_parts(vec![
+            Part::text("what is this?"),
+            Part::image("image/png", b"\x89PNG"),
+        ]);
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(
+            v["content"][0],
+            json!({"type": "text", "text": "what is this?"})
+        );
+        assert_eq!(v["content"][1]["type"], "image_url");
+        assert_eq!(
+            v["content"][1]["image_url"]["url"],
+            "data:image/png;base64,iVBORw=="
+        );
+        let a = serde_json::to_value(Part::wav(b"RIFF")).unwrap();
+        assert_eq!(
+            a,
+            json!({"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}})
+        );
+        // a lone text part stays a plain string
+        let t = serde_json::to_value(Msg::user_parts(vec![Part::text("hi")])).unwrap();
+        assert_eq!(t, json!({"role": "user", "content": "hi"}));
+        assert!(m.tokens() > IMAGE_TOKENS);
+    }
+
+    #[test]
+    fn library_context_respects_the_budget() {
+        let items = vec![LibraryContextItem {
+            recording_id: "a".into(),
+            recording_title: "A".into(),
+            segments: segs(200),
+        }];
+        let small = library_qa_system(&items, "auto", 200);
+        assert!(small.contains("[R1#0]"));
+        assert!(small.contains("omitted"));
+        assert!(!small.contains("[R1#199]"));
+        assert!(library_qa_system(&items, "auto", 100_000).contains("[R1#199]"));
+    }
+
     #[test]
     fn fix_batches_cover_the_transcript() {
         let s = segs(200);
@@ -924,17 +1290,18 @@ mod tests {
         assert_eq!(b.len(), 3);
         assert!(fix_batches(&[]).is_empty());
 
-        let m = fix_messages("t", Some("خلاصه"), &s, b[1].clone());
-        let user = &m[1].content;
+        let text = |m: &Msg| match &m.content {
+            Content::Text(t) => t.clone(),
+            Content::Parts(_) => panic!("fix prompts are plain text"),
+        };
+        let user = text(&fix_messages("t", Some("خلاصه"), &s, b[1].clone())[1]);
         assert!(user.contains("خلاصه"));
         assert!(user.contains(
             "Context before (don't correct):\n[77] جمله 77\n[78] جمله 78\n[79] جمله 79\n"
         ));
         assert!(user.contains("Segments to correct:\n[80] جمله 80\n"));
         assert!(user.contains("Context after (don't correct):\n[160] جمله 160\n"));
-        assert!(!fix_messages("t", None, &s, b[0].clone())[1]
-            .content
-            .contains("Context before"));
+        assert!(!text(&fix_messages("t", None, &s, b[0].clone())[1]).contains("Context before"));
     }
 
     #[test]
