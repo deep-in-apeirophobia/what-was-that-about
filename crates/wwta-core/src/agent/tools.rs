@@ -6,7 +6,7 @@ use regex::Regex;
 use serde_json::{json, Value};
 
 use super::draft::{check_html, Draft, READ_LINES};
-use super::{clip, skills};
+use super::{clip, skills, CUT_NOTE};
 use crate::db::Db;
 use crate::llm::{extract_html, ToolCall};
 use crate::search;
@@ -43,6 +43,8 @@ pub struct ToolBox {
     draft: Draft,
     /// Segment ranges returned by transcript reads.
     read_ranges: Vec<(u32, u32)>,
+    /// The tool call behind each of `read_ranges`.
+    read_ids: Vec<String>,
     /// Last segment id, cached for coverage and statistics.
     transcript_last: Option<u32>,
     /// Draft changed since the last transcript read.
@@ -50,8 +52,6 @@ pub struct ToolBox {
     nudges: u32,
     /// Transcript bytes per read: [`WINDOW_CHARS`], less for a small context.
     window: usize,
-    /// Transcript bytes read since the draft last changed (doc mode).
-    unwritten: usize,
 }
 
 /// A completed draft, or a valid HTML answer from a model that ignored the tools.
@@ -87,11 +87,11 @@ impl ToolBox {
             doc_aliases: vec![],
             draft: Draft::default(),
             read_ranges: vec![],
+            read_ids: vec![],
             transcript_last: None,
             edited_since_read: false,
             nudges: 0,
             window: WINDOW_CHARS,
-            unwritten: 0,
         }
     }
 
@@ -100,6 +100,31 @@ impl ToolBox {
     /// is counted as having read.
     pub fn fit_window(&mut self, budget: usize) {
         self.window = (budget / 2).clamp(MIN_WINDOW_CHARS, WINDOW_CHARS);
+    }
+
+    /// The agent cut a transcript part to fit the context before the model saw all of it:
+    /// count only the segments it kept whole as read, so coverage shows the rest as unread.
+    pub fn on_cut(&mut self, call_id: &str, kept: &str) {
+        static LINE: std::sync::LazyLock<Regex> =
+            std::sync::LazyLock::new(|| Regex::new(r"^\[(\d+)\] ").unwrap());
+        let Some(i) = self.read_ids.iter().position(|id| id == call_id) else {
+            return;
+        };
+        // the line the cut went through is partial
+        let body = kept.rsplit_once(CUT_NOTE).map_or(kept, |(body, _)| body);
+        let whole = body.rsplit_once('\n').map_or("", |(whole, _)| whole);
+        let last = whole
+            .lines()
+            .rev()
+            .find_map(|l| LINE.captures(l)?[1].parse::<u32>().ok());
+        let (from, end) = self.read_ranges[i];
+        match last.filter(|&k| k >= from) {
+            Some(k) => self.read_ranges[i].1 = k.min(end),
+            None => {
+                self.read_ranges.remove(i);
+                self.read_ids.remove(i);
+            }
+        }
     }
 
     /// Load the existing doc for an in-place revision.
@@ -474,10 +499,14 @@ impl ToolBox {
                 self.transcript_last = db.segments(id).ok().and_then(|s| s.last().map(|s| s.id));
             }
         }
+        let reads = self.read_ranges.len();
         let out = match parse_args(&call.arguments) {
             Ok(args) => self.dispatch(db, &call.name, &args, semantic),
             Err(e) => Err(e),
         };
+        if self.read_ranges.len() > reads {
+            self.read_ids.push(call.id.clone());
+        }
         match out {
             Ok(s) => s,
             Err(e) => format!("Error: {e}"),
@@ -526,7 +555,6 @@ impl ToolBox {
                     .ok_or("`html` is required")?;
                 let out = self.draft.write(&html)?;
                 self.edited_since_read = true;
-                self.unwritten = 0;
                 Ok(format!("{out}\n{}", self.coverage()))
             }
             "read_draft" => {
@@ -561,7 +589,6 @@ impl ToolBox {
                 .ok_or("`new` is required")?;
                 let out = self.draft.edit(&old, &new)?;
                 self.edited_since_read = true;
-                self.unwritten = 0;
                 Ok(format!("{out}\n{}", self.coverage()))
             }
             "finish_doc" => self.draft.finish(),
@@ -803,16 +830,6 @@ impl ToolBox {
                 "segment {from} doesn't exist; the transcript has segments 0–{last}."
             ));
         }
-        // one part at a time: reading on before writing would put several parts in the
-        // context at once, and compaction would cut parts counted as read
-        if self.docs && self.unwritten >= self.window / 2 {
-            return Err(if self.draft.is_empty() {
-                "write the draft with write_draft, with what you found in the part you just read, before reading more: earlier parts are removed from your context."
-            } else {
-                "add what you found in the part you just read to the draft with edit_draft before reading more: earlier parts are removed from your context."
-            }
-            .into());
-        }
         let to = to.min(last);
         let prefix = if self.library() {
             format!("{}#", self.alias(id))
@@ -852,7 +869,6 @@ impl ToolBox {
             if let Some(end) = returned {
                 self.read_ranges.push((from, end));
             }
-            self.unwritten += body.len();
             if !self.draft.is_empty() && !self.edited_since_read {
                 out.push_str("\nReminder: nothing was added to the draft since the last part you read. Put what you found into the draft before reading on; earlier parts are removed from your context.");
             }
@@ -1248,32 +1264,27 @@ mod tests {
     }
 
     #[test]
-    fn docs_read_one_part_at_a_time() {
-        let mut db = Db::open_in_memory().unwrap();
-        db.insert_recording(&rec("x", "long")).unwrap();
-        let segs: Vec<Segment> = (0..200).map(|i| seg(i, &"کلمه ".repeat(400))).collect();
-        db.replace_segments("x", "m", &segs).unwrap();
-        let section = |from: u32| call("read_transcript_section", json!({"from": from}));
-        let mut t = ToolBox::new(Scope::Recording("x".into()), true);
-        t.fit_window(8_000);
-        assert!(t.run(&db, &section(0), vec![]).starts_with("Segments 0–0"));
-        assert!(t
-            .run(&db, &section(1), vec![])
-            .starts_with("Error: write the draft with write_draft"));
-        let html = "<!doctype html>\n<script>const ITEMS = [\n// end: items\n];</script>\n</html>";
-        t.run(&db, &call("write_draft", json!({"html": html})), vec![]);
-        assert!(t.run(&db, &section(1), vec![]).starts_with("Segments 1–1"));
-        assert!(t
-            .run(&db, &section(2), vec![])
-            .starts_with("Error: add what you found"));
-        let edit = json!({"old": "// end: items", "new": "1,\n// end: items"});
-        t.run(&db, &call("edit_draft", edit), vec![]);
-        assert!(t.run(&db, &section(2), vec![]).starts_with("Segments 2–2"));
-        // chat reads as much as it likes
-        let mut t = ToolBox::new(Scope::Recording("x".into()), false);
-        t.fit_window(8_000);
-        t.run(&db, &section(0), vec![]);
-        assert!(t.run(&db, &section(1), vec![]).starts_with("Segments 1–1"));
+    fn a_cut_part_counts_only_its_whole_segments() {
+        let db = library();
+        let mut t = ToolBox::new(Scope::Recording("uuid-a".into()), true);
+        let mut read = call("read_transcript", json!({}));
+        read.id = "r1".into();
+        let out = t.run(&db, &read, vec![]);
+        assert!(out.ends_with("Transcript read so far: all of 0–2."));
+        // cut in the middle of segment 1's line
+        let at = out.find("[1] ").unwrap() + 6;
+        t.on_cut("r1", &format!("{}{CUT_NOTE}", &out[..at]));
+        assert_eq!(
+            t.coverage(),
+            "Transcript read so far: 0 (33% of 0–2). Unread: 1–2."
+        );
+        // cut before any whole segment: nothing counts
+        t.on_cut("r1", &format!("Segments 0–0 of 0–2:\n[0] (0:{CUT_NOTE}"));
+        assert_eq!(t.coverage(), "Transcript read so far: nothing of 0–2.");
+        // results of other calls are left alone
+        t.run(&db, &read, vec![]);
+        t.on_cut("other", "x");
+        assert!(t.coverage().ends_with("all of 0–2."));
     }
 
     #[test]

@@ -43,6 +43,10 @@ the answers given with their citations exactly as written (like [12] or [R3#14])
 names that came up, and open questions. Write it in the language of the conversation. Reply with \
 the summary only.";
 
+/// Put after a tool result that was cut to fit the context.
+pub(crate) const CUT_NOTE: &str =
+    "\n[…the rest was cut to fit the context; ask for a smaller part.]";
+
 const ANSWER_NOW: &str = "You have used all your tool calls. Answer now with what you found; \
 say what you couldn't check.";
 
@@ -65,6 +69,9 @@ pub trait Host: Send {
     fn follow_up(&mut self, _answer: &str) -> Option<String> {
         None
     }
+    /// The result of `call_id` was cut to fit the context before the model saw all of it;
+    /// `kept` is what it will see.
+    fn on_cut(&mut self, _call_id: &str, _kept: &str) {}
 }
 
 /// What the model sees: the system prompt (plus a summary of older conversation), earlier
@@ -80,6 +87,8 @@ pub struct Context {
     /// Prune output older than the newest N rounds before each request (docs); None keeps
     /// output until the context overflows (chat).
     pub keep_rounds: Option<usize>,
+    /// Tool results cut since the host last heard about it: (call id, text kept).
+    cut: Vec<(String, String)>,
     /// Estimated tokens per character, calibrated from the usage the API reports.
     ratio: f64,
 }
@@ -135,6 +144,7 @@ impl Context {
             folded: 0,
             budget: CONTEXT_BUDGET,
             keep_rounds: None,
+            cut: vec![],
             ratio: DEFAULT_RATIO,
         }
     }
@@ -307,10 +317,11 @@ impl Context {
             if text.len() < 4_000 {
                 break;
             }
-            m.content = Content::Text(format!(
-                "{}\n[…the rest was cut to fit the context; ask for a smaller part.]",
-                clip(text, text.len() / 2)
-            ));
+            let kept = format!("{}{CUT_NOTE}", clip(text, text.len() / 2));
+            let id = m.tool_call_id.clone().unwrap_or_default();
+            self.cut.retain(|(cut, _)| *cut != id);
+            self.cut.push((id, kept.clone()));
+            m.content = Content::Text(kept);
         }
     }
 }
@@ -396,6 +407,9 @@ impl<'a> Agent<'a> {
             }
             if self.ctx.tokens() > self.ctx.budget {
                 self.compact().await?;
+            }
+            for (id, kept) in std::mem::take(&mut self.ctx.cut) {
+                host.on_cut(&id, &kept);
             }
             let messages = self.ctx.messages();
             let chars: usize = messages.iter().map(msg_chars).sum();
@@ -887,6 +901,9 @@ mod tests {
         fn follow_up(&mut self, answer: &str) -> Option<String> {
             self.tools.follow_up(answer)
         }
+        fn on_cut(&mut self, call_id: &str, kept: &str) {
+            self.tools.on_cut(call_id, kept)
+        }
     }
 
     fn host(scope: Scope) -> TestHost {
@@ -1150,6 +1167,39 @@ mod tests {
         // the newest round is kept by the rolling prune, so only the retry drops it
         assert_eq!(arguments(1), json!({"html": SKELETON}).to_string());
         assert!(arguments(2).contains("the draft holds the result"));
+    }
+
+    #[tokio::test]
+    async fn coverage_leaves_out_what_compaction_cut() {
+        let (base, seen) = fake_openrouter(vec![
+            calls("", &[("read_transcript_section", json!({"from": 2}))]),
+            calls("", &[("write_draft", json!({"html": SKELETON}))]),
+            calls("", &[("finish_doc", json!({}))]),
+        ]);
+        let client = Client::with_base("key", &base).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut h = doc_host();
+        let mut ctx = doc_context("quiz");
+        // segment 2 is one long line; this budget makes compaction cut it
+        ctx.budget = 4_000;
+        let mut agent = Agent::new(&client, "m", 32_000, &cancel, ctx);
+        agent.run(&mut h).await.unwrap();
+        let seen = seen.lock().unwrap();
+        let tool = |i: usize, n: usize| {
+            seen[i]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["role"] == "tool")
+                .nth(n)
+                .unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert!(tool(1, 0).ends_with(CUT_NOTE));
+        assert!(tool(2, 1).ends_with("Transcript read so far: nothing of 0–2."));
+        assert_eq!(h.tools.doc_stats().transcript_read_pct, 0);
     }
 
     #[tokio::test]
