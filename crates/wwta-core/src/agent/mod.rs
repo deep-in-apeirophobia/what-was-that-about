@@ -910,7 +910,24 @@ mod tests {
         }
     }
 
-    const SKELETON: &str = "<!doctype html>\n<html>\n<style>/* padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding */</style>\n<script>const ITEMS = [\n  // end: items\n];\nconst segments = WWTA.segments;</script>\n</html>";
+    const SKELETON: &str = concat!(
+        "<!doctype html>\n<html>\n<style>/* ",
+        "padding padding padding padding padding padding padding padding padding padding ",
+        "padding padding padding padding padding padding padding padding padding padding ",
+        "padding padding padding padding padding padding padding padding padding padding ",
+        "padding padding padding padding padding padding padding padding padding padding ",
+        "padding padding padding padding padding padding padding padding padding padding ",
+        "padding padding padding padding padding padding padding padding padding padding ",
+        "padding padding padding padding padding padding padding padding padding padding ",
+        "padding padding padding padding padding padding padding padding padding padding ",
+        "padding padding padding padding padding padding padding padding padding padding ",
+        "padding padding padding padding padding padding padding padding padding padding ",
+        "padding padding padding padding padding padding padding padding padding padding ",
+        "padding padding padding padding padding padding padding padding padding padding ",
+        "padding padding padding padding padding padding padding padding padding padding ",
+        "padding padding padding padding padding padding padding padding padding padding ",
+        "*/</style>\n<script>const ITEMS = [\n  // end: items\n];\nconst segments = WWTA.segments;</script>\n</html>",
+    );
 
     fn doc_host() -> TestHost {
         let mut h = host(Scope::Recording("uuid-a".into()));

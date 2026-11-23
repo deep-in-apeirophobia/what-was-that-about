@@ -367,10 +367,26 @@ impl ToolBox {
                     },
                 },
             }));
-            defs.push(def("write_draft", "Save the doc file. Call it once with the complete HTML (skeleton, styles, the script that renders the content, and an empty data list ending in a marker comment), then grow it with edit_draft. Calling it again replaces the whole file.", &[("html", "string", "The whole HTML file.")]));
-            defs.push(def("read_draft", "Read part of the doc file with line numbers: lines `from` to `to` (1-based, inclusive), at most 200 lines per call.", &[("from", "integer", "First line."), ("to", "integer", "Last line.")]));
-            defs.push(def("edit_draft", "Change the doc file: replace `old` with `new`. `old` is a few lines copied exactly from the draft (without line numbers) and must occur only once. To add items to a list, use its end-marker comment as `old` and put the new items before that same comment in `new`.", &[("old", "string", "Exact text to replace, copied from the draft."), ("new", "string", "The replacement text.")]));
-            defs.push(def("finish_doc", "Finish: check the draft and save it as the doc. Call it when the content is complete.", &[]));
+            defs.push(def(
+                "write_draft",
+                "Save the doc file. Call it once with the complete HTML (skeleton, styles, the script that renders the content, and an empty data list ending in a marker comment), then grow it with edit_draft. Calling it again replaces the whole file.",
+                &[("html", "string", "The whole HTML file.")],
+            ));
+            defs.push(def(
+                "read_draft",
+                "Read part of the doc file with line numbers: lines `from` to `to` (1-based, inclusive), at most 200 lines per call.",
+                &[("from", "integer", "First line."), ("to", "integer", "Last line.")],
+            ));
+            defs.push(def(
+                "edit_draft",
+                "Change the doc file: replace `old` with `new`. `old` is a few lines copied exactly from the draft (without line numbers) and must occur only once. To add items to a list, use its end-marker comment as `old` and put the new items before that same comment in `new`.",
+                &[("old", "string", "Exact text to replace, copied from the draft."), ("new", "string", "The replacement text.")],
+            ));
+            defs.push(def(
+                "finish_doc",
+                "Finish: check the draft and save it as the doc. Call it when the content is complete.",
+                &[],
+            ));
         }
         defs
     }
@@ -406,8 +422,10 @@ impl ToolBox {
             ),
             "get_overview" => format!("Reading the overview{of}"),
             "read_transcript" => format!("Reading the transcript{of}"),
-            "read_transcript_section" => match (arg_u32(&args, &["from"]), arg_u32(&args, &["to"]))
-            {
+            "read_transcript_section" => match (
+                arg_u32(&args, &["from", "start", "from_segment"]),
+                arg_u32(&args, &["to", "end", "to_segment"]),
+            ) {
                 (Some(a), Some(b)) => format!("Reading segments {a}–{b}{of}"),
                 (Some(a), None) => format!("Reading segments from {a}{of}"),
                 _ => format!("Reading the transcript{of}"),
@@ -790,7 +808,7 @@ impl ToolBox {
             }
             if line.len() > WINDOW_CHARS - 200 {
                 body.push_str(&clip(&line, WINDOW_CHARS - 200));
-                body.push_str("…\n");
+                body.push('\n');
             } else {
                 body.push_str(&line);
             }
@@ -1192,7 +1210,8 @@ mod tests {
         let out = t.run(&db, &call("read_transcript", json!({})), vec![]);
         assert!(out.len() <= WINDOW_CHARS + 200);
         assert!(out.starts_with("Segments 0–0 of 0–1:"));
-        assert!(out.contains("…"));
+        assert!(out.contains("…\n"));
+        assert!(!out.contains("……"));
         assert!(out.contains("Continue with read_transcript_section from 1."));
         db.replace_segments("uuid-a", "m", &[seg(0, &"ش".repeat(40_000))])
             .unwrap();
@@ -1409,6 +1428,13 @@ mod tests {
         assert_eq!(
             t.label(&db, &call("read_transcript_section", json!({"from": 212}))),
             "Reading segments from 212"
+        );
+        assert_eq!(
+            t.label(
+                &db,
+                &call("read_transcript_section", json!({"start": 212, "end": 430}))
+            ),
+            "Reading segments 212–430"
         );
     }
 

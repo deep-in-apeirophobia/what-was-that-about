@@ -83,8 +83,12 @@ impl Draft {
         let mut html = normalized.trim();
         if let Some((fence, rest)) = html.split_once('\n') {
             if matches!(fence.trim(), "```html" | "```") {
-                if let Some(body) = rest.strip_suffix("\n```") {
-                    html = body.trim();
+                if rest.trim() == "```" {
+                    html = "";
+                } else if let Some((body, closing)) = rest.rsplit_once('\n') {
+                    if closing.trim() == "```" {
+                        html = body.trim();
+                    }
                 }
             }
         }
@@ -521,12 +525,39 @@ mod tests {
     fn refuses_empty_and_huge_writes() {
         let mut d = Draft::default();
         assert_eq!(d.write(" ").unwrap_err(), "`html` is empty.");
+        assert_eq!(d.write("```html\n```").unwrap_err(), "`html` is empty.");
+        assert_eq!(d.write("```\n \n```").unwrap_err(), "`html` is empty.");
         assert!(d.write("hello").unwrap_err().contains("doesn't look like"));
         assert!(d
             .write(&format!("<{}", "x".repeat(201_000)))
             .unwrap_err()
             .contains("keep docs under about 60 KB"));
         assert!(d.is_empty());
+    }
+
+    #[test]
+    fn refuses_invalid_edits_without_changing_the_file() {
+        let mut empty = Draft::default();
+        assert_eq!(empty.edit("old", "new").unwrap_err(), NO_DRAFT);
+        let mut d = Draft::load(DOC);
+        assert!(d
+            .edit(" ", "new")
+            .unwrap_err()
+            .starts_with("`old` is empty."));
+        assert!(d
+            .edit("Quiz", "Quiz")
+            .unwrap_err()
+            .starts_with("`old` and `new` are the same."));
+        assert!(d
+            .edit("Quiz", &"x".repeat(HARD_MAX_BYTES))
+            .unwrap_err()
+            .contains("keep docs under about 60 KB"));
+        assert_eq!(d.html(), DOC);
+        assert!(!d.dirty);
+        assert_eq!(d.edits, 0);
+        let out = d.write(DOC).unwrap();
+        assert!(out.starts_with("Draft replaced (was 5 lines, 0 KB): now 5 lines, 0 KB."));
+        assert_eq!(d.writes, 1);
     }
 
     #[test]
