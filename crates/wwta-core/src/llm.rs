@@ -336,7 +336,7 @@ impl ReplyBuilder {
         }
     }
 
-    fn finish(mut self) -> Result<Reply> {
+    fn finish(mut self) -> Reply {
         let calls = &mut self.reply.tool_calls;
         calls.retain(|c| !c.name.is_empty());
         for (i, c) in calls.iter_mut().enumerate() {
@@ -347,10 +347,7 @@ impl ReplyBuilder {
                 c.arguments = "{}".into();
             }
         }
-        if self.reply.content.is_empty() && calls.is_empty() {
-            bail!("the model returned an empty answer");
-        }
-        Ok(self.reply)
+        self.reply
     }
 }
 
@@ -520,7 +517,7 @@ impl Client {
                 }
             }
         }
-        reply.finish()
+        Ok(reply.finish())
     }
 
     pub async fn embed(&self, model: &str, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -1276,7 +1273,7 @@ mod tests {
                 text.push_str(&d);
             }
         }
-        let r = b.finish().unwrap();
+        let r = b.finish();
         assert_eq!(text, "Let me look.");
         assert_eq!(r.tool_calls.len(), 2);
         assert_eq!(r.tool_calls[0].name, "search");
@@ -1297,7 +1294,7 @@ mod tests {
         ] {
             assert_eq!(b.apply(&serde_json::from_str(c).unwrap()).unwrap(), None);
         }
-        let r = b.finish().unwrap();
+        let r = b.finish();
         assert_eq!(
             r.reasoning_details,
             vec![
