@@ -241,14 +241,20 @@ impl Context {
                 }
             }
             for call in &mut self.turn[start].tool_calls {
-                if call.arguments.len() > PRUNE_ARGS_CHARS {
-                    let size = (call.arguments.len() + 512) / 1024;
-                    call.arguments = serde_json::json!({"removed": format!("the arguments ({size} KB) were removed to save space; the draft holds the result")}).to_string();
-                    pruned += 1;
-                }
+                pruned += u32::from(stub_arguments(call));
             }
         }
         pruned
+    }
+
+    /// Replace the large arguments of every draft write and edit made so far, the newest
+    /// included: the draft holds what they wrote (overflow only).
+    fn prune_draft_arguments(&mut self) {
+        for call in self.turn.iter_mut().flat_map(|m| &mut m.tool_calls) {
+            if matches!(call.name.as_str(), "write_draft" | "edit_draft") {
+                stub_arguments(call);
+            }
+        }
     }
 
     /// Remove whole old tool rounds and replace them with one cumulative note.
@@ -307,6 +313,17 @@ impl Context {
             ));
         }
     }
+}
+
+/// Replace tool-call arguments longer than [`PRUNE_ARGS_CHARS`] with a short, valid JSON
+/// note. Returns whether it did.
+fn stub_arguments(call: &mut ToolCall) -> bool {
+    if call.arguments.len() <= PRUNE_ARGS_CHARS {
+        return false;
+    }
+    let size = (call.arguments.len() + 512) / 1024;
+    call.arguments = serde_json::json!({"removed": format!("the arguments ({size} KB) were removed to save space; the draft holds the result")}).to_string();
+    true
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -419,7 +436,10 @@ impl<'a> Agent<'a> {
                     if let Some(message) = host.follow_up(&reply.content) {
                         host.on_reset();
                         self.stats.nudges += 1;
-                        self.ctx.turn.push(Msg::assistant(reply.content));
+                        // some providers reject an assistant message with no content
+                        if !reply.content.trim().is_empty() {
+                            self.ctx.turn.push(Msg::assistant(reply.content));
+                        }
                         self.ctx.turn.push(Msg::user(message));
                         continue;
                     }
@@ -466,6 +486,7 @@ impl<'a> Agent<'a> {
         self.stats.compactions += 1;
         let target = self.ctx.budget / 2;
         self.ctx.drop_old_tool_output();
+        self.ctx.prune_draft_arguments();
         if self.ctx.tokens() > target {
             self.ctx.fold_old_rounds(KEEP_ROUNDS_ON_FOLD);
         }
@@ -1011,6 +1032,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_empty_early_answer_is_not_replayed() {
+        let (base, seen) = fake_openrouter(vec![
+            answer(""),
+            calls("", &[("write_draft", json!({"html": SKELETON}))]),
+            calls("", &[("finish_doc", json!({}))]),
+        ]);
+        let client = Client::with_base("key", &base).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut h = doc_host();
+        let mut agent = Agent::new(&client, "m", 32_000, &cancel, doc_context("quiz"));
+        agent.run(&mut h).await.unwrap();
+        assert_eq!(agent.stats.nudges, 1);
+        let seen = seen.lock().unwrap();
+        let messages = seen[1]["messages"].as_array().unwrap();
+        assert!(messages.iter().all(|m| m["role"] != "assistant"));
+        assert!(messages.last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("You haven't written the doc yet."));
+    }
+
+    #[tokio::test]
     async fn nudges_a_model_that_answers_too_early() {
         let (base, seen) = fake_openrouter(vec![
             calls("", &[("write_draft", json!({"html": SKELETON}))]),
@@ -1077,6 +1120,36 @@ mod tests {
             ANSWER_NOW
         );
         assert_eq!(agent.stats.nudges, 0);
+    }
+
+    #[tokio::test]
+    async fn drops_draft_arguments_after_a_context_error() {
+        let overflow = Canned {
+            status: 400,
+            content_type: "application/json",
+            body: json!({ "error": { "message": "This endpoint's maximum context length is 30000 tokens." } }).to_string(),
+        };
+        let (base, seen) = fake_openrouter(vec![
+            calls("", &[("write_draft", json!({"html": SKELETON}))]),
+            overflow,
+            calls("", &[("finish_doc", json!({}))]),
+        ]);
+        let client = Client::with_base("key", &base).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut h = doc_host();
+        let mut agent = Agent::new(&client, "m", 32_000, &cancel, doc_context("quiz"));
+        agent.run(&mut h).await.unwrap();
+        assert_eq!(h.tools.doc_result("").unwrap().html, SKELETON);
+        let seen = seen.lock().unwrap();
+        let arguments = |i: usize| {
+            seen[i]["messages"].as_array().unwrap()[2]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        // the newest round is kept by the rolling prune, so only the retry drops it
+        assert_eq!(arguments(1), json!({"html": SKELETON}).to_string());
+        assert!(arguments(2).contains("the draft holds the result"));
     }
 
     #[tokio::test]

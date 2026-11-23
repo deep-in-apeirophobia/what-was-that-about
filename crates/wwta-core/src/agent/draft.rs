@@ -159,9 +159,7 @@ impl Draft {
 
     /// Replace one unique span, accepting copied line numbers and common text differences.
     pub fn edit(&mut self, old: &str, new: &str) -> Result<String, String> {
-        let old = strip_numbers(old);
-        let new = strip_numbers(new);
-        let result = self.edit_inner(&old, &new);
+        let result = self.edit_inner(old, new);
         if let Err(mut error) = result {
             self.failed_edits += 1;
             self.failed_in_a_row += 1;
@@ -182,10 +180,21 @@ impl Draft {
                 "`old` is empty. Copy a few unique lines from the draft to replace.".into(),
             );
         }
+        // Try `old` as given first: the draft itself may have lines like `12: "x",`.
+        let (old, new, found) = match find_unique(&self.html, old) {
+            Err(EditError::NotFound) if strip_numbers(old) != old => {
+                // copied from read_draft with its line numbers
+                let (old, new) = (strip_numbers(old), strip_numbers(new));
+                let found = find_unique(&self.html, &old);
+                (old, new, found)
+            }
+            found => (old.to_string(), new.to_string(), found),
+        };
         if old == new {
             return Err("`old` and `new` are the same.".into());
         }
-        let (start, end) = find_unique(&self.html, old).map_err(|error| match error {
+        let (old, new) = (old.as_str(), new.as_str());
+        let (start, end) = found.map_err(|error| match error {
             EditError::NotFound => {
                 let mut out = "could not find `old` in the draft. It must match the draft text exactly (copy it from read_draft, without the line numbers).".to_string();
                 let hint = closest_lines(&self.html, old);
@@ -300,7 +309,6 @@ fn normalize(line: &str, tier: u8) -> String {
 }
 
 fn find_unique(text: &str, old: &str) -> Result<(usize, usize), EditError> {
-    let old = strip_numbers(old);
     if old.trim().is_empty() {
         return Err(EditError::NotFound);
     }
@@ -314,7 +322,7 @@ fn find_unique(text: &str, old: &str) -> Result<(usize, usize), EditError> {
         }
     };
     let exact: Vec<_> = text
-        .match_indices(&old)
+        .match_indices(old)
         .map(|(i, m)| (i, i + m.len()))
         .collect();
     if !exact.is_empty() {
@@ -623,6 +631,15 @@ mod tests {
         d.edit("12: const A = 1;\n13: const B = 2;", "12: const C = 3;")
             .unwrap();
         assert_eq!(d.html(), "const C = 3;");
+    }
+
+    #[test]
+    fn keeps_numeric_keys_that_look_like_line_numbers() {
+        let mut d = Draft::load("const T = {\n12: \"سلام\",\n};");
+        d.edit("3: 12: \"سلام\",", "3: 12: \"درود\",").unwrap();
+        assert_eq!(d.html(), "const T = {\n12: \"درود\",\n};");
+        d.edit("12: \"درود\",", "12: \"خداحافظ\",").unwrap();
+        assert_eq!(d.html(), "const T = {\n12: \"خداحافظ\",\n};");
     }
 
     #[test]

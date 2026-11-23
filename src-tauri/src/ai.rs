@@ -1158,6 +1158,8 @@ struct DocRunStats {
     agent: Stats,
     draft: DocStats,
     source: Option<&'static str>,
+    /// A built-in template's name, never free text.
+    skill: Option<String>,
 }
 
 fn doc_props(stats: DocRunStats) -> Value {
@@ -1172,6 +1174,9 @@ fn doc_props(stats: DocRunStats) -> Value {
     props["transcript_read_pct"] = draft.transcript_read_pct.into();
     if let Some(source) = stats.source {
         props["source"] = source.into();
+    }
+    if let Some(skill) = stats.skill {
+        props["skill"] = skill.into();
     }
     props
 }
@@ -1497,7 +1502,14 @@ pub async fn generate_doc(
     let job = LlmJob::start(app, &request_id);
     let started = std::time::Instant::now();
     let model = app.state::<AppState>().settings().llm_model;
-    let mut stats = DocRunStats::default();
+    let mut stats = DocRunStats {
+        // only the built-in template names, never free text
+        skill: skill
+            .as_deref()
+            .and_then(agent::skills::get)
+            .map(|s| s.name.clone()),
+        ..Default::default()
+    };
     let (r, usage) = match Ai::new(app, Some(&job)) {
         Ok(ai) => {
             let work = generate_doc_inner(&ai, &job, &id, &prompt, skill.as_deref(), &mut stats);
