@@ -8,8 +8,9 @@ A short multiple-choice quiz that checks understanding of the recording.
 
 ## Gather
 1. `get_overview` for the main ideas.
-2. Read the transcript (whole, or section by section) so every question and its answer come
-   from what was actually said. Note the segment id of each answer.
+2. Read the transcript part by part and after each part add questions whose answers were
+   actually said, with the segment id of each answer; about 8 questions spread over the
+   whole recording.
 
 ## Content
 ```js

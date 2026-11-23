@@ -9,8 +9,8 @@ moment where that topic is discussed.
 
 ## Gather
 1. `get_overview` for the summary, chapters and topics.
-2. Read the transcript (or the sections of each chapter) to find 2-5 concrete subtopics per
-   main topic and the segment where each one starts.
+2. Read the transcript part by part and, after each part, add 2-5 concrete subtopics per
+   main topic with the segment where each one starts.
 
 ## Content
 - Center: the recording's subject in 2-5 words.

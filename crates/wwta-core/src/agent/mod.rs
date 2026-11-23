@@ -644,8 +644,9 @@ pub fn recording_chat_system(rec: &RecordingFacts, ai_language: &str) -> String 
          with tools. {lang}\n\n\
          How to work:\n\
          - Look things up before you answer. get_overview gives the big picture; search finds where \
-         something is said; read_transcript_section reads around it; read_transcript reads everything \
-         (fine for recordings up to about an hour); get_notes shows the user's own notes.\n\
+         something is said; read_transcript_section reads a range of segments and read_transcript \
+         reads from the start. Long transcripts come in parts of about 15 minutes, and each part \
+         says where to continue; get_notes shows the user's own notes.\n\
          - {analysis}{notes}\n\
          - The user may attach images or voice messages; use them together with the transcript.\n\
          - Don't guess. If the recording doesn't say, tell the user.\n\n\
@@ -687,17 +688,35 @@ pub fn doc_system(rec: &RecordingFacts, ai_language: &str) -> String {
         .map(|s| format!("- {}: {}\n", s.name, s.description))
         .collect();
     format!(
-        "You make small, polished, interactive HTML documents that help someone explore an audio \
-         recording: mind maps, timelines, flashcards, quizzes, minutes, glossaries, tables… This one \
-         is about {desc}. {lang}\n\n\
-         How to work:\n\
-         1. Load the design guide closest to the request with load_skill (skip this when a guide \
-         is already included with the request).\n\
-         2. Gather the content with the tools: get_overview first, then read the transcript (whole, \
-         or section by section when it's long) and the user's notes when they matter. Note the \
-         segment id of everything you use.\n\
-         3. Write the document. Your final answer is the complete HTML file and nothing else.\n\n\
-         Guides you can load:\n{guides}\n{base}",
+        r#"You make small, polished, interactive HTML documents that help someone explore an audio
+recording: mind maps, timelines, flashcards, quizzes, minutes, glossaries, tables… This one is
+about {desc}. {lang}
+
+You build the doc as a file with tools. Only the draft file counts: text in your answers is not
+kept.
+
+How to work:
+1. Load the design guide closest to the request with load_skill (skip this when a guide is
+   already included with the request).
+2. get_overview for the big picture: chapters, topics, how many notes the user wrote.
+3. write_draft with the complete file right away: the skeleton from the rules below, the
+   styles, the script that renders the content, and the data list empty except for a marker
+   comment at its end (like `// end: items`). It must already be a working doc with no items.
+4. Read the transcript part by part: read_transcript first, then read_transcript_section from
+   the segment each part tells you to continue from. After each part, add what you found to the
+   data list with edit_draft (`old` = the marker comment, `new` = the new items followed by the
+   same comment). Do this before reading the next part: earlier parts are removed from your
+   context, and the draft is your only memory. get_notes when the user's notes matter.
+5. When every part is read (each result says what is still unread), fix anything that needs it
+   and call finish_doc. If it reports problems, fix them with edit_draft and call it again.
+
+Edits: `old` is a few lines copied exactly from the draft, without line numbers, and must occur
+only once. Don't read the draft after an edit; the confirmation tells you it applied. If you are
+told you have used all your tool calls, answer with one sentence: the draft as it is will be used.
+
+Guides you can load:
+{guides}
+{base}"#,
         desc = rec.describe(),
         lang = language_instruction(ai_language),
         base = skills::base(),
@@ -715,12 +734,13 @@ pub fn doc_request(prompt: &str, skill: Option<&str>) -> String {
     }
 }
 
-pub fn doc_revision(prompt: &str, html: &str, instruction: &str) -> String {
+/// Revise a loaded draft without pasting its HTML into the request.
+pub fn doc_revision(prompt: &str, summary: &str, instruction: &str) -> String {
     format!(
-        "Here is the current document, made for the request “{prompt}”:\n\n{html}\n\n\
-         Change it: {instruction}\n\
-         Keep everything else as it is. Your final answer is the complete updated HTML file and \
-         nothing else."
+        r#"The doc made for the request “{prompt}” is loaded as the draft ({summary}). Change it: {instruction}
+Read the parts you need with read_draft (start with lines 1–200 to see its structure), make the
+change with edit_draft, keep everything else as it is, then call finish_doc. If the change needs
+new content from the recording, read the transcript part by part as usual."#
     )
 }
 
@@ -1064,7 +1084,11 @@ mod tests {
             "m",
             32_000,
             &cancel,
-            doc_context("Rename the loaded doc to Quiz 2"),
+            doc_context(&doc_revision(
+                "a quiz",
+                &h.tools.draft().summary(),
+                "Rename it to Quiz 2",
+            )),
         );
         let answer = agent.run(&mut h).await.unwrap();
         assert_eq!(
@@ -1535,6 +1559,12 @@ mod tests {
         assert!(sys.contains("“t” (1:01, segments 0–9)"));
         assert!(sys.contains("- quiz: "));
         assert!(sys.contains("WWTA.onTime"));
+        assert!(sys.contains("write_draft"));
+        assert!(sys.contains("// end: items"));
+        let revision = doc_revision("a quiz", "142 lines, 18 KB", "rename the title");
+        assert!(revision.contains("loaded as the draft (142 lines, 18 KB)"));
+        assert!(revision.contains("read_draft") && revision.contains("finish_doc"));
+        assert!(!revision.contains("<html"));
         assert!(doc_request("x", Some("timeline")).contains("# Timeline"));
         assert_eq!(doc_request("x", None), "Make this doc: x");
     }

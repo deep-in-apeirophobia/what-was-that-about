@@ -9,8 +9,9 @@ that plays the moment the answer comes from.
 
 ## Gather
 1. `get_overview` for the key points.
-2. Read the transcript (whole, or section by section) and collect 10-20 facts worth
-   remembering: definitions, names, numbers, reasons, steps, conclusions.
+2. Read the transcript part by part and after each part add the facts worth remembering
+   (definitions, names, numbers, reasons, steps, conclusions); aim for 10-20 cards in
+   total.
 
 ## Content
 ```js
