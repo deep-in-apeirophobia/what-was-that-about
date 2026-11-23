@@ -1044,7 +1044,11 @@ pub fn extract_html(s: &str) -> Result<String> {
         .find("<!doctype")
         .or_else(|| lower.find("<html"))
         .unwrap_or(0);
-    let end = lower.rfind("</html>").map(|i| i + 7).unwrap_or(body.len());
+    // the closing tag after the opening one: an answer may mention `</html>` before it
+    let end = lower[start..]
+        .rfind("</html>")
+        .map(|i| start + i + 7)
+        .unwrap_or(body.len());
     let html = body[start..end].trim();
     if !html.to_ascii_lowercase().contains("<") {
         bail!("the model did not return an HTML document");
@@ -1229,6 +1233,9 @@ mod tests {
         assert!(h.starts_with("<!DOCTYPE"));
         assert!(h.ends_with("</html>"));
         assert_eq!(html_title(&h).as_deref(), Some("T"));
+        // a closing tag mentioned before the document doesn't panic
+        let h = extract_html("I will add </html> at the end, after <!doctype html>.").unwrap();
+        assert_eq!(h, "<!doctype html>.");
     }
 
     #[test]

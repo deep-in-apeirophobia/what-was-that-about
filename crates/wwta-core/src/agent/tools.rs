@@ -16,6 +16,8 @@ use crate::types::SearchHit;
 /// Transcript text per read: about 10–15 minutes of Persian speech (~10k tokens). Longer
 /// requests are cut at a segment boundary and say where to continue.
 pub const WINDOW_CHARS: usize = 24_000;
+/// The smallest window [`ToolBox::fit_window`] picks for a small context.
+const MIN_WINDOW_CHARS: usize = 4_000;
 const DOC_CHARS: usize = 80_000;
 /// Recordings per `list_recordings` page.
 const PAGE_SIZE: usize = 100;
@@ -46,6 +48,8 @@ pub struct ToolBox {
     /// Draft changed since the last transcript read.
     edited_since_read: bool,
     nudges: u32,
+    /// Transcript bytes per read: [`WINDOW_CHARS`], less for a small context.
+    window: usize,
 }
 
 /// A completed draft, or a valid HTML answer from a model that ignored the tools.
@@ -84,7 +88,15 @@ impl ToolBox {
             transcript_last: None,
             edited_since_read: false,
             nudges: 0,
+            window: WINDOW_CHARS,
         }
+    }
+
+    /// Size transcript reads so two of them take at most about a quarter of a context of
+    /// `budget` tokens (~4 bytes a token). Otherwise compaction would cut a part the model
+    /// is counted as having read.
+    pub fn fit_window(&mut self, budget: usize) {
+        self.window = (budget / 2).clamp(MIN_WINDOW_CHARS, WINDOW_CHARS);
     }
 
     /// Load the existing doc for an in-place revision.
@@ -774,7 +786,7 @@ impl ToolBox {
         Ok(out)
     }
 
-    /// The whole transcript, or segments `from..=to`, cut at [`WINDOW_CHARS`].
+    /// The whole transcript, or segments `from..=to`, cut at the window size.
     fn transcript(&mut self, db: &Db, id: &str, range: Option<(u32, u32)>) -> ToolResult {
         let segs = db.segments(id).map_err(|e| e.to_string())?;
         let Some(last) = segs.last().map(|s| s.id) else {
@@ -802,12 +814,12 @@ impl ToolBox {
                 fmt_time(s.start),
                 s.text.trim()
             );
-            if returned.is_some() && body.len() + line.len() > WINDOW_CHARS - 200 {
+            if returned.is_some() && body.len() + line.len() > self.window - 200 {
                 next = Some(s.id);
                 break;
             }
-            if line.len() > WINDOW_CHARS - 200 {
-                body.push_str(&clip(&line, WINDOW_CHARS - 200));
+            if line.len() > self.window - 200 {
+                body.push_str(&clip(&line, self.window - 200));
                 body.push('\n');
             } else {
                 body.push_str(&line);
@@ -1195,6 +1207,28 @@ mod tests {
             "{}",
             &out[out.len() - 200..]
         );
+    }
+
+    #[test]
+    fn small_contexts_get_smaller_windows() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.insert_recording(&rec("x", "long")).unwrap();
+        let segs: Vec<Segment> = (0..200).map(|i| seg(i, &"کلمه ".repeat(400))).collect();
+        db.replace_segments("x", "m", &segs).unwrap();
+        let mut t = ToolBox::new(Scope::Recording("x".into()), true);
+        t.fit_window(8_000);
+        let out = t.run(&db, &call("read_transcript", json!({})), vec![]);
+        let body = out.split_once("\nTranscript read so far").unwrap().0;
+        assert!(body.len() <= 4_000, "{}", body.len());
+        assert!(body.contains("[Stopped at segment 1 to keep this part small."));
+        assert!(out.ends_with("Transcript read so far: 0 (0% of 0–199). Unread: 1–199."));
+        t.fit_window(1_000_000);
+        let out = t.run(
+            &db,
+            &call("read_transcript_section", json!({"from": 1})),
+            vec![],
+        );
+        assert!(out.len() > 20_000);
     }
 
     #[test]

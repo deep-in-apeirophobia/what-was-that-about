@@ -1479,6 +1479,7 @@ async fn write_doc(
     ctx.budget = agent_budget(&caps, DOC_TOKENS);
     ctx.keep_rounds = Some(agent::DOC_KEEP_ROUNDS);
     let mut host = ToolHost::new(ai.app, job, Some(recording_id), true);
+    host.tools.fit_window(ctx.budget);
     if let Some(html) = draft {
         host.tools.set_draft(html);
     }
