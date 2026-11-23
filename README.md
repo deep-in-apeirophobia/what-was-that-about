@@ -102,7 +102,9 @@ A one-hour recording is roughly 40k tokens, a fraction of a cent with these mode
 - **Docs:** the model loads a design guide for the kind of doc (mind map, timeline, flashcards,
   quiz, minutes, glossary or a general report; see `crates/wwta-core/src/agent/skills`),
   gathers the content with the same tools, and writes a self-contained HTML/JS page shown
-  inside the app. Docs run in a sandboxed iframe on their own origin with a
+  inside the app. The model writes the doc as a file: it saves a skeleton, reads the
+  transcript in parts and adds to the file after each part, then checks it; revisions edit
+  the file in place. Docs run in a sandboxed iframe on their own origin with a
   Content-Security-Policy that blocks all network access; they can only read the transcript
   through a small `window.WWTA` bridge and ask the player to seek.
 - **Semantic search:** optional embeddings (default `baai/bge-m3`) for meaning-based search and

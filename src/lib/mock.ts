@@ -847,7 +847,11 @@ async function stream(requestId: string, chunks: string[], delay: number): Promi
 /** Mimic the agent's tool steps before the answer streams. */
 async function agentSteps(requestId: string, labels: string[]): Promise<void> {
   for (const status of labels) {
-    if (cancelledRequests.has(requestId)) return;
+    if (cancelledRequests.has(requestId)) {
+      cancelledRequests.delete(requestId);
+      emit(EV.llm, { requestId, delta: null, done: true, error: "Cancelled" });
+      throw new Error("Cancelled");
+    }
     emit(EV.llm, { requestId, delta: null, done: false, error: null, status });
     await sleep(450);
   }
@@ -855,12 +859,6 @@ async function agentSteps(requestId: string, labels: string[]): Promise<void> {
 
 function wordChunks(text: string): string[] {
   return text.match(/\S+\s*|\s+/g) ?? [text];
-}
-
-function sizedChunks(text: string, size: number): string[] {
-  const out: string[] = [];
-  for (let i = 0; i < text.length; i += size) out.push(text.slice(i, i + size));
-  return out;
 }
 
 function bestSegments(segments: Segment[], question: string, n: number): Segment[] {
@@ -1432,8 +1430,14 @@ export const handlers: Record<string, Handler> = {
       ...(skill ? [] : [`Loading the ${kind} guide…`]),
       "Reading the overview…",
       "Reading the transcript…",
+      "Writing the draft…",
+      "Reading segments 41–80…",
+      "Adding to the draft (6 KB so far)…",
+      "Reading segments 81–120…",
+      "Adding to the draft (9 KB so far)…",
+      "Checking the doc…",
     ]);
-    await stream(requestId, sizedChunks(html, 160), 18);
+    await stream(requestId, ["Done."], 10);
     const doc: Doc = {
       id: uid("doc"),
       recordingId: s.rec.id,
@@ -1458,8 +1462,8 @@ export const handlers: Record<string, Handler> = {
     if (!owner || !doc) throw new Error("Doc not found.");
     const hue = Math.floor(Math.random() * 360);
     const html = doc.html.replace(/--accent: hsl\(\d+/, `--accent: hsl(${hue}`) + `\n<!-- revised: ${instruction.replace(/-->/g, "")} -->`;
-    await sleep(500);
-    await stream(requestId, sizedChunks(html, 200), 14);
+    await agentSteps(requestId, ["Reading the draft (lines 1–200)…", "Editing the draft…", "Checking the doc…"]);
+    await stream(requestId, ["Done."], 10);
     const updated: Doc = { ...doc, html, updatedAt: nowIso(), model: settings.llmModel };
     owner.docs = owner.docs.map((d) => (d.id === docId ? updated : d));
     return updated;
