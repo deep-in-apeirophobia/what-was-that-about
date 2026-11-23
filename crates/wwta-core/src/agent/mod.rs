@@ -3,6 +3,7 @@
 //! loads a design guide ([`skills`]). The context is kept under a token budget: old tool
 //! output is dropped first, then earlier conversation is summarized.
 
+pub mod draft;
 pub mod skills;
 pub mod tools;
 
