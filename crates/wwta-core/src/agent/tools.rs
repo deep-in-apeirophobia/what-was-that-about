@@ -10,10 +10,11 @@ use crate::db::Db;
 use crate::llm::ToolCall;
 use crate::search;
 use crate::text::fmt_time;
-use crate::types::{SearchHit, Segment};
+use crate::types::SearchHit;
 
-/// Transcript text per tool result; longer transcripts are paged.
-const TRANSCRIPT_CHARS: usize = 120_000;
+/// Transcript text per read: about 10–15 minutes of Persian speech (~10k tokens). Longer
+/// requests are cut at a segment boundary and say where to continue.
+pub const WINDOW_CHARS: usize = 24_000;
 const DOC_CHARS: usize = 80_000;
 /// Recordings per `list_recordings` page.
 const PAGE_SIZE: usize = 100;
@@ -279,7 +280,7 @@ impl ToolBox {
                 let id = self.recording(db, args)?;
                 let from = arg_u32(args, &["from", "start", "from_segment"])
                     .ok_or("`from` (a segment id) is required")?;
-                let to = arg_u32(args, &["to", "end", "to_segment"]).unwrap_or(from + 40);
+                let to = arg_u32(args, &["to", "end", "to_segment"]).unwrap_or(u32::MAX);
                 self.transcript(db, &id, Some((from.min(to), from.max(to))))
             }
             "get_notes" => self.notes(db, args),
@@ -508,7 +509,7 @@ impl ToolBox {
         Ok(out)
     }
 
-    /// The whole transcript, or segments `from..=to`, cut at [`TRANSCRIPT_CHARS`].
+    /// The whole transcript, or segments `from..=to`, cut at [`WINDOW_CHARS`].
     fn transcript(&mut self, db: &Db, id: &str, range: Option<(u32, u32)>) -> ToolResult {
         let segs = db.segments(id).map_err(|e| e.to_string())?;
         let Some(last) = segs.last().map(|s| s.id) else {
@@ -526,23 +527,34 @@ impl ToolBox {
         } else {
             String::new()
         };
-        let picked: Vec<&Segment> = segs.iter().filter(|s| s.id >= from && s.id <= to).collect();
-        let mut out = format!("Segments {from}–{to} of 0–{last}:\n");
-        for s in picked {
+        let mut body = String::new();
+        let mut returned = None;
+        let mut next = None;
+        for s in segs.iter().filter(|s| s.id >= from && s.id <= to) {
             let line = format!(
                 "[{prefix}{}] ({}) {}\n",
                 s.id,
                 fmt_time(s.start),
                 s.text.trim()
             );
-            if out.len() + line.len() > TRANSCRIPT_CHARS {
-                out.push_str(&format!(
-                    "[Stopped at segment {} to save space. Continue with read_transcript_section from {}.]\n",
-                    s.id, s.id
-                ));
+            if returned.is_some() && body.len() + line.len() > WINDOW_CHARS - 200 {
+                next = Some(s.id);
                 break;
             }
-            out.push_str(&line);
+            if line.len() > WINDOW_CHARS - 200 {
+                body.push_str(&clip(&line, WINDOW_CHARS - 200));
+                body.push_str("…\n");
+            } else {
+                body.push_str(&line);
+            }
+            returned = Some(s.id);
+        }
+        let end = returned.unwrap_or(from);
+        let mut out = format!("Segments {from}–{end} of 0–{last}:\n{body}");
+        if let Some(next) = next {
+            out.push_str(&format!("[Stopped at segment {next} to keep this part small. Continue with read_transcript_section from {next}.]"));
+        } else if end == last {
+            out.push_str("(End of the transcript.)");
         }
         Ok(out)
     }
@@ -655,7 +667,7 @@ fn arg_u32(args: &Value, keys: &[&str]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{now_iso, Analysis, Chapter, Doc, Recording, RecordingStatus};
+    use crate::types::{now_iso, Analysis, Chapter, Doc, Recording, RecordingStatus, Segment};
 
     fn rec(id: &str, title: &str) -> Recording {
         Recording {
@@ -870,12 +882,67 @@ mod tests {
         db.replace_segments("x", "m", &segs).unwrap();
         let mut t = ToolBox::new(Scope::Recording("x".into()), false);
         let out = t.run(&db, &call("read_transcript", json!({})), vec![]);
-        assert!(out.len() <= TRANSCRIPT_CHARS + 200);
+        assert!(out.len() <= WINDOW_CHARS + 200);
+        let end = out
+            .split_once('–')
+            .unwrap()
+            .1
+            .split(' ')
+            .next()
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        assert!(out.starts_with(&format!("Segments 0–{end} of 0–199:")));
+        assert!(out.contains(&format!(
+            "Continue with read_transcript_section from {}.",
+            end + 1
+        )));
         assert!(
             out.contains("Continue with read_transcript_section from"),
             "{}",
             &out[out.len() - 200..]
         );
+    }
+
+    #[test]
+    fn a_segment_bigger_than_a_window_is_still_readable() {
+        let mut db = library();
+        db.replace_segments(
+            "uuid-a",
+            "m",
+            &[seg(0, &"ش".repeat(40_000)), seg(1, "next")],
+        )
+        .unwrap();
+        let mut t = ToolBox::new(Scope::Recording("uuid-a".into()), false);
+        let out = t.run(&db, &call("read_transcript", json!({})), vec![]);
+        assert!(out.len() <= WINDOW_CHARS + 200);
+        assert!(out.starts_with("Segments 0–0 of 0–1:"));
+        assert!(out.contains("…"));
+        assert!(out.contains("Continue with read_transcript_section from 1."));
+        db.replace_segments("uuid-a", "m", &[seg(0, &"ش".repeat(40_000))])
+            .unwrap();
+        let out = t.run(&db, &call("read_transcript", json!({})), vec![]);
+        assert!(out.ends_with("(End of the transcript.)"));
+    }
+
+    #[test]
+    fn section_without_to_reads_to_the_end() {
+        let db = library();
+        let mut t = ToolBox::new(Scope::Recording("uuid-a".into()), false);
+        let out = t.run(
+            &db,
+            &call("read_transcript_section", json!({"from": 1})),
+            vec![],
+        );
+        assert!(out.starts_with("Segments 1–2 of 0–2:"));
+        assert!(out.ends_with("(End of the transcript.)"));
+        let out = t.run(
+            &db,
+            &call("read_transcript_section", json!({"from": 0, "to": 1})),
+            vec![],
+        );
+        assert!(out.starts_with("Segments 0–1 of 0–2:"));
+        assert!(!out.contains("End of the transcript"));
     }
 
     #[test]

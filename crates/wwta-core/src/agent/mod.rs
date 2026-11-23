@@ -802,7 +802,7 @@ mod tests {
     async fn summarizes_history_and_cuts_oversized_tool_output() {
         let (base, seen) = fake_openrouter(vec![
             completion("They talked about the budget."),
-            calls("", &[("read_transcript", json!({}))]),
+            calls("", &[("read_transcript_section", json!({"from": 2}))]),
             answer("Done [1]."),
         ]);
         let client = Client::with_base("key", &base).unwrap();
@@ -811,14 +811,14 @@ mod tests {
         let history: Vec<Msg> = (0..6)
             .map(|i| {
                 if i % 2 == 0 {
-                    Msg::user(format!("question {i} {}", "x".repeat(3_000)))
+                    Msg::user(format!("question {i} {}", "x".repeat(1_500)))
                 } else {
                     Msg::assistant(format!("answer {i}"))
                 }
             })
             .collect();
         let mut ctx = Context::new("system", None, history, Msg::user("now?"));
-        ctx.budget = 12_000;
+        ctx.budget = 6_000;
         let mut agent = Agent::new(&client, "m", 1_000, &cancel, ctx);
         assert_eq!(agent.run(&mut h).await.unwrap(), "Done [1].");
         assert_eq!(agent.ctx.folded, 2);
@@ -827,7 +827,7 @@ mod tests {
             Some("They talked about the budget.")
         );
         assert_eq!(agent.stats.compactions, 2);
-        assert!(agent.ctx.tokens() <= 12_000);
+        assert!(agent.ctx.tokens() <= 6_000);
         let seen = seen.lock().unwrap();
         // the summary request saw the folded messages only
         let summarized = seen[0]["messages"][1]["content"].as_str().unwrap();
@@ -847,7 +847,7 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(
-            out.starts_with("Segments 0–2 of 0–2:\n[0] (0:00) سلام"),
+            out.starts_with("Segments 2–2 of 0–2:\n[2] (0:20) متن"),
             "{out}"
         );
         assert!(out.ends_with("ask for a smaller part.]"), "{out}");
