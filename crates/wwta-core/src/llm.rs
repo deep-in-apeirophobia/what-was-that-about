@@ -336,7 +336,7 @@ impl ReplyBuilder {
         }
     }
 
-    fn finish(mut self) -> Result<Reply> {
+    fn finish(mut self) -> Reply {
         let calls = &mut self.reply.tool_calls;
         calls.retain(|c| !c.name.is_empty());
         for (i, c) in calls.iter_mut().enumerate() {
@@ -347,10 +347,7 @@ impl ReplyBuilder {
                 c.arguments = "{}".into();
             }
         }
-        if self.reply.content.is_empty() && calls.is_empty() {
-            bail!("the model returned an empty answer");
-        }
-        Ok(self.reply)
+        self.reply
     }
 }
 
@@ -520,7 +517,7 @@ impl Client {
                 }
             }
         }
-        reply.finish()
+        Ok(reply.finish())
     }
 
     pub async fn embed(&self, model: &str, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -1047,7 +1044,11 @@ pub fn extract_html(s: &str) -> Result<String> {
         .find("<!doctype")
         .or_else(|| lower.find("<html"))
         .unwrap_or(0);
-    let end = lower.rfind("</html>").map(|i| i + 7).unwrap_or(body.len());
+    // the closing tag after the opening one: an answer may mention `</html>` before it
+    let end = lower[start..]
+        .rfind("</html>")
+        .map(|i| start + i + 7)
+        .unwrap_or(body.len());
     let html = body[start..end].trim();
     if !html.to_ascii_lowercase().contains("<") {
         bail!("the model did not return an HTML document");
@@ -1232,6 +1233,9 @@ mod tests {
         assert!(h.starts_with("<!DOCTYPE"));
         assert!(h.ends_with("</html>"));
         assert_eq!(html_title(&h).as_deref(), Some("T"));
+        // a closing tag mentioned before the document doesn't panic
+        let h = extract_html("I will add </html> at the end, after <!doctype html>.").unwrap();
+        assert_eq!(h, "<!doctype html>.");
     }
 
     #[test]
@@ -1276,7 +1280,7 @@ mod tests {
                 text.push_str(&d);
             }
         }
-        let r = b.finish().unwrap();
+        let r = b.finish();
         assert_eq!(text, "Let me look.");
         assert_eq!(r.tool_calls.len(), 2);
         assert_eq!(r.tool_calls[0].name, "search");
@@ -1297,7 +1301,7 @@ mod tests {
         ] {
             assert_eq!(b.apply(&serde_json::from_str(c).unwrap()).unwrap(), None);
         }
-        let r = b.finish().unwrap();
+        let r = b.finish();
         assert_eq!(
             r.reasoning_details,
             vec![

@@ -3,6 +3,7 @@
 //! loads a design guide ([`skills`]). The context is kept under a token budget: old tool
 //! output is dropped first, then earlier conversation is summarized.
 
+pub mod draft;
 pub mod skills;
 pub mod tools;
 
@@ -19,7 +20,12 @@ use crate::text::fmt_time;
 /// Compact the context once it is estimated to be larger than this many tokens.
 pub const CONTEXT_BUDGET: usize = 256_000;
 /// Tool rounds per request; after that the model has to answer with what it found.
-const MAX_ROUNDS: u32 = 10;
+const MAX_ROUNDS: u32 = 24;
+/// Keep the two newest tool rounds during doc runs, so each read survives its next edit.
+pub const DOC_KEEP_ROUNDS: usize = 2;
+const PRUNE_MIN_CHARS: usize = 400;
+const PRUNE_ARGS_CHARS: usize = 1_000;
+const KEEP_ROUNDS_ON_FOLD: usize = 2;
 /// Earlier messages kept word for word when the rest of the conversation is summarized.
 const KEEP_RECENT: usize = 4;
 /// A single tool result is cut beyond this (the tools page long transcripts themselves).
@@ -37,6 +43,10 @@ the answers given with their citations exactly as written (like [12] or [R3#14])
 names that came up, and open questions. Write it in the language of the conversation. Reply with \
 the summary only.";
 
+/// Put after a tool result that was cut to fit the context.
+pub(crate) const CUT_NOTE: &str =
+    "\n[…the rest was cut to fit the context; ask for a smaller part.]";
+
 const ANSWER_NOW: &str = "You have used all your tool calls. Answer now with what you found; \
 say what you couldn't check.";
 
@@ -51,6 +61,19 @@ pub trait Host: Send {
     /// The text streamed since the last call was the model thinking aloud before calling
     /// tools, not the answer: discard it.
     fn on_reset(&mut self);
+    /// A tool call ended the task: stop without asking for an answer.
+    fn finished(&self) -> bool {
+        false
+    }
+    /// Continue after an early answer; the host limits how often.
+    fn follow_up(&mut self, _answer: &str) -> Option<String> {
+        None
+    }
+    /// The result of `call_id` was cut to fit the context before the model saw all of it;
+    /// `kept` is what it will see. A returned note goes after the newest tool result.
+    fn on_cut(&mut self, _call_id: &str, _kept: &str) -> Option<String> {
+        None
+    }
 }
 
 /// What the model sees: the system prompt (plus a summary of older conversation), earlier
@@ -63,6 +86,11 @@ pub struct Context {
     /// How many of the initial history messages have been folded into `summary`.
     pub folded: usize,
     pub budget: usize,
+    /// Prune output older than the newest N rounds before each request (docs); None keeps
+    /// output until the context overflows (chat).
+    pub keep_rounds: Option<usize>,
+    /// Tool results cut since the host last heard about it: (call id, text kept).
+    cut: Vec<(String, String)>,
     /// Estimated tokens per character, calibrated from the usage the API reports.
     ratio: f64,
 }
@@ -117,6 +145,8 @@ impl Context {
             turn: vec![request],
             folded: 0,
             budget: CONTEXT_BUDGET,
+            keep_rounds: None,
+            cut: vec![],
             ratio: DEFAULT_RATIO,
         }
     }
@@ -184,6 +214,104 @@ impl Context {
         }
     }
 
+    /// Prune old, large read results and call arguments, counting each replacement once.
+    fn prune_rounds(&mut self, keep: usize) -> u32 {
+        let rounds: Vec<_> = self
+            .turn
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| !m.tool_calls.is_empty())
+            .map(|(i, _)| i)
+            .collect();
+        let old = rounds.len().saturating_sub(keep);
+        let mut pruned = 0;
+        for (n, &start) in rounds.iter().take(old).enumerate() {
+            let end = rounds.get(n + 1).copied().unwrap_or(self.turn.len());
+            let calls = self.turn[start].tool_calls.clone();
+            for m in &mut self.turn[start + 1..end] {
+                if m.role != "tool" || text_len(&m.content) <= PRUNE_MIN_CHARS {
+                    continue;
+                }
+                let Some(call) = calls
+                    .iter()
+                    .find(|c| Some(&c.id) == m.tool_call_id.as_ref())
+                else {
+                    continue;
+                };
+                if matches!(
+                    call.name.as_str(),
+                    "read_transcript"
+                        | "read_transcript_section"
+                        | "read_draft"
+                        | "read_doc"
+                        | "search"
+                        | "get_notes"
+                        | "list_recordings"
+                ) {
+                    m.content = Content::Text(format!("[The output of {}({}) was removed to save space. Call the tool again if you still need it.]", call.name, clip(&call.arguments, 120)));
+                    pruned += 1;
+                }
+            }
+            for call in &mut self.turn[start].tool_calls {
+                pruned += u32::from(stub_arguments(call));
+            }
+        }
+        pruned
+    }
+
+    /// Replace the large arguments of every draft write and edit made so far, the newest
+    /// included: the draft holds what they wrote (overflow only).
+    fn prune_draft_arguments(&mut self) {
+        for call in self.turn.iter_mut().flat_map(|m| &mut m.tool_calls) {
+            if matches!(call.name.as_str(), "write_draft" | "edit_draft") {
+                stub_arguments(call);
+            }
+        }
+    }
+
+    /// Append `note` to the newest tool result, the last thing the model reads.
+    fn note_after_tools(&mut self, note: &str) {
+        if let Some(m) = self.turn.iter_mut().rev().find(|m| m.role == "tool") {
+            if let Content::Text(text) = &mut m.content {
+                text.push('\n');
+                text.push_str(note);
+            }
+        }
+    }
+
+    /// Remove whole old tool rounds and replace them with one cumulative note.
+    fn fold_old_rounds(&mut self, keep: usize) -> usize {
+        let rounds: Vec<_> = self
+            .turn
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| !m.tool_calls.is_empty())
+            .map(|(i, _)| i)
+            .collect();
+        let removed = rounds.len().saturating_sub(keep);
+        if removed == 0 {
+            return 0;
+        }
+        let end = rounds.get(removed).copied().unwrap_or(self.turn.len());
+        let previous = self
+            .turn
+            .get(1)
+            .filter(|m| m.role == "user")
+            .map(|m| m.content.text())
+            .filter(|s| s.starts_with('[') && s.contains("earlier tool rounds were removed"))
+            .and_then(|s| {
+                s.split_whitespace()
+                    .next()?
+                    .trim_start_matches('[')
+                    .parse::<usize>()
+                    .ok()
+            })
+            .unwrap_or(0);
+        self.turn.drain(1..end);
+        self.turn.insert(1, Msg::user(format!("[{} earlier tool rounds were removed to save space. Call a tool again if you need its output.]", previous + removed)));
+        removed
+    }
+
     /// Halve the largest tool outputs until the context fits `target` tokens.
     fn shrink_tool_output(&mut self, target: usize) {
         while self.tokens() > target {
@@ -201,12 +329,24 @@ impl Context {
             if text.len() < 4_000 {
                 break;
             }
-            m.content = Content::Text(format!(
-                "{}\n[…the rest was cut to fit the context; ask for a smaller part.]",
-                clip(text, text.len() / 2)
-            ));
+            let kept = format!("{}{CUT_NOTE}", clip(text, text.len() / 2));
+            let id = m.tool_call_id.clone().unwrap_or_default();
+            self.cut.retain(|(cut, _)| *cut != id);
+            self.cut.push((id, kept.clone()));
+            m.content = Content::Text(kept);
         }
     }
+}
+
+/// Replace tool-call arguments longer than [`PRUNE_ARGS_CHARS`] with a short, valid JSON
+/// note. Returns whether it did.
+fn stub_arguments(call: &mut ToolCall) -> bool {
+    if call.arguments.len() <= PRUNE_ARGS_CHARS {
+        return false;
+    }
+    let size = (call.arguments.len() + 512) / 1024;
+    call.arguments = serde_json::json!({"removed": format!("the arguments ({size} KB) were removed to save space; the draft holds the result")}).to_string();
+    true
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -215,12 +355,16 @@ pub struct Stats {
     pub requests: u32,
     pub tool_calls: u32,
     pub compactions: u32,
+    pub nudges: u32,
+    pub pruned: u32,
 }
 
 pub struct Agent<'a> {
     client: &'a Client,
     model: &'a str,
     max_tokens: u32,
+    /// Tool rounds before the final request with tools disabled.
+    pub max_rounds: u32,
     cancel: &'a AtomicBool,
     pub ctx: Context,
     /// Summed over every request, including summaries.
@@ -240,6 +384,7 @@ impl<'a> Agent<'a> {
             client,
             model,
             max_tokens,
+            max_rounds: MAX_ROUNDS,
             cancel,
             ctx,
             usage: None,
@@ -265,12 +410,22 @@ impl<'a> Agent<'a> {
         let mut retried = false;
         loop {
             self.check_cancel()?;
-            let last = rounds >= MAX_ROUNDS;
+            let last = rounds >= self.max_rounds;
             if last {
                 self.ctx.turn.push(Msg::user(ANSWER_NOW));
             }
+            if let Some(keep) = self.ctx.keep_rounds {
+                self.stats.pruned += self.ctx.prune_rounds(keep);
+            }
             if self.ctx.tokens() > self.ctx.budget {
                 self.compact().await?;
+            }
+            let mut note = None;
+            for (id, kept) in std::mem::take(&mut self.ctx.cut) {
+                note = host.on_cut(&id, &kept).or(note);
+            }
+            if let Some(note) = note {
+                self.ctx.note_after_tools(&note);
             }
             let messages = self.ctx.messages();
             let chars: usize = messages.iter().map(msg_chars).sum();
@@ -300,14 +455,24 @@ impl<'a> Agent<'a> {
                 }
                 Err(e) => return Err(explain_error(e, self.model)),
             };
+            retried = false;
             self.stats.requests += 1;
             add_usage(&mut self.usage, reply.usage);
             if let Some(u) = reply.usage {
                 self.ctx.calibrate(u.prompt_tokens, chars);
             }
             if reply.tool_calls.is_empty() || last {
-                if reply.content.trim().is_empty() {
-                    bail!("the model didn't answer");
+                if !last {
+                    if let Some(message) = host.follow_up(&reply.content) {
+                        host.on_reset();
+                        self.stats.nudges += 1;
+                        // some providers reject an assistant message with no content
+                        if !reply.content.trim().is_empty() {
+                            self.ctx.turn.push(Msg::assistant(reply.content));
+                        }
+                        self.ctx.turn.push(Msg::user(message));
+                        continue;
+                    }
                 }
                 return Ok(reply.content);
             }
@@ -315,7 +480,7 @@ impl<'a> Agent<'a> {
             rounds += 1;
             self.ctx.turn.push(Msg {
                 reasoning_details: reply.reasoning_details,
-                ..Msg::tool_calls(reply.content, reply.tool_calls.clone())
+                ..Msg::tool_calls(reply.content.clone(), reply.tool_calls.clone())
             });
             for call in &reply.tool_calls {
                 self.check_cancel()?;
@@ -324,6 +489,9 @@ impl<'a> Agent<'a> {
                 self.ctx
                     .turn
                     .push(Msg::tool_result(&call.id, clip(&out, MAX_TOOL_CHARS)));
+            }
+            if host.finished() {
+                return Ok(reply.content);
             }
         }
     }
@@ -348,6 +516,10 @@ impl<'a> Agent<'a> {
         self.stats.compactions += 1;
         let target = self.ctx.budget / 2;
         self.ctx.drop_old_tool_output();
+        self.ctx.prune_draft_arguments();
+        if self.ctx.tokens() > target {
+            self.ctx.fold_old_rounds(KEEP_ROUNDS_ON_FOLD);
+        }
         if self.ctx.history_tokens() > self.ctx.budget / 4 {
             self.summarize_history().await?;
         }
@@ -523,8 +695,9 @@ pub fn recording_chat_system(rec: &RecordingFacts, ai_language: &str) -> String 
          with tools. {lang}\n\n\
          How to work:\n\
          - Look things up before you answer. get_overview gives the big picture; search finds where \
-         something is said; read_transcript_section reads around it; read_transcript reads everything \
-         (fine for recordings up to about an hour); get_notes shows the user's own notes.\n\
+         something is said; read_transcript_section reads a range of segments and read_transcript \
+         reads from the start. Long transcripts come in parts of about 15 minutes, and each part \
+         says where to continue; get_notes shows the user's own notes.\n\
          - {analysis}{notes}\n\
          - The user may attach images or voice messages; use them together with the transcript.\n\
          - Don't guess. If the recording doesn't say, tell the user.\n\n\
@@ -566,17 +739,35 @@ pub fn doc_system(rec: &RecordingFacts, ai_language: &str) -> String {
         .map(|s| format!("- {}: {}\n", s.name, s.description))
         .collect();
     format!(
-        "You make small, polished, interactive HTML documents that help someone explore an audio \
-         recording: mind maps, timelines, flashcards, quizzes, minutes, glossaries, tables… This one \
-         is about {desc}. {lang}\n\n\
-         How to work:\n\
-         1. Load the design guide closest to the request with load_skill (skip this when a guide \
-         is already included with the request).\n\
-         2. Gather the content with the tools: get_overview first, then read the transcript (whole, \
-         or section by section when it's long) and the user's notes when they matter. Note the \
-         segment id of everything you use.\n\
-         3. Write the document. Your final answer is the complete HTML file and nothing else.\n\n\
-         Guides you can load:\n{guides}\n{base}",
+        r#"You make small, polished, interactive HTML documents that help someone explore an audio
+recording: mind maps, timelines, flashcards, quizzes, minutes, glossaries, tables… This one is
+about {desc}. {lang}
+
+You build the doc as a file with tools. Only the draft file counts: text in your answers is not
+kept.
+
+How to work:
+1. Load the design guide closest to the request with load_skill (skip this when a guide is
+   already included with the request).
+2. get_overview for the big picture: chapters, topics, how many notes the user wrote.
+3. write_draft with the complete file right away: the skeleton from the rules below, the
+   styles, the script that renders the content, and the data list empty except for a marker
+   comment at its end (like `// end: items`). It must already be a working doc with no items.
+4. Read the transcript part by part: read_transcript first, then read_transcript_section from
+   the segment each part tells you to continue from. After each part, add what you found to the
+   data list with edit_draft (`old` = the marker comment, `new` = the new items followed by the
+   same comment). Do this before reading the next part: earlier parts are removed from your
+   context, and the draft is your only memory. get_notes when the user's notes matter.
+5. When every part is read (each result says what is still unread), fix anything that needs it
+   and call finish_doc. If it reports problems, fix them with edit_draft and call it again.
+
+Edits: `old` is a few lines copied exactly from the draft, without line numbers, and must occur
+only once. Don't read the draft after an edit; the confirmation tells you it applied. If you are
+told you have used all your tool calls, answer with one sentence: the draft as it is will be used.
+
+Guides you can load:
+{guides}
+{base}"#,
         desc = rec.describe(),
         lang = language_instruction(ai_language),
         base = skills::base(),
@@ -594,12 +785,13 @@ pub fn doc_request(prompt: &str, skill: Option<&str>) -> String {
     }
 }
 
-pub fn doc_revision(prompt: &str, html: &str, instruction: &str) -> String {
+/// Revise a loaded draft without pasting its HTML into the request.
+pub fn doc_revision(prompt: &str, summary: &str, instruction: &str) -> String {
     format!(
-        "Here is the current document, made for the request “{prompt}”:\n\n{html}\n\n\
-         Change it: {instruction}\n\
-         Keep everything else as it is. Your final answer is the complete updated HTML file and \
-         nothing else."
+        r#"The doc made for the request “{prompt}” is loaded as the draft ({summary}). Change it: {instruction}
+Read the parts you need with read_draft (start with lines 1–200 to see its structure), make the
+change with edit_draft, keep everything else as it is, then call finish_doc. If the change needs
+new content from the recording, read the transcript part by part as usual."#
     )
 }
 
@@ -719,6 +911,15 @@ mod tests {
             self.text.clear();
             self.resets += 1;
         }
+        fn finished(&self) -> bool {
+            self.tools.finished()
+        }
+        fn follow_up(&mut self, answer: &str) -> Option<String> {
+            self.tools.follow_up(answer)
+        }
+        fn on_cut(&mut self, call_id: &str, kept: &str) -> Option<String> {
+            self.tools.on_cut(call_id, kept)
+        }
     }
 
     fn host(scope: Scope) -> TestHost {
@@ -763,6 +964,445 @@ mod tests {
         }
     }
 
+    const SKELETON: &str = concat!(
+        "<!doctype html>\n<html>\n<style>/* ",
+        "padding padding padding padding padding padding padding padding padding padding ",
+        "padding padding padding padding padding padding padding padding padding padding ",
+        "padding padding padding padding padding padding padding padding padding padding ",
+        "padding padding padding padding padding padding padding padding padding padding ",
+        "padding padding padding padding padding padding padding padding padding padding ",
+        "padding padding padding padding padding padding padding padding padding padding ",
+        "padding padding padding padding padding padding padding padding padding padding ",
+        "padding padding padding padding padding padding padding padding padding padding ",
+        "padding padding padding padding padding padding padding padding padding padding ",
+        "padding padding padding padding padding padding padding padding padding padding ",
+        "padding padding padding padding padding padding padding padding padding padding ",
+        "padding padding padding padding padding padding padding padding padding padding ",
+        "padding padding padding padding padding padding padding padding padding padding ",
+        "padding padding padding padding padding padding padding padding padding padding ",
+        "*/</style>\n<script>const ITEMS = [\n  // end: items\n];\nconst segments = WWTA.segments;</script>\n</html>",
+    );
+
+    fn doc_host() -> TestHost {
+        let mut h = host(Scope::Recording("uuid-a".into()));
+        let mut segments = h.db.segments("uuid-a").unwrap();
+        segments[1].text.push_str(&" حرف".repeat(120));
+        h.db.replace_segments("uuid-a", "m", &segments).unwrap();
+        h.tools = ToolBox::new(Scope::Recording("uuid-a".into()), true);
+        h
+    }
+
+    fn doc_context(request: &str) -> Context {
+        let mut ctx = Context::new("system", None, vec![], Msg::user(request));
+        ctx.keep_rounds = Some(DOC_KEEP_ROUNDS);
+        ctx
+    }
+
+    const DOC: &str = "<!doctype html>\n<html>\n<title>Quiz</title>\n<script>const x = WWTA.segments;</script>\n</html>";
+
+    #[tokio::test]
+    async fn builds_a_doc_step_by_step() {
+        let (base, seen) = fake_openrouter(vec![
+            calls("", &[("get_overview", json!({}))]),
+            calls("", &[("read_transcript", json!({}))]),
+            calls("", &[("write_draft", json!({"html": SKELETON}))]),
+            calls("", &[("read_transcript_section", json!({"from": 2}))]),
+            calls(
+                "",
+                &[(
+                    "edit_draft",
+                    json!({"old": "  // end: items", "new": "  { q: \"x\", seg: 1 },\n  // end: items"}),
+                )],
+            ),
+            calls("", &[("finish_doc", json!({}))]),
+        ]);
+        let client = Client::with_base("key", &base).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut h = doc_host();
+        let mut agent = Agent::new(&client, "m", 32_000, &cancel, doc_context("quiz"));
+        assert_eq!(agent.run(&mut h).await.unwrap(), "");
+        assert!(h.tools.finished());
+        assert_eq!(agent.stats.requests, 6);
+        assert!(agent.stats.pruned > 0);
+        let result = h.tools.doc_result("").unwrap();
+        assert_eq!(result.source, "draft");
+        assert!(result.html.contains("{ q: \"x\", seg: 1 }"));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 6);
+        let messages = seen[4]["messages"].as_array().unwrap();
+        let outputs = messages
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .collect::<Vec<_>>();
+        assert!(outputs[1]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("[The output of read_transcript({}) was removed"));
+        assert!(outputs[3]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("Segments 2–2 of 0–2:"));
+        let messages = seen[5]["messages"].as_array().unwrap();
+        let write = messages
+            .iter()
+            .find(|m| m["tool_calls"][0]["function"]["name"] == "write_draft")
+            .unwrap();
+        let args: Value = serde_json::from_str(
+            write["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(args["removed"]
+            .as_str()
+            .unwrap()
+            .contains("the draft holds the result"));
+        let messages = seen[2]["messages"].as_array().unwrap();
+        assert!(messages.last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .ends_with("Transcript read so far: 0–1 (66% of 0–2). Unread: 2."));
+    }
+
+    #[tokio::test]
+    async fn an_empty_early_answer_is_not_replayed() {
+        let (base, seen) = fake_openrouter(vec![
+            answer(""),
+            calls("", &[("write_draft", json!({"html": SKELETON}))]),
+            calls("", &[("finish_doc", json!({}))]),
+        ]);
+        let client = Client::with_base("key", &base).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut h = doc_host();
+        let mut agent = Agent::new(&client, "m", 32_000, &cancel, doc_context("quiz"));
+        agent.run(&mut h).await.unwrap();
+        assert_eq!(agent.stats.nudges, 1);
+        let seen = seen.lock().unwrap();
+        let messages = seen[1]["messages"].as_array().unwrap();
+        assert!(messages.iter().all(|m| m["role"] != "assistant"));
+        assert!(messages.last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("You haven't written the doc yet."));
+    }
+
+    #[tokio::test]
+    async fn nudges_a_model_that_answers_too_early() {
+        let (base, seen) = fake_openrouter(vec![
+            calls("", &[("write_draft", json!({"html": SKELETON}))]),
+            answer("Done."),
+            calls("", &[("finish_doc", json!({}))]),
+        ]);
+        let client = Client::with_base("key", &base).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut h = doc_host();
+        let mut agent = Agent::new(&client, "m", 32_000, &cancel, doc_context("quiz"));
+        agent.run(&mut h).await.unwrap();
+        assert_eq!((agent.stats.nudges, agent.stats.requests), (1, 3));
+        assert_eq!(h.tools.doc_result("").unwrap().source, "draft");
+        let seen = seen.lock().unwrap();
+        let messages = seen[2]["messages"].as_array().unwrap();
+        assert_eq!(messages[messages.len() - 2]["content"], "Done.");
+        assert_eq!(messages[messages.len() - 2]["role"], "assistant");
+        assert_eq!(messages.last().unwrap()["role"], "user");
+        assert!(messages.last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("The doc isn't finished."));
+    }
+
+    #[tokio::test]
+    async fn accepts_html_dumped_in_the_answer() {
+        let html = format!("```html\n{DOC}\n```");
+        let (base, _) = fake_openrouter(vec![answer(&html)]);
+        let client = Client::with_base("key", &base).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut h = doc_host();
+        let mut agent = Agent::new(&client, "m", 32_000, &cancel, doc_context("quiz"));
+        let answer = agent.run(&mut h).await.unwrap();
+        assert_eq!(h.tools.doc_result(&answer).unwrap().source, "answer");
+        assert_eq!(agent.stats.nudges, 0);
+    }
+
+    #[tokio::test]
+    async fn takes_the_draft_at_the_round_limit() {
+        let (base, seen) = fake_openrouter(vec![
+            calls("", &[("write_draft", json!({"html": SKELETON}))]),
+            calls(
+                "",
+                &[(
+                    "edit_draft",
+                    json!({"old": "  // end: items", "new": "  1,\n  // end: items"}),
+                )],
+            ),
+            answer("I'd continue…"),
+        ]);
+        let client = Client::with_base("key", &base).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut h = doc_host();
+        let mut agent = Agent::new(&client, "m", 32_000, &cancel, doc_context("quiz"));
+        agent.max_rounds = 2;
+        let answer = agent.run(&mut h).await.unwrap();
+        let result = h.tools.doc_result(&answer).unwrap();
+        assert_eq!(result.source, "draft");
+        assert!(result.html.contains("  1,\n  // end: items"));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[2]["tool_choice"], "none");
+        assert_eq!(
+            seen[2]["messages"].as_array().unwrap().last().unwrap()["content"],
+            ANSWER_NOW
+        );
+        assert_eq!(agent.stats.nudges, 0);
+    }
+
+    #[tokio::test]
+    async fn drops_draft_arguments_after_a_context_error() {
+        let overflow = Canned {
+            status: 400,
+            content_type: "application/json",
+            body: json!({ "error": { "message": "This endpoint's maximum context length is 30000 tokens." } }).to_string(),
+        };
+        let (base, seen) = fake_openrouter(vec![
+            calls("", &[("write_draft", json!({"html": SKELETON}))]),
+            overflow,
+            calls("", &[("finish_doc", json!({}))]),
+        ]);
+        let client = Client::with_base("key", &base).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut h = doc_host();
+        let mut agent = Agent::new(&client, "m", 32_000, &cancel, doc_context("quiz"));
+        agent.run(&mut h).await.unwrap();
+        assert_eq!(h.tools.doc_result("").unwrap().html, SKELETON);
+        let seen = seen.lock().unwrap();
+        let arguments = |i: usize| {
+            seen[i]["messages"].as_array().unwrap()[2]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        // the newest round is kept by the rolling prune, so only the retry drops it
+        assert_eq!(arguments(1), json!({"html": SKELETON}).to_string());
+        assert!(arguments(2).contains("the draft holds the result"));
+    }
+
+    #[tokio::test]
+    async fn coverage_leaves_out_what_compaction_cut() {
+        let (base, seen) = fake_openrouter(vec![
+            calls("", &[("read_transcript_section", json!({"from": 2}))]),
+            calls("", &[("write_draft", json!({"html": SKELETON}))]),
+            calls("", &[("finish_doc", json!({}))]),
+        ]);
+        let client = Client::with_base("key", &base).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut h = doc_host();
+        let mut ctx = doc_context("quiz");
+        // segment 2 is one long line; this budget makes compaction cut it
+        ctx.budget = 4_000;
+        let mut agent = Agent::new(&client, "m", 32_000, &cancel, ctx);
+        agent.run(&mut h).await.unwrap();
+        let seen = seen.lock().unwrap();
+        let tool = |i: usize, n: usize| {
+            seen[i]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["role"] == "tool")
+                .nth(n)
+                .unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let cut = tool(1, 0);
+        assert!(cut.contains(CUT_NOTE));
+        assert!(cut.ends_with("cut to fit the context. Transcript read so far: nothing of 0–2."));
+        assert!(tool(2, 1).ends_with("Transcript read so far: nothing of 0–2."));
+        assert_eq!(h.tools.doc_stats().transcript_read_pct, 0);
+    }
+
+    #[tokio::test]
+    async fn revises_in_place() {
+        let (base, seen) = fake_openrouter(vec![
+            calls("", &[("read_draft", json!({"from": 1, "to": 200}))]),
+            calls(
+                "",
+                &[(
+                    "edit_draft",
+                    json!({"old": "<title>Quiz</title>", "new": "<title>Quiz 2</title>"}),
+                )],
+            ),
+            calls("", &[("finish_doc", json!({}))]),
+        ]);
+        let client = Client::with_base("key", &base).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut h = doc_host();
+        h.tools.set_draft(DOC);
+        let mut agent = Agent::new(
+            &client,
+            "m",
+            32_000,
+            &cancel,
+            doc_context(&doc_revision(
+                "a quiz",
+                &h.tools.draft().summary(),
+                "Rename it to Quiz 2",
+            )),
+        );
+        let answer = agent.run(&mut h).await.unwrap();
+        assert_eq!(
+            h.tools.doc_result(&answer).unwrap().html,
+            DOC.replace("<title>Quiz</title>", "<title>Quiz 2</title>")
+        );
+        assert!(!seen.lock().unwrap()[0]["messages"]
+            .to_string()
+            .contains("<title>Quiz</title>"));
+    }
+
+    #[tokio::test]
+    async fn folds_old_rounds_when_the_turn_overflows() {
+        let mut script = (0..5)
+            .map(|_| calls(&"x".repeat(3_000), &[("get_notes", json!({}))]))
+            .collect::<Vec<_>>();
+        script.push(answer("ok"));
+        let (base, seen) = fake_openrouter(script);
+        let client = Client::with_base("key", &base).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut h = host(Scope::Recording("uuid-a".into()));
+        let mut ctx = Context::new("system", None, vec![], Msg::user("question"));
+        ctx.budget = 6_000;
+        let mut agent = Agent::new(&client, "m", 1_000, &cancel, ctx);
+        assert_eq!(agent.run(&mut h).await.unwrap(), "ok");
+        assert!(agent.ctx.tokens() <= 6_000);
+        let seen = seen.lock().unwrap();
+        let messages = seen.last().unwrap()["messages"].as_array().unwrap();
+        let note = messages[2]["content"].as_str().unwrap();
+        assert!(note.starts_with('[') && note.contains("earlier tool rounds were removed"));
+        assert!(
+            messages
+                .iter()
+                .filter(|m| m.get("tool_calls").is_some())
+                .count()
+                < 5
+        );
+    }
+
+    #[test]
+    fn pruning_preserves_guides_and_reasoning_and_is_idempotent() {
+        let mut ctx = doc_context("question");
+        for (i, name) in [
+            "get_overview",
+            "load_skill",
+            "read_draft",
+            "edit_draft",
+            "get_notes",
+        ]
+        .iter()
+        .enumerate()
+        {
+            ctx.turn.push(Msg {
+                reasoning_details: vec![json!({"data": "opaque"})],
+                ..Msg::tool_calls(
+                    "",
+                    vec![ToolCall {
+                        id: i.to_string(),
+                        name: name.to_string(),
+                        arguments: json!({"text": "x".repeat(2_000)}).to_string(),
+                    }],
+                )
+            });
+            ctx.turn
+                .push(Msg::tool_result(&i.to_string(), "x".repeat(2_000)));
+        }
+        assert_eq!(ctx.prune_rounds(2), 4);
+        assert_eq!(ctx.prune_rounds(2), 0);
+        assert_eq!(ctx.turn[2].content.text().len(), 2_000);
+        assert_eq!(ctx.turn[4].content.text().len(), 2_000);
+        assert!(ctx.turn[6]
+            .content
+            .text()
+            .starts_with("[The output of read_draft("));
+        assert_eq!(ctx.turn[5].reasoning_details[0]["data"], "opaque");
+        assert_eq!(ctx.turn[8].content.text().len(), 2_000);
+    }
+
+    #[test]
+    fn folding_accumulates_counts_and_removes_intervening_nudges() {
+        let mut ctx = doc_context("question");
+        for i in 0..5 {
+            ctx.turn.push(Msg::tool_calls(
+                "",
+                vec![ToolCall {
+                    id: i.to_string(),
+                    name: "get_notes".into(),
+                    arguments: "{}".into(),
+                }],
+            ));
+            ctx.turn.push(Msg::tool_result(&i.to_string(), "notes"));
+            if i == 1 {
+                ctx.turn.push(Msg::assistant("Done."));
+                ctx.turn.push(Msg::user("Continue."));
+            }
+        }
+        assert_eq!(ctx.fold_old_rounds(3), 2);
+        assert!(!ctx.turn.iter().any(|m| m.content.text() == "Continue."));
+        assert_eq!(ctx.fold_old_rounds(2), 1);
+        assert!(ctx.turn[1]
+            .content
+            .text()
+            .starts_with("[3 earlier tool rounds"));
+        assert_eq!(ctx.fold_old_rounds(2), 0);
+        assert_eq!(ctx.turn[0].content.text(), "question");
+        assert_eq!(
+            ctx.turn.iter().filter(|m| !m.tool_calls.is_empty()).count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn retries_context_errors_again_after_a_successful_round() {
+        let overflow = || Canned {
+            status: 400,
+            content_type: "application/json",
+            body: json!({"error": {"message": "maximum context length is 30000 tokens"}})
+                .to_string(),
+        };
+        let (base, _) = fake_openrouter(vec![
+            overflow(),
+            calls("", &[("get_notes", json!({}))]),
+            overflow(),
+            answer("ok"),
+        ]);
+        let client = Client::with_base("key", &base).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut h = host(Scope::Recording("uuid-a".into()));
+        let mut agent = Agent::new(
+            &client,
+            "m",
+            1_000,
+            &cancel,
+            Context::new("s", None, vec![], Msg::user("q")),
+        );
+        assert_eq!(agent.run(&mut h).await.unwrap(), "ok");
+        assert_eq!(agent.stats.compactions, 2);
+        assert_eq!(agent.stats.requests, 2);
+    }
+
+    #[tokio::test]
+    async fn an_empty_answer_is_returned_not_an_error() {
+        let (base, _) = fake_openrouter(vec![answer("")]);
+        let client = Client::with_base("key", &base).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut h = host(Scope::Recording("uuid-a".into()));
+        let mut agent = Agent::new(
+            &client,
+            "m",
+            1_000,
+            &cancel,
+            Context::new("s", None, vec![], Msg::user("q")),
+        );
+        assert_eq!(agent.run(&mut h).await.unwrap(), "");
+    }
+
     #[tokio::test]
     async fn runs_tools_until_the_model_answers() {
         let mut first = calls("Let me search.", &[("search", json!({ "query": "بودجه" }))]);
@@ -801,7 +1441,7 @@ mod tests {
     async fn summarizes_history_and_cuts_oversized_tool_output() {
         let (base, seen) = fake_openrouter(vec![
             completion("They talked about the budget."),
-            calls("", &[("read_transcript", json!({}))]),
+            calls("", &[("read_transcript_section", json!({"from": 2}))]),
             answer("Done [1]."),
         ]);
         let client = Client::with_base("key", &base).unwrap();
@@ -810,14 +1450,14 @@ mod tests {
         let history: Vec<Msg> = (0..6)
             .map(|i| {
                 if i % 2 == 0 {
-                    Msg::user(format!("question {i} {}", "x".repeat(3_000)))
+                    Msg::user(format!("question {i} {}", "x".repeat(1_500)))
                 } else {
                     Msg::assistant(format!("answer {i}"))
                 }
             })
             .collect();
         let mut ctx = Context::new("system", None, history, Msg::user("now?"));
-        ctx.budget = 12_000;
+        ctx.budget = 6_000;
         let mut agent = Agent::new(&client, "m", 1_000, &cancel, ctx);
         assert_eq!(agent.run(&mut h).await.unwrap(), "Done [1].");
         assert_eq!(agent.ctx.folded, 2);
@@ -826,7 +1466,7 @@ mod tests {
             Some("They talked about the budget.")
         );
         assert_eq!(agent.stats.compactions, 2);
-        assert!(agent.ctx.tokens() <= 12_000);
+        assert!(agent.ctx.tokens() <= 6_000);
         let seen = seen.lock().unwrap();
         // the summary request saw the folded messages only
         let summarized = seen[0]["messages"][1]["content"].as_str().unwrap();
@@ -846,7 +1486,7 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(
-            out.starts_with("Segments 0–2 of 0–2:\n[0] (0:00) سلام"),
+            out.starts_with("Segments 2–2 of 0–2:\n[2] (0:20) متن"),
             "{out}"
         );
         assert!(out.ends_with("ask for a smaller part.]"), "{out}");
@@ -1033,7 +1673,7 @@ mod tests {
 
     #[tokio::test]
     async fn forces_an_answer_after_too_many_rounds() {
-        let mut script: Vec<Canned> = (0..MAX_ROUNDS)
+        let mut script: Vec<Canned> = (0..3)
             .map(|_| calls("", &[("get_notes", json!({}))]))
             .collect();
         script.push(answer("Here is what I found."));
@@ -1043,6 +1683,7 @@ mod tests {
         let mut h = host(Scope::Recording("uuid-a".into()));
         let ctx = Context::new("system", None, vec![], Msg::user("hi"));
         let mut agent = Agent::new(&client, "m", 1_000, &cancel, ctx);
+        agent.max_rounds = 3;
         assert_eq!(agent.run(&mut h).await.unwrap(), "Here is what I found.");
         let seen = seen.lock().unwrap();
         let last = seen.last().unwrap();
@@ -1076,6 +1717,12 @@ mod tests {
         assert!(sys.contains("“t” (1:01, segments 0–9)"));
         assert!(sys.contains("- quiz: "));
         assert!(sys.contains("WWTA.onTime"));
+        assert!(sys.contains("write_draft"));
+        assert!(sys.contains("// end: items"));
+        let revision = doc_revision("a quiz", "142 lines, 18 KB", "rename the title");
+        assert!(revision.contains("loaded as the draft (142 lines, 18 KB)"));
+        assert!(revision.contains("read_draft") && revision.contains("finish_doc"));
+        assert!(!revision.contains("<html"));
         assert!(doc_request("x", Some("timeline")).contains("# Timeline"));
         assert_eq!(doc_request("x", None), "Make this doc: x");
     }

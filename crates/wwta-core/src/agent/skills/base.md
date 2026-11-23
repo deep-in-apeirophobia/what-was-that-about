@@ -5,10 +5,10 @@ description: Rules and building blocks every doc follows (always in the prompt).
 # Making a doc
 
 A doc is ONE self-contained HTML file. The app shows it in a sandboxed frame next to the
-audio player. Your final answer is that file and nothing else.
+audio player. You build it with write_draft and edit_draft and finish with finish_doc.
 
 ## Hard rules
-- Start with `<!doctype html>` and end with `</html>`. No markdown fences, no commentary.
+- The file starts with `<!doctype html>` and ends with `</html>`. Plain HTML, no markdown fences.
 - Inline all CSS and JavaScript. No external resources: no CDNs, web fonts, image URLs,
   fetch/XHR, iframes or forms. The frame's security policy blocks them and the doc breaks.
   The clipboard, storage, downloads and pop-ups are blocked too, so don't add buttons for them.
@@ -90,5 +90,13 @@ For an English doc use `<html lang="en" dir="ltr">`.
 - It has to work 360 px wide and on a large screen.
 - The script must run without errors: define functions before you use them, check that a
   segment exists before using it, and don't assume `WWTA.analysis` is set.
-- Put the content you wrote into a JavaScript array near the top of the script and render it
-  from there. That keeps the HTML short and the data easy to check.
+- Put the content you write into a JavaScript list near the top of the script and render
+  everything from it. End every list you will grow with a marker comment that occurs nowhere
+  else, for example:
+  ```js
+  const ITEMS = [
+    // end: items
+  ];
+  ```
+  Add items with edit_draft: `old` is the marker line, `new` is the new items followed by the
+  same marker line. Write the skeleton so it already works with an empty list.

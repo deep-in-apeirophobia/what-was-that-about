@@ -3,7 +3,7 @@ import { Pause, Play, Trash2, Wand2, X } from "lucide-react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { api, isTauri } from "../../lib/api";
 import { bridgeDataFrom, buildDocSrcdoc, parseBridgeMessage } from "../../lib/docBridge";
-import { formatBytes, formatTime } from "../../lib/format";
+import { formatTime } from "../../lib/format";
 import { newRequestId } from "../../lib/platform";
 import type { Doc } from "../../lib/types";
 import { isCancellation, stopLlm } from "../../store/chat";
@@ -108,7 +108,6 @@ export function DocViewer({ doc, onClose }: { doc: Doc; onClose: () => void }) {
   const [instruction, setInstruction] = useState("");
   const [revising, setRevising] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
-  const streamLen = useStreams((s) => (revising ? (s.streams[revising]?.text.length ?? 0) : 0));
   const status = useStreams((s) => (revising ? (s.streams[revising]?.status ?? null) : null));
 
   const revise = async () => {
@@ -194,15 +193,9 @@ export function DocViewer({ doc, onClose }: { doc: Doc; onClose: () => void }) {
               <div className="flex items-center gap-2 rounded-full border border-line bg-surface px-3.5 py-1.5 text-[12.5px] shadow-pop">
                 <Wand2 className="size-3.5 animate-pulse text-accent" />
                 Revising…{" "}
-                {streamLen > 0 ? (
-                  <span className="text-muted tabular-nums">{formatBytes(streamLen)}</span>
-                ) : (
-                  status && (
-                    <span className="text-muted" dir="auto">
-                      {status}
-                    </span>
-                  )
-                )}
+                <span className="text-muted" dir="auto">
+                  {status ?? "Thinking…"}
+                </span>
               </div>
             </div>
           )}

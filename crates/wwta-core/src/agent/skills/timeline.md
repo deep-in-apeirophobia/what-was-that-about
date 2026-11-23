@@ -9,9 +9,9 @@ being played is highlighted while the audio runs.
 
 ## Gather
 1. `get_overview` for the chapters (they give the skeleton: title, segment range, summary).
-2. Read the transcript chapter by chapter with `read_transcript_section` (or the whole
-   transcript if it's short) and pick 1-4 key moments inside each chapter: a claim, a
-   number, a decision, a story, a question.
+2. Read the transcript part by part (or chapter by chapter with
+   `read_transcript_section`) and after each part add 1-4 key moments: a claim, a number,
+   a decision, a story, a question.
 
 ## Content
 ```js

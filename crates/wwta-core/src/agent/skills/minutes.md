@@ -8,8 +8,9 @@ Clean minutes of a meeting, class or conversation. Every line links to where it 
 
 ## Gather
 1. `get_overview` for the summary, chapters and action items (if the recording was analyzed).
-2. Read the whole transcript (or every section in order). Minutes must not miss decisions,
-   so don't rely on search alone.
+2. Read the whole transcript part by part, in order, and add decisions, actions, topics
+   and open questions after each part. Minutes must not miss decisions, so don't rely on
+   search alone.
 3. `get_notes`: the user's notes often mark what mattered.
 
 ## Content

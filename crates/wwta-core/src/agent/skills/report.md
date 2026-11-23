@@ -16,9 +16,8 @@ Before writing, decide:
    transcript; a summary of one topic needs `search` and the sections around the hits.
 
 ## Gather
-- `get_overview` first, then read what you need. Collect each item with its segment id.
-- Be complete when the user says "every" or "all": read the whole transcript, section by
-  section if it's long.
+- `get_overview` first, then read what you need part by part, adding each item with its segment
+  id as you go. Be complete when the user says "every" or "all": read the whole transcript.
 
 ## Content
 Put the items into one JavaScript array of objects with the fields you planned, each with a

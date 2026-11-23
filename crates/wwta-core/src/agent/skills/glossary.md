@@ -9,8 +9,9 @@ definitions and a link to where each first appears.
 
 ## Gather
 1. `get_overview` for the topics.
-2. Read the whole transcript and collect every term a newcomer might not know: people,
-   organizations, places, technical words, abbreviations, foreign words.
+2. Read the transcript part by part and after each part add every term a newcomer might
+   not know: people, organizations, places, technical words, abbreviations, foreign
+   words.
 3. Use `search` to find a term's first mention when you're not sure.
 
 ## Content
