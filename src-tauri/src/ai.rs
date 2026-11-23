@@ -10,7 +10,8 @@ use anyhow::{anyhow, bail, Result};
 use futures_util::{StreamExt, TryStreamExt};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager};
-use wwta_core::agent::tools::{Scope, ToolBox};
+use wwta_core::agent::draft::Draft;
+use wwta_core::agent::tools::{DocOutput, DocStats, Scope, ToolBox};
 use wwta_core::agent::{self, add_usage, Agent, Context, Host, RecordingFacts, Stats};
 use wwta_core::context::{self, MsgCost};
 use wwta_core::db::thread_title;
@@ -33,6 +34,8 @@ const ANSWER_TOKENS: usize = 4_000;
 const ANALYSIS_TOKENS: usize = 16_000;
 /// Reply budget for generated docs.
 const DOC_TOKENS: usize = 32_000;
+/// Tool rounds for reading a long recording and building its doc a part at a time.
+const DOC_ROUNDS: u32 = 60;
 /// Most verbatim chat history sent with a question; older turns are summarized.
 const HISTORY_MAX_TOKENS: usize = 24_000;
 /// Share (percent) of the prompt budget the verbatim history may take.
@@ -1080,6 +1083,14 @@ impl<'a> ToolHost<'a> {
 }
 
 impl Host for ToolHost<'_> {
+    fn finished(&self) -> bool {
+        self.tools.finished()
+    }
+
+    fn follow_up(&mut self, answer: &str) -> Option<String> {
+        self.tools.follow_up(answer)
+    }
+
     fn tools(&self) -> Vec<Value> {
         self.tools.definitions()
     }
@@ -1136,7 +1147,33 @@ fn stats_props(stats: Stats) -> serde_json::Value {
         "requests": stats.requests,
         "tool_calls": stats.tool_calls,
         "compactions": stats.compactions,
+        "nudges": stats.nudges,
+        "pruned": stats.pruned,
     })
+}
+
+/// What a doc run used, without any prompt, instruction, or HTML content.
+#[derive(Default)]
+struct DocRunStats {
+    agent: Stats,
+    draft: DocStats,
+    source: Option<&'static str>,
+}
+
+fn doc_props(stats: DocRunStats) -> Value {
+    let mut props = stats_props(stats.agent);
+    let draft = stats.draft;
+    props["draft_writes"] = draft.writes.into();
+    props["draft_edits"] = draft.edits.into();
+    props["failed_edits"] = draft.failed_edits.into();
+    props["draft_reads"] = draft.reads.into();
+    props["finish_attempts"] = draft.finish_attempts.into();
+    props["finished"] = draft.finished.into();
+    props["transcript_read_pct"] = draft.transcript_read_pct.into();
+    if let Some(source) = stats.source {
+        props["source"] = source.into();
+    }
+    props
 }
 
 /// What a question used, for usage statistics (counts and flags only).
@@ -1349,6 +1386,9 @@ async fn ask_inner(
         }
     }
     let answer = result?;
+    if answer.trim().is_empty() {
+        bail!("the model didn't answer");
+    }
     let answer = match host.rewriter.as_mut() {
         Some(r) => {
             let tail = r.finish(host.tools.recording_ids());
@@ -1414,8 +1454,10 @@ async fn write_doc(
     job: &LlmJob,
     recording_id: &str,
     request: String,
+    draft: Option<&str>,
     stats: &mut Stats,
-) -> Result<String> {
+    doc_stats: &mut DocStats,
+) -> Result<DocOutput> {
     let state = ai.app.state::<AppState>();
     let settings = state.settings();
     let system = {
@@ -1430,12 +1472,19 @@ async fn write_doc(
     let caps = caps(ai.app, &ai.model).await;
     let mut ctx = Context::new(system, None, vec![], Msg::user(request));
     ctx.budget = agent_budget(&caps, DOC_TOKENS);
+    ctx.keep_rounds = Some(agent::DOC_KEEP_ROUNDS);
     let mut host = ToolHost::new(ai.app, job, Some(recording_id), true);
+    if let Some(html) = draft {
+        host.tools.set_draft(html);
+    }
     let mut agent = Agent::new(&ai.client, &ai.model, DOC_TOKENS as u32, &job.cancel, ctx);
-    let result = agent.run(&mut host).await;
+    agent.max_rounds = DOC_ROUNDS;
+    let answer = agent.run(&mut host).await;
     ai.add_usage(agent.usage);
     *stats = agent.stats;
-    llm::extract_html(&result?)
+    *doc_stats = host.tools.doc_stats();
+    let answer = answer?;
+    host.tools.doc_result(&answer)
 }
 
 pub async fn generate_doc(
@@ -1448,7 +1497,7 @@ pub async fn generate_doc(
     let job = LlmJob::start(app, &request_id);
     let started = std::time::Instant::now();
     let model = app.state::<AppState>().settings().llm_model;
-    let mut stats = Stats::default();
+    let mut stats = DocRunStats::default();
     let (r, usage) = match Ai::new(app, Some(&job)) {
         Ok(ai) => {
             let work = generate_doc_inner(&ai, &job, &id, &prompt, skill.as_deref(), &mut stats);
@@ -1458,12 +1507,15 @@ pub async fn generate_doc(
         Err(e) => (Err(e), None),
     };
     job.finish(&r);
-    let mut props = stats_props(stats);
-    // only the built-in template names, never free text
-    if let Some(s) = skill.as_deref().and_then(agent::skills::get) {
-        props["skill"] = s.name.as_str().into();
-    }
-    track_ai(app, "generate_doc", &model, started, &r, usage, props);
+    track_ai(
+        app,
+        "generate_doc",
+        &model,
+        started,
+        &r,
+        usage,
+        doc_props(stats),
+    );
     r
 }
 
@@ -1473,10 +1525,19 @@ async fn generate_doc_inner(
     id: &str,
     prompt: &str,
     skill: Option<&str>,
-    stats: &mut Stats,
+    stats: &mut DocRunStats,
 ) -> Result<Doc> {
     let request = agent::doc_request(prompt, skill);
-    let html = write_doc(ai, job, id, request, stats).await?;
+    let DocOutput { html, source } = write_doc(
+        ai,
+        job,
+        id,
+        request,
+        None,
+        &mut stats.agent,
+        &mut stats.draft,
+    )
+    .await?;
     let now = now_iso();
     let doc = Doc {
         id: uuid::Uuid::new_v4().to_string(),
@@ -1494,6 +1555,7 @@ async fn generate_doc_inner(
         .lock()
         .unwrap()
         .save_doc(&doc)?;
+    stats.source = Some(source);
     Ok(doc)
 }
 
@@ -1506,7 +1568,7 @@ pub async fn revise_doc(
     let job = LlmJob::start(app, &request_id);
     let started = std::time::Instant::now();
     let model = app.state::<AppState>().settings().llm_model;
-    let mut stats = Stats::default();
+    let mut stats = DocRunStats::default();
     let (r, usage) = match Ai::new(app, Some(&job)) {
         Ok(ai) => {
             let work = revise_doc_inner(&ai, &job, &doc_id, &instruction, &mut stats);
@@ -1523,7 +1585,7 @@ pub async fn revise_doc(
         started,
         &r,
         usage,
-        stats_props(stats),
+        doc_props(stats),
     );
     r
 }
@@ -1533,7 +1595,7 @@ async fn revise_doc_inner(
     job: &LlmJob,
     doc_id: &str,
     instruction: &str,
-    stats: &mut Stats,
+    stats: &mut DocRunStats,
 ) -> Result<Doc> {
     let doc = ai
         .app
@@ -1543,8 +1605,18 @@ async fn revise_doc_inner(
         .unwrap()
         .doc(doc_id)
         .map_err(|_| anyhow!("doc not found"))?;
-    let request = agent::doc_revision(&doc.prompt, &doc.html, instruction);
-    let html = write_doc(ai, job, &doc.recording_id, request, stats).await?;
+    let summary = Draft::load(&doc.html).summary();
+    let request = agent::doc_revision(&doc.prompt, &summary, instruction);
+    let DocOutput { html, source } = write_doc(
+        ai,
+        job,
+        &doc.recording_id,
+        request,
+        Some(&doc.html),
+        &mut stats.agent,
+        &mut stats.draft,
+    )
+    .await?;
     let updated = Doc {
         title: llm::html_title(&html).unwrap_or(doc.title.clone()),
         html,
@@ -1558,5 +1630,6 @@ async fn revise_doc_inner(
         .lock()
         .unwrap()
         .save_doc(&updated)?;
+    stats.source = Some(source);
     Ok(updated)
 }
