@@ -1064,7 +1064,7 @@ struct ToolHost<'a> {
 }
 
 impl<'a> ToolHost<'a> {
-    fn new(app: &'a AppHandle, job: &'a LlmJob, recording_id: Option<&str>, skills: bool) -> Self {
+    fn new(app: &'a AppHandle, job: &'a LlmJob, recording_id: Option<&str>, docs: bool) -> Self {
         let scope = match recording_id {
             Some(id) => Scope::Recording(id.to_string()),
             None => Scope::Library,
@@ -1072,7 +1072,7 @@ impl<'a> ToolHost<'a> {
         Self {
             app,
             job,
-            tools: ToolBox::new(scope, skills),
+            tools: ToolBox::new(scope, docs),
             recording_id: recording_id.map(String::from),
             rewriter: recording_id.is_none().then(CitationRewriter::default),
         }
