@@ -1091,7 +1091,7 @@ impl Host for ToolHost<'_> {
         self.tools.follow_up(answer)
     }
 
-    fn on_cut(&mut self, call_id: &str, kept: &str) {
+    fn on_cut(&mut self, call_id: &str, kept: &str) -> Option<String> {
         self.tools.on_cut(call_id, kept)
     }
 

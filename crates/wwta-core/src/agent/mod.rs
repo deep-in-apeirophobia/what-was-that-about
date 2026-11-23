@@ -70,8 +70,10 @@ pub trait Host: Send {
         None
     }
     /// The result of `call_id` was cut to fit the context before the model saw all of it;
-    /// `kept` is what it will see.
-    fn on_cut(&mut self, _call_id: &str, _kept: &str) {}
+    /// `kept` is what it will see. A returned note goes after the newest tool result.
+    fn on_cut(&mut self, _call_id: &str, _kept: &str) -> Option<String> {
+        None
+    }
 }
 
 /// What the model sees: the system prompt (plus a summary of older conversation), earlier
@@ -267,6 +269,16 @@ impl Context {
         }
     }
 
+    /// Append `note` to the newest tool result, the last thing the model reads.
+    fn note_after_tools(&mut self, note: &str) {
+        if let Some(m) = self.turn.iter_mut().rev().find(|m| m.role == "tool") {
+            if let Content::Text(text) = &mut m.content {
+                text.push('\n');
+                text.push_str(note);
+            }
+        }
+    }
+
     /// Remove whole old tool rounds and replace them with one cumulative note.
     fn fold_old_rounds(&mut self, keep: usize) -> usize {
         let rounds: Vec<_> = self
@@ -408,8 +420,12 @@ impl<'a> Agent<'a> {
             if self.ctx.tokens() > self.ctx.budget {
                 self.compact().await?;
             }
+            let mut note = None;
             for (id, kept) in std::mem::take(&mut self.ctx.cut) {
-                host.on_cut(&id, &kept);
+                note = host.on_cut(&id, &kept).or(note);
+            }
+            if let Some(note) = note {
+                self.ctx.note_after_tools(&note);
             }
             let messages = self.ctx.messages();
             let chars: usize = messages.iter().map(msg_chars).sum();
@@ -901,7 +917,7 @@ mod tests {
         fn follow_up(&mut self, answer: &str) -> Option<String> {
             self.tools.follow_up(answer)
         }
-        fn on_cut(&mut self, call_id: &str, kept: &str) {
+        fn on_cut(&mut self, call_id: &str, kept: &str) -> Option<String> {
             self.tools.on_cut(call_id, kept)
         }
     }
@@ -1197,7 +1213,9 @@ mod tests {
                 .unwrap()
                 .to_string()
         };
-        assert!(tool(1, 0).ends_with(CUT_NOTE));
+        let cut = tool(1, 0);
+        assert!(cut.contains(CUT_NOTE));
+        assert!(cut.ends_with("cut to fit the context. Transcript read so far: nothing of 0–2."));
         assert!(tool(2, 1).ends_with("Transcript read so far: nothing of 0–2."));
         assert_eq!(h.tools.doc_stats().transcript_read_pct, 0);
     }

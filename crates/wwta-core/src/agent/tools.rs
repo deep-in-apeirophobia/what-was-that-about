@@ -103,13 +103,12 @@ impl ToolBox {
     }
 
     /// The agent cut a transcript part to fit the context before the model saw all of it:
-    /// count only the segments it kept whole as read, so coverage shows the rest as unread.
-    pub fn on_cut(&mut self, call_id: &str, kept: &str) {
+    /// count only the segments it kept whole as read. Returns the corrected coverage for the
+    /// model, since earlier results still show the old one.
+    pub fn on_cut(&mut self, call_id: &str, kept: &str) -> Option<String> {
         static LINE: std::sync::LazyLock<Regex> =
             std::sync::LazyLock::new(|| Regex::new(r"^\[(\d+)\] ").unwrap());
-        let Some(i) = self.read_ids.iter().position(|id| id == call_id) else {
-            return;
-        };
+        let i = self.read_ids.iter().position(|id| id == call_id)?;
         // the line the cut went through is partial
         let body = kept.rsplit_once(CUT_NOTE).map_or(kept, |(body, _)| body);
         let whole = body.rsplit_once('\n').map_or("", |(whole, _)| whole);
@@ -125,6 +124,10 @@ impl ToolBox {
                 self.read_ids.remove(i);
             }
         }
+        Some(format!(
+            "Note: a transcript part was cut to fit the context. {}",
+            self.coverage()
+        ))
     }
 
     /// Load the existing doc for an in-place revision.
@@ -844,7 +847,8 @@ impl ToolBox {
                 "[{prefix}{}] ({}) {}\n",
                 s.id,
                 fmt_time(s.start),
-                s.text.trim()
+                // one line per segment, so a cut line is a cut segment
+                s.text.trim().replace(['\r', '\n'], " ")
             );
             if returned.is_some() && body.len() + line.len() > self.window - 200 {
                 next = Some(s.id);
@@ -1273,18 +1277,24 @@ mod tests {
         assert!(out.ends_with("Transcript read so far: all of 0–2."));
         // cut in the middle of segment 1's line
         let at = out.find("[1] ").unwrap() + 6;
-        t.on_cut("r1", &format!("{}{CUT_NOTE}", &out[..at]));
         assert_eq!(
-            t.coverage(),
-            "Transcript read so far: 0 (33% of 0–2). Unread: 1–2."
+            t.on_cut("r1", &format!("{}{CUT_NOTE}", &out[..at])).unwrap(),
+            "Note: a transcript part was cut to fit the context. Transcript read so far: 0 (33% of 0–2). Unread: 1–2."
         );
         // cut before any whole segment: nothing counts
         t.on_cut("r1", &format!("Segments 0–0 of 0–2:\n[0] (0:{CUT_NOTE}"));
         assert_eq!(t.coverage(), "Transcript read so far: nothing of 0–2.");
         // results of other calls are left alone
         t.run(&db, &read, vec![]);
-        t.on_cut("other", "x");
+        assert_eq!(t.on_cut("other", "x"), None);
         assert!(t.coverage().ends_with("all of 0–2."));
+        // a segment with line breaks is still one line
+        let mut segs = db.segments("uuid-a").unwrap();
+        segs[0].text = "یک\nدو".into();
+        let mut db = db;
+        db.replace_segments("uuid-a", "m", &segs).unwrap();
+        let out = t.run(&db, &read, vec![]);
+        assert!(out.contains("[0] (0:00) یک دو\n[1]"), "{out}");
     }
 
     #[test]
