@@ -50,6 +50,8 @@ pub struct ToolBox {
     nudges: u32,
     /// Transcript bytes per read: [`WINDOW_CHARS`], less for a small context.
     window: usize,
+    /// Transcript bytes read since the draft last changed (doc mode).
+    unwritten: usize,
 }
 
 /// A completed draft, or a valid HTML answer from a model that ignored the tools.
@@ -89,6 +91,7 @@ impl ToolBox {
             edited_since_read: false,
             nudges: 0,
             window: WINDOW_CHARS,
+            unwritten: 0,
         }
     }
 
@@ -523,6 +526,7 @@ impl ToolBox {
                     .ok_or("`html` is required")?;
                 let out = self.draft.write(&html)?;
                 self.edited_since_read = true;
+                self.unwritten = 0;
                 Ok(format!("{out}\n{}", self.coverage()))
             }
             "read_draft" => {
@@ -557,6 +561,7 @@ impl ToolBox {
                 .ok_or("`new` is required")?;
                 let out = self.draft.edit(&old, &new)?;
                 self.edited_since_read = true;
+                self.unwritten = 0;
                 Ok(format!("{out}\n{}", self.coverage()))
             }
             "finish_doc" => self.draft.finish(),
@@ -798,6 +803,16 @@ impl ToolBox {
                 "segment {from} doesn't exist; the transcript has segments 0–{last}."
             ));
         }
+        // one part at a time: reading on before writing would put several parts in the
+        // context at once, and compaction would cut parts counted as read
+        if self.docs && self.unwritten >= self.window / 2 {
+            return Err(if self.draft.is_empty() {
+                "write the draft with write_draft, with what you found in the part you just read, before reading more: earlier parts are removed from your context."
+            } else {
+                "add what you found in the part you just read to the draft with edit_draft before reading more: earlier parts are removed from your context."
+            }
+            .into());
+        }
         let to = to.min(last);
         let prefix = if self.library() {
             format!("{}#", self.alias(id))
@@ -837,6 +852,7 @@ impl ToolBox {
             if let Some(end) = returned {
                 self.read_ranges.push((from, end));
             }
+            self.unwritten += body.len();
             if !self.draft.is_empty() && !self.edited_since_read {
                 out.push_str("\nReminder: nothing was added to the draft since the last part you read. Put what you found into the draft before reading on; earlier parts are removed from your context.");
             }
@@ -1229,6 +1245,35 @@ mod tests {
             vec![],
         );
         assert!(out.len() > 20_000);
+    }
+
+    #[test]
+    fn docs_read_one_part_at_a_time() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.insert_recording(&rec("x", "long")).unwrap();
+        let segs: Vec<Segment> = (0..200).map(|i| seg(i, &"کلمه ".repeat(400))).collect();
+        db.replace_segments("x", "m", &segs).unwrap();
+        let section = |from: u32| call("read_transcript_section", json!({"from": from}));
+        let mut t = ToolBox::new(Scope::Recording("x".into()), true);
+        t.fit_window(8_000);
+        assert!(t.run(&db, &section(0), vec![]).starts_with("Segments 0–0"));
+        assert!(t
+            .run(&db, &section(1), vec![])
+            .starts_with("Error: write the draft with write_draft"));
+        let html = "<!doctype html>\n<script>const ITEMS = [\n// end: items\n];</script>\n</html>";
+        t.run(&db, &call("write_draft", json!({"html": html})), vec![]);
+        assert!(t.run(&db, &section(1), vec![]).starts_with("Segments 1–1"));
+        assert!(t
+            .run(&db, &section(2), vec![])
+            .starts_with("Error: add what you found"));
+        let edit = json!({"old": "// end: items", "new": "1,\n// end: items"});
+        t.run(&db, &call("edit_draft", edit), vec![]);
+        assert!(t.run(&db, &section(2), vec![]).starts_with("Segments 2–2"));
+        // chat reads as much as it likes
+        let mut t = ToolBox::new(Scope::Recording("x".into()), false);
+        t.fit_window(8_000);
+        t.run(&db, &section(0), vec![]);
+        assert!(t.run(&db, &section(1), vec![]).starts_with("Segments 1–1"));
     }
 
     #[test]

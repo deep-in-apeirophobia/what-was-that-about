@@ -183,8 +183,14 @@ impl Draft {
         // Try `old` as given first: the draft itself may have lines like `12: "x",`.
         let (old, new, found) = match find_unique(&self.html, old) {
             Err(EditError::NotFound) if strip_numbers(old) != old => {
-                // copied from read_draft with its line numbers
-                let (old, new) = (strip_numbers(old), strip_numbers(new));
+                // copied from read_draft with its line numbers; `new` only carries them too
+                // when it starts at the same line (otherwise `12:` may be a real key)
+                let new = if first_number(new) == first_number(old) {
+                    strip_numbers(new)
+                } else {
+                    new.to_string()
+                };
+                let old = strip_numbers(old);
                 let found = find_unique(&self.html, &old);
                 (old, new, found)
             }
@@ -266,8 +272,15 @@ fn line_at(text: &str, byte: usize) -> usize {
         + 1
 }
 
+static PREFIX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*(\d+):\s?").unwrap());
+
+/// The line number `read_draft` put before the first non-empty line, if any.
+fn first_number(text: &str) -> Option<&str> {
+    let line = text.lines().find(|l| !l.trim().is_empty())?;
+    Some(PREFIX.captures(line)?.get(1)?.as_str())
+}
+
 fn strip_numbers(text: &str) -> String {
-    static PREFIX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*\d+:\s?").unwrap());
     if !text.lines().any(|l| !l.trim().is_empty())
         || !text
             .lines()
@@ -640,6 +653,9 @@ mod tests {
         assert_eq!(d.html(), "const T = {\n12: \"درود\",\n};");
         d.edit("12: \"درود\",", "12: \"خداحافظ\",").unwrap();
         assert_eq!(d.html(), "const T = {\n12: \"خداحافظ\",\n};");
+        // numbered `old`, `new` written fresh with its key
+        d.edit("2: 12: \"خداحافظ\",", "12: \"تازه\",").unwrap();
+        assert_eq!(d.html(), "const T = {\n12: \"تازه\",\n};");
     }
 
     #[test]
